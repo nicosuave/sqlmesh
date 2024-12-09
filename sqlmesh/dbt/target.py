@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import abc
 import logging
-import sys
 import typing as t
 from pathlib import Path
 
@@ -10,9 +9,11 @@ from dbt.adapters.base import BaseRelation, Column
 from pydantic import Field
 
 from sqlmesh.core.config.connection import (
+    AthenaConnectionConfig,
     BigQueryConnectionConfig,
     BigQueryConnectionMethod,
     BigQueryPriority,
+    ClickhouseConnectionConfig,
     ConnectionConfig,
     DatabricksConnectionConfig,
     DuckDBConnectionConfig,
@@ -22,7 +23,6 @@ from sqlmesh.core.config.connection import (
     SnowflakeConnectionConfig,
     TrinoAuthenticationMethod,
     TrinoConnectionConfig,
-    AthenaConnectionConfig,
 )
 from sqlmesh.core.model import (
     IncrementalByTimeRangeKind,
@@ -39,11 +39,6 @@ from sqlmesh.utils.pydantic import (
     model_validator,
     model_validator_v1_args,
 )
-
-if sys.version_info >= (3, 9):
-    from typing import Literal
-else:
-    from typing_extensions import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +105,8 @@ class TargetConfig(abc.ABC, DbtConfig):
             return MSSQLConfig(**data)
         elif db_type == "trino":
             return TrinoConfig(**data)
+        elif db_type == "clickhouse":
+            return ClickhouseConfig(**data)
         elif db_type == "athena":
             return AthenaConfig(**data)
 
@@ -162,7 +159,7 @@ class DuckDbConfig(TargetConfig):
         settings: A dictionary of settings to pass into the duckdb connector.
     """
 
-    type: Literal["duckdb"] = "duckdb"
+    type: t.Literal["duckdb"] = "duckdb"
     database: str = "main"
     schema_: str = Field(default="main", alias="schema")
     path: str = DUCKDB_IN_MEMORY
@@ -229,7 +226,7 @@ class SnowflakeConfig(TargetConfig):
         token: OAuth authentication: The Snowflake OAuth 2.0 access token
     """
 
-    type: Literal["snowflake"] = "snowflake"
+    type: t.Literal["snowflake"] = "snowflake"
     account: str
     user: str
 
@@ -328,7 +325,7 @@ class PostgresConfig(TargetConfig):
         sslmode: SSL Mode used to connect to the database
     """
 
-    type: Literal["postgres"] = "postgres"
+    type: t.Literal["postgres"] = "postgres"
     host: str
     user: str
     password: str
@@ -392,7 +389,7 @@ class RedshiftConfig(TargetConfig):
     """
 
     # TODO add other forms of authentication
-    type: Literal["redshift"] = "redshift"
+    type: t.Literal["redshift"] = "redshift"
     host: str
     user: str
     password: str
@@ -457,7 +454,7 @@ class DatabricksConfig(TargetConfig):
         database: Name of the database. Not applicable for Databricks and ignored
     """
 
-    type: Literal["databricks"] = "databricks"
+    type: t.Literal["databricks"] = "databricks"
     host: str
     http_path: str
     token: t.Optional[str] = None  # only required if auth_type is not set to 'oauth'
@@ -521,7 +518,7 @@ class BigQueryConfig(TargetConfig):
         maximum_bytes_billed: The maximum number of bytes to be billed for the underlying job
     """
 
-    type: Literal["bigquery"] = "bigquery"
+    type: t.Literal["bigquery"] = "bigquery"
     method: t.Optional[str] = BigQueryConnectionMethod.OAUTH
     dataset: t.Optional[str] = None
     project: t.Optional[str] = None
@@ -634,7 +631,7 @@ class MSSQLConfig(TargetConfig):
         client_secret: The client secret of the Azure Active Directory service principal, not used by SQLMesh
     """
 
-    type: Literal["sqlserver"] = "sqlserver"
+    type: t.Literal["sqlserver"] = "sqlserver"
     host: t.Optional[str] = None
     server: t.Optional[str] = None
     port: int = 1433
@@ -772,7 +769,7 @@ class TrinoConfig(TargetConfig):
         "oauth_console": TrinoAuthenticationMethod.OAUTH,
     }
 
-    type: Literal["trino"] = "trino"
+    type: t.Literal["trino"] = "trino"
     host: str
     database: str
     schema_: str = Field(alias="schema")
@@ -860,6 +857,99 @@ class TrinoConfig(TargetConfig):
         )
 
 
+class ClickhouseConfig(TargetConfig):
+    """
+    Project connection and operational configuration for the Clickhouse target
+
+    Args:
+      host: [localhost]
+      user: [default] # User for all database operations
+      password: [<empty string>] # Password for the user
+      secure: [False] # Use TLS (native protocol) or HTTPS (http protocol)
+      port: [8123]  # If not set, defaults to 8123, 8443 depending on the secure and driver settings
+      connect_timeout: [10] # Timeout in seconds to establish a connection to ClickHouse
+      send_receive_timeout: [300] # Timeout in seconds to receive data from the ClickHouse server
+      verify: [True] # Validate TLS certificate if using TLS/SSL
+      cluster: [<empty string>] # If set, certain DDL/table operations will be executed with the `ON CLUSTER` clause using this cluster.
+      custom_settings: [{}] # A dictionary/mapping of custom ClickHouse settings for the connection - default is empty.
+      schema: [default] # ClickHouse database for dbt models, not used by SQLMesh
+      driver: [http] # http or native.  If not set this will be autodetermined based on port setting, not used by SQLMesh
+      retries: [1] # Number of times to retry a "retriable" database exception (such as a 503 'Service Unavailable' error), not used by SQLMesh
+      compression: [<empty string>] # Use gzip compression if truthy (http), or compression type for a native connection, not used by SQLMesh
+      cluster_mode: [False] # Use specific settings designed to improve operation on Replicated databases (recommended for ClickHouse Cloud), not used by SQLMesh
+      use_lw_deletes: [False] # Use the strategy `delete+insert` as the default incremental strategy, not used by SQLMesh
+      check_exchange: [True] # Validate that clickhouse support the atomic EXCHANGE TABLES command. Not used by SQLMesh.
+      local_suffix: [_local] # Table suffix of local tables on shards for distributed materializations, not used by SQLMesh
+      local_db_prefix: [<empty string>] # Database prefix of local tables on shards for distributed materializations, not used by SQLMesh
+      allow_automatic_deduplication: [False] # Enable ClickHouse automatic deduplication for Replicated tables, not used by SQLMesh
+      tcp_keepalive: [False] # Native client only, specify TCP keepalive configuration. Specify custom keepalive settings as [idle_time_sec, interval_sec, probes], not used by SQLMesh
+      sync_request_timeout: [5] # Timeout for server ping, not used by SQLMesh
+      compress_block_size: [1048576] # Compression block size if compression is enabled, not used by SQLMesh
+    """
+
+    host: str = "localhost"
+    user: str = Field(default="default", alias="username")
+    password: str = ""
+    port: t.Optional[int] = None
+    cluster: t.Optional[str] = None
+    schema_: str = Field(default="default", alias="schema")
+    connect_timeout: int = 10
+    send_receive_timeout: int = 300
+    verify: bool = True
+    compression: str = ""
+    custom_settings: t.Optional[t.Dict[str, t.Any]] = None
+
+    # Not used by SQLMesh
+    driver: t.Optional[str] = None
+    secure: bool = False
+    retries: int = 1
+    database_engine: t.Optional[str] = None
+    cluster_mode: bool = False
+    sync_request_timeout: int = 5
+    compress_block_size: int = 1048576
+    check_exchange: bool = True
+    use_lw_deletes: bool = False
+    allow_automatic_deduplication: bool = False
+    tcp_keepalive: t.Union[bool, t.Tuple[int, ...], t.List[int]] = False
+    database: str = ""
+    local_suffix: str = "local"
+    local_db_prefix: str = ""
+
+    type: t.Literal["clickhouse"] = "clickhouse"
+
+    def default_incremental_strategy(self, kind: IncrementalKind) -> str:
+        # dbt-clickhouse name for temp table swap. That is sqlmesh's default
+        #   strategy so doesn't require special handling during conversion.
+        return "legacy"
+
+    @classproperty
+    def relation_class(cls) -> t.Type[BaseRelation]:
+        from dbt.adapters.clickhouse.relation import ClickHouseRelation
+
+        return ClickHouseRelation
+
+    @classproperty
+    def column_class(cls) -> t.Type[Column]:
+        from dbt.adapters.clickhouse.column import ClickHouseColumn
+
+        return ClickHouseColumn
+
+    def to_sqlmesh(self, **kwargs: t.Any) -> ConnectionConfig:
+        return ClickhouseConnectionConfig(
+            host=self.host,
+            username=self.user,
+            password=self.password,
+            port=self.port,
+            cluster=self.cluster,
+            connect_timeout=self.connect_timeout,
+            send_receive_timeout=self.send_receive_timeout,
+            verify=self.verify,
+            compression_method=self.compression,
+            connection_settings=self.custom_settings,
+            **kwargs,
+        )
+
+
 class AthenaConfig(TargetConfig):
     """
     Project connection and operational configuration for the Athena target.
@@ -887,7 +977,7 @@ class AthenaConfig(TargetConfig):
         lf_tags_database: Default LF tags for new database if it's created by dbt
     """
 
-    type: Literal["athena"] = "athena"
+    type: t.Literal["athena"] = "athena"
     threads: int = 4
 
     s3_staging_dir: t.Optional[str] = None
@@ -954,4 +1044,5 @@ TARGET_TYPE_TO_CONFIG_CLASS: t.Dict[str, t.Type[TargetConfig]] = {
     "tsql": MSSQLConfig,
     "trino": TrinoConfig,
     "athena": AthenaConfig,
+    "clickhouse": ClickhouseConfig,
 }

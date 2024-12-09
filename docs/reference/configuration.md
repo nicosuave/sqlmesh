@@ -164,16 +164,19 @@ Most parameters are specific to the connection engine `type` - see [below](#engi
 
 | Option              | Description                                                                                                                                                             | Type | Required |
 |---------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:----:|:--------:|
-| `type`              | The engine type name, listed in engine-specific configuration pages below.                                                                                              | str  | Y        |
-| `concurrent_tasks`  | The maximum number of concurrent tasks that will be run by SQLMesh. (Default: 4 for engines that support concurrent tasks.)                                             | int  | N        |
-| `register_comments` | Whether SQLMesh should register model comments with the SQL engine (if the engine supports it). (Default: `true`.)                                                      | bool | N        |
-| `pre_ping`          | Whether or not to pre-ping the connection before starting a new transaction to ensure it is still alive. This can only be enabled for engines with transaction support. | bool | N        |
+| `type`              | The engine type name, listed in engine-specific configuration pages below.                                                                                              | str  |    Y     |
+| `concurrent_tasks`  | The maximum number of concurrent tasks that will be run by SQLMesh. (Default: 4 for engines that support concurrent tasks.)                                             | int  |    N     |
+| `register_comments` | Whether SQLMesh should register model comments with the SQL engine (if the engine supports it). (Default: `true`.)                                                      | bool |    N     |
+| `pre_ping`          | Whether or not to pre-ping the connection before starting a new transaction to ensure it is still alive. This can only be enabled for engines with transaction support. | bool |    N     |
+| `pretty_sql`        | If SQL should be formatted before being executed, not recommended in a production setting. (Default: `false`.)                                                          | bool |    N     |
 
 #### Engine-specific
 
 These pages describe the connection configuration options for each execution engine.
 
+* [Athena](../integrations/engines/athena.md)
 * [BigQuery](../integrations/engines/bigquery.md)
+* [ClickHouse](../integrations/engines/clickhouse.md)
 * [Databricks](../integrations/engines/databricks.md)
 * [DuckDB](../integrations/engines/duckdb.md)
 * [MotherDuck](../integrations/engines/motherduck.md)
@@ -226,6 +229,17 @@ See [Airflow Integration Guide](../integrations/airflow.md) for information abou
 **Type:** `cloud_composer`
 
 The Google Cloud Composer scheduler type shares the same configuration options as the `airflow` type, except for `username` and `password`. Cloud Composer relies on `gcloud` authentication, so the `username` and `password` options are not required.
+
+#### YC Airflow
+
+**Type:** `yc_airflow`
+
+Yandex Managed Airflow shares similar configuration options with the standard `airflow` type, with the following exceptions:
+
+- `max_snapshot_ids_per_request`: This option is deprecated and not supported.
+- Authentication: YC Airflow requires additional credentials, including both a `token` and a combination of `username` and `password`.
+
+Unlike the `airflow` type, YC Airflow leverages Yandex Cloud's internal authentication mechanisms. Therefore, all requests to the Airflow API must include a valid Yandex Cloud IAM-token for authentication.
 
 ## Gateway/connection defaults
 

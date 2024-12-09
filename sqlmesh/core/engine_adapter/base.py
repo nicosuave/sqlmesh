@@ -115,6 +115,7 @@ class EngineAdapter:
         execute_log_level: int = logging.DEBUG,
         register_comments: bool = True,
         pre_ping: bool = False,
+        pretty_sql: bool = False,
         **kwargs: t.Any,
     ):
         self.dialect = dialect.lower() or self.DIALECT
@@ -127,6 +128,7 @@ class EngineAdapter:
         self._extra_config = kwargs
         self._register_comments = register_comments
         self._pre_ping = pre_ping
+        self._pretty_sql = pretty_sql
 
     def with_log_level(self, level: int) -> EngineAdapter:
         adapter = self.__class__(
@@ -474,7 +476,7 @@ class EngineAdapter:
         query: Query,
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         partitioned_by: t.Optional[t.List[exp.Expression]] = None,
-        clustered_by: t.Optional[t.List[str]] = None,
+        clustered_by: t.Optional[t.List[exp.Expression]] = None,
         table_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
         table_description: t.Optional[str] = None,
         column_descriptions: t.Optional[t.Dict[str, str]] = None,
@@ -489,7 +491,7 @@ class EngineAdapter:
             query: The SQL query for the engine to base the managed table on
             columns_to_types: A mapping between the column name and its data type.
             partitioned_by: The partition columns or engine specific expressions, only applicable in certain engines. (eg. (ds, hour))
-            clustered_by: The cluster columns, only applicable in certain engines. (eg. (ds, hour))
+            clustered_by: The cluster columns or engine specific expressions, only applicable in certain engines. (eg. (ds, hour))
             table_properties: Optional mapping of engine-specific properties to be set on the managed table
             table_description: Optional table description from MODEL DDL.
             column_descriptions: Optional column descriptions from model query.
@@ -2044,7 +2046,6 @@ class EngineAdapter:
         to_sql_kwargs = (
             {"unsupported_level": ErrorLevel.IGNORE} if ignore_unsupported_errors else {}
         )
-
         with self.transaction():
             for e in ensure_list(expressions):
                 sql = t.cast(
@@ -2136,7 +2137,7 @@ class EngineAdapter:
 
     def _build_clustered_by_exp(
         self,
-        clustered_by: t.List[str],
+        clustered_by: t.List[exp.Expression],
         **kwargs: t.Any,
     ) -> t.Optional[exp.Cluster]:
         return None
@@ -2148,7 +2149,7 @@ class EngineAdapter:
         storage_format: t.Optional[str] = None,
         partitioned_by: t.Optional[t.List[exp.Expression]] = None,
         partition_interval_unit: t.Optional[IntervalUnit] = None,
-        clustered_by: t.Optional[t.List[str]] = None,
+        clustered_by: t.Optional[t.List[exp.Expression]] = None,
         table_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         table_description: t.Optional[str] = None,
@@ -2209,7 +2210,7 @@ class EngineAdapter:
         """
         sql_gen_kwargs = {
             "dialect": self.dialect,
-            "pretty": False,
+            "pretty": self._pretty_sql,
             "comments": False,
             **self._sql_gen_kwargs,
             **kwargs,

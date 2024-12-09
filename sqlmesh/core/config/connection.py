@@ -5,14 +5,15 @@ import base64
 import logging
 import os
 import pathlib
-import sys
 import typing as t
 from enum import Enum
-from functools import partial
+from functools import partial, lru_cache
 
+import pydantic
 from pydantic import Field
 from sqlglot import exp
 from sqlglot.helper import subclasses
+
 from sqlmesh.core import engine_adapter
 from sqlmesh.core.config.base import BaseConfig
 from sqlmesh.core.config.common import (
@@ -30,15 +31,9 @@ from sqlmesh.utils.pydantic import (
 )
 from sqlmesh.utils.aws import validate_s3_uri
 
-if sys.version_info >= (3, 9):
-    from typing import Literal
-else:
-    from typing_extensions import Literal
-
-
 logger = logging.getLogger(__name__)
 
-RECOMMENDED_STATE_SYNC_ENGINES = {"postgres", "gcp_postgres", "mysql", "duckdb", "mssql"}
+RECOMMENDED_STATE_SYNC_ENGINES = {"postgres", "gcp_postgres", "mysql", "mssql"}
 FORBIDDEN_STATE_SYNC_ENGINES = {
     # Do not support row-level operations
     "spark",
@@ -53,6 +48,7 @@ class ConnectionConfig(abc.ABC, BaseConfig):
     concurrent_tasks: int
     register_comments: bool
     pre_ping: bool
+    pretty_sql: bool = False
 
     @property
     @abc.abstractmethod
@@ -124,6 +120,7 @@ class ConnectionConfig(abc.ABC, BaseConfig):
             cursor_init=self._cursor_init,
             register_comments=register_comments_override or self.register_comments,
             pre_ping=self.pre_ping,
+            pretty_sql=self.pretty_sql,
             **self._extra_engine_config,
         )
 
@@ -152,9 +149,9 @@ class BaseDuckDBConnectionConfig(ConnectionConfig):
     extensions: t.List[t.Union[str, t.Dict[str, t.Any]]] = []
     connector_config: t.Dict[str, t.Any] = {}
 
-    concurrent_tasks: Literal[1] = 1
+    concurrent_tasks: int = 1
     register_comments: bool = True
-    pre_ping: Literal[False] = False
+    pre_ping: t.Literal[False] = False
 
     @property
     def _engine_adapter(self) -> t.Type[EngineAdapter]:
@@ -237,7 +234,7 @@ class MotherDuckConnectionConfig(BaseDuckDBConnectionConfig):
     database: str
     token: t.Optional[str] = None
 
-    type_: Literal["motherduck"] = Field(alias="type", default="motherduck")
+    type_: t.Literal["motherduck"] = Field(alias="type", default="motherduck")
 
     @property
     def _connection_kwargs_keys(self) -> t.Set[str]:
@@ -285,7 +282,7 @@ class DuckDBConnectionConfig(BaseDuckDBConnectionConfig):
     database: t.Optional[str] = None
     catalogs: t.Optional[t.Dict[str, t.Union[str, DuckDBAttachOptions]]] = None
 
-    type_: Literal["duckdb"] = Field(alias="type", default="duckdb")
+    type_: t.Literal["duckdb"] = Field(alias="type", default="duckdb")
 
     _data_file_to_adapter: t.ClassVar[t.Dict[str, EngineAdapter]] = {}
 
@@ -303,6 +300,49 @@ class DuckDBConnectionConfig(BaseDuckDBConnectionConfig):
     @property
     def _connection_kwargs_keys(self) -> t.Set[str]:
         return {"database"}
+
+    @property
+    def _connection_factory(self) -> t.Callable:
+        import duckdb
+
+        if self.concurrent_tasks > 1:
+            # ensures a single connection instance is used across threads rather than a new connection being established per thread
+            # this is in line with https://duckdb.org/docs/guides/python/multiple_threads.html
+            # the important thing is that the *cursor*'s are per thread, but the connection should be shared
+            @lru_cache
+            def _factory(*args: t.Any, **kwargs: t.Any) -> t.Any:
+                class ConnWrapper:
+                    def __init__(self, conn: duckdb.DuckDBPyConnection):
+                        self.conn = conn
+
+                    def __getattr__(self, attr: str) -> t.Any:
+                        return getattr(self.conn, attr)
+
+                    def close(self) -> None:
+                        # This overrides conn.close() to be a no-op to work with ThreadLocalConnectionPool which assumes that a new connection should
+                        # be created per thread. However, DuckDB expects the same connection instance to be shared across threads. There is a pattern
+                        # in the SQLMesh codebase that `EngineAdapter.recycle()` is called after doing things like merging intervals. This in turn causes
+                        # `ThreadLocalConnectionPool.close_all(exclude_calling_thread=True)` to be called.
+                        #
+                        # The problem with sharing a connection across threads and then allowing it to be closed for every thread except the current one
+                        # is that it gets closed for the current one too because its shared. This causes any ":memory:" databases to be discarded.
+                        # ":memory:" databases are convienient and are used heavily in our test suite amongst other things.
+                        #
+                        # Ok, so why not have a connection per thread as is the default for ThreadLocalConnectionPool? Two reasons:
+                        # - It makes any ":memory:" databases unique to that thread. So if one thread creates tables, another thread cant see them
+                        # - If you use local files instead (eg point each connection to the same db file) then all the connection instances
+                        #   fight over locks to the same file and performance tanks heavily
+                        #
+                        # From what I can tell, DuckDB expects the single process reading / writing the database from multiple
+                        # threads to /share the same connection/ and just use thread-local cursors. In order to support ":memory:" databases
+                        # and remove lock contention, the connection needs to live for the life of the application and not be closed
+                        pass
+
+                return ConnWrapper(duckdb.connect(*args, **kwargs))
+
+            return _factory
+
+        return super()._connection_factory
 
     def create_engine_adapter(self, register_comments_override: bool = False) -> EngineAdapter:
         """Checks if another engine adapter has already been created that shares a catalog that points to the same data
@@ -379,7 +419,7 @@ class SnowflakeConnectionConfig(ConnectionConfig):
 
     session_parameters: t.Optional[dict] = None
 
-    type_: Literal["snowflake"] = Field(alias="type", default="snowflake")
+    type_: t.Literal["snowflake"] = Field(alias="type", default="snowflake")
 
     _concurrent_tasks_validator = concurrent_tasks_validator
 
@@ -566,9 +606,9 @@ class DatabricksConnectionConfig(ConnectionConfig):
 
     concurrent_tasks: int = 1
     register_comments: bool = True
-    pre_ping: Literal[False] = False
+    pre_ping: t.Literal[False] = False
 
-    type_: Literal["databricks"] = Field(alias="type", default="databricks")
+    type_: t.Literal["databricks"] = Field(alias="type", default="databricks")
 
     _concurrent_tasks_validator = concurrent_tasks_validator
     _http_headers_validator = http_headers_validator
@@ -814,9 +854,9 @@ class BigQueryConnectionConfig(ConnectionConfig):
 
     concurrent_tasks: int = 1
     register_comments: bool = True
-    pre_ping: Literal[False] = False
+    pre_ping: t.Literal[False] = False
 
-    type_: Literal["bigquery"] = Field(alias="type", default="bigquery")
+    type_: t.Literal["bigquery"] = Field(alias="type", default="bigquery")
 
     @field_validator("execution_project")
     @field_validator_v1_args
@@ -945,7 +985,7 @@ class GCPPostgresConnectionConfig(ConnectionConfig):
     timeout: t.Optional[int] = None
     scopes: t.Tuple[str, ...] = ("https://www.googleapis.com/auth/sqlservice.admin",)
     driver: str = "pg8000"
-    type_: Literal["gcp_postgres"] = Field(alias="type", default="gcp_postgres")
+    type_: t.Literal["gcp_postgres"] = Field(alias="type", default="gcp_postgres")
     concurrent_tasks: int = 4
     register_comments: bool = True
     pre_ping: bool = True
@@ -1063,7 +1103,7 @@ class RedshiftConnectionConfig(ConnectionConfig):
     register_comments: bool = True
     pre_ping: bool = False
 
-    type_: Literal["redshift"] = Field(alias="type", default="redshift")
+    type_: t.Literal["redshift"] = Field(alias="type", default="redshift")
 
     @property
     def _connection_kwargs_keys(self) -> t.Set[str]:
@@ -1117,7 +1157,7 @@ class PostgresConnectionConfig(ConnectionConfig):
     register_comments: bool = True
     pre_ping: bool = True
 
-    type_: Literal["postgres"] = Field(alias="type", default="postgres")
+    type_: t.Literal["postgres"] = Field(alias="type", default="postgres")
 
     @property
     def _connection_kwargs_keys(self) -> t.Set[str]:
@@ -1165,7 +1205,7 @@ class MySQLConnectionConfig(ConnectionConfig):
     register_comments: bool = True
     pre_ping: bool = True
 
-    type_: Literal["mysql"] = Field(alias="type", default="mysql")
+    type_: t.Literal["mysql"] = Field(alias="type", default="mysql")
 
     @property
     def _cursor_kwargs(self) -> t.Optional[t.Dict[str, t.Any]]:
@@ -1210,7 +1250,7 @@ class MSSQLConnectionConfig(ConnectionConfig):
     charset: t.Optional[str] = "UTF-8"
     appname: t.Optional[str] = None
     port: t.Optional[int] = 1433
-    conn_properties: t.Optional[t.Union[t.Iterable[str], str]] = None
+    conn_properties: t.Optional[t.Union[t.List[str], str]] = None
     autocommit: t.Optional[bool] = False
     tds_version: t.Optional[str] = None
 
@@ -1218,7 +1258,7 @@ class MSSQLConnectionConfig(ConnectionConfig):
     register_comments: bool = True
     pre_ping: bool = True
 
-    type_: Literal["mssql"] = Field(alias="type", default="mssql")
+    type_: t.Literal["mssql"] = Field(alias="type", default="mssql")
 
     @property
     def _connection_kwargs_keys(self) -> t.Set[str]:
@@ -1259,9 +1299,9 @@ class SparkConnectionConfig(ConnectionConfig):
 
     concurrent_tasks: int = 4
     register_comments: bool = True
-    pre_ping: Literal[False] = False
+    pre_ping: t.Literal[False] = False
 
-    type_: Literal["spark"] = Field(alias="type", default="spark")
+    type_: t.Literal["spark"] = Field(alias="type", default="spark")
 
     @property
     def _connection_kwargs_keys(self) -> t.Set[str]:
@@ -1342,7 +1382,7 @@ class TrinoConnectionConfig(ConnectionConfig):
     user: str
     catalog: str
     port: t.Optional[int] = None
-    http_scheme: Literal["http", "https"] = "https"
+    http_scheme: t.Literal["http", "https"] = "https"
     # General Optional
     roles: t.Optional[t.Dict[str, str]] = None
     http_headers: t.Optional[t.Dict[str, str]] = None
@@ -1373,9 +1413,9 @@ class TrinoConnectionConfig(ConnectionConfig):
 
     concurrent_tasks: int = 4
     register_comments: bool = True
-    pre_ping: Literal[False] = False
+    pre_ping: t.Literal[False] = False
 
-    type_: Literal["trino"] = Field(alias="type", default="trino")
+    type_: t.Literal["trino"] = Field(alias="type", default="trino")
 
     @model_validator(mode="after")
     @model_validator_v1_args
@@ -1511,7 +1551,7 @@ class ClickhouseConnectionConfig(ConnectionConfig):
     # * https://clickhouse.com/docs/en/integrations/python#customizing-the-http-connection-pool
     connection_pool_options: t.Optional[t.Dict[str, t.Any]] = None
 
-    type_: Literal["clickhouse"] = Field(alias="type", default="clickhouse")
+    type_: t.Literal["clickhouse"] = Field(alias="type", default="clickhouse")
 
     @property
     def _connection_kwargs_keys(self) -> t.Set[str]:
@@ -1610,12 +1650,12 @@ class AthenaConnectionConfig(ConnectionConfig):
     # SQLMesh options
     s3_warehouse_location: t.Optional[str] = None
     concurrent_tasks: int = 4
-    register_comments: Literal[False] = (
+    register_comments: t.Literal[False] = (
         False  # because Athena doesnt support comments in most cases
     )
-    pre_ping: Literal[False] = False
+    pre_ping: t.Literal[False] = False
 
-    type_: Literal["athena"] = Field(alias="type", default="athena")
+    type_: t.Literal["athena"] = Field(alias="type", default="athena")
 
     @model_validator(mode="after")
     @model_validator_v1_args

@@ -21,6 +21,7 @@ import typing as t
 from sqlmesh.core import analytics
 from sqlmesh.core import constants as c
 from sqlmesh.core.console import Console, get_console
+from sqlmesh.core.environment import EnvironmentNamingInfo
 from sqlmesh.core.notification_target import (
     NotificationTarget,
 )
@@ -32,6 +33,8 @@ from sqlmesh.core.snapshot import (
     SnapshotEvaluator,
     SnapshotIntervals,
     SnapshotId,
+    SnapshotInfoLike,
+    SnapshotTableInfo,
 )
 from sqlmesh.core.state_sync import StateSync
 from sqlmesh.core.state_sync.base import PromotionResult
@@ -39,7 +42,7 @@ from sqlmesh.core.user import User
 from sqlmesh.schedulers.airflow import common as airflow_common
 from sqlmesh.schedulers.airflow.client import AirflowClient, BaseAirflowClient
 from sqlmesh.schedulers.airflow.mwaa_client import MWAAClient
-from sqlmesh.utils.errors import SQLMeshError
+from sqlmesh.utils.errors import PlanError, SQLMeshError
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +200,7 @@ class BuiltInPlanEvaluator(PlanEvaluator):
             interval_end_per_model=plan.interval_end_per_model,
         )
         if not is_run_successful:
-            raise SQLMeshError("Plan application failed.")
+            raise PlanError("Plan application failed.")
 
     def _push(
         self,
@@ -306,14 +309,16 @@ class BuiltInPlanEvaluator(PlanEvaluator):
 
         completed = False
         try:
-            self.snapshot_evaluator.promote(
+            self._promote_snapshots(
+                plan,
                 [snapshots[s.snapshot_id] for s in promotion_result.added],
                 environment.naming_info,
                 deployability_index=deployability_index,
                 on_complete=lambda s: self.console.update_promotion_progress(s, True),
             )
             if promotion_result.removed_environment_naming_info:
-                self.snapshot_evaluator.demote(
+                self._demote_snapshots(
+                    plan,
                     promotion_result.removed,
                     promotion_result.removed_environment_naming_info,
                     on_complete=lambda s: self.console.update_promotion_progress(s, False),
@@ -322,6 +327,32 @@ class BuiltInPlanEvaluator(PlanEvaluator):
             completed = True
         finally:
             self.console.stop_promotion_progress(success=completed)
+
+    def _promote_snapshots(
+        self,
+        plan: EvaluatablePlan,
+        target_snapshots: t.Iterable[Snapshot],
+        environment_naming_info: EnvironmentNamingInfo,
+        deployability_index: t.Optional[DeployabilityIndex] = None,
+        on_complete: t.Optional[t.Callable[[SnapshotInfoLike], None]] = None,
+    ) -> None:
+        self.snapshot_evaluator.promote(
+            target_snapshots,
+            environment_naming_info,
+            deployability_index=deployability_index,
+            on_complete=on_complete,
+        )
+
+    def _demote_snapshots(
+        self,
+        plan: EvaluatablePlan,
+        target_snapshots: t.Iterable[SnapshotTableInfo],
+        environment_naming_info: EnvironmentNamingInfo,
+        on_complete: t.Optional[t.Callable[[SnapshotInfoLike], None]] = None,
+    ) -> None:
+        self.snapshot_evaluator.demote(
+            target_snapshots, environment_naming_info, on_complete=on_complete
+        )
 
     def _restate(self, plan: EvaluatablePlan, snapshots_by_name: t.Dict[str, Snapshot]) -> None:
         if not plan.restatements:
@@ -387,7 +418,7 @@ class BaseAirflowPlanEvaluator(PlanEvaluator):
                 self.dag_run_poll_interval_secs,
             )
             if not plan_application_succeeded:
-                raise SQLMeshError("Plan application failed.")
+                raise PlanError("Plan application failed.")
 
             self.console.log_success("The plan has been applied successfully")
 

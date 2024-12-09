@@ -477,7 +477,7 @@ def _parse_table_parts(
             or "{" in name
             or (
                 self._curr
-                and self._prev.token_type == TokenType.L_PAREN
+                and self._prev.token_type in (TokenType.L_PAREN, TokenType.R_PAREN)
                 and self._curr.text.upper() not in ("FILE_FORMAT", "PATTERN")
             )
         ):
@@ -552,11 +552,15 @@ def _create_parser(parser_type: t.Type[exp.Expression], table_keys: t.List[str])
             elif key == "columns":
                 value = self._parse_schema()
             elif key == "kind":
-                id_var = self._parse_id_var(any_token=True)
-                if not id_var:
-                    value = None
+                if self._match(TokenType.PARAMETER):
+                    field = _parse_macro(self)
                 else:
-                    kind = ModelKindName[id_var.name.upper()]
+                    field = self._parse_id_var(any_token=True)
+
+                if not field or isinstance(field, (MacroVar, MacroFunc)):
+                    value = field
+                else:
+                    kind = ModelKindName[field.name.upper()]
 
                     if kind in (
                         ModelKindName.INCREMENTAL_BY_TIME_RANGE,
@@ -573,11 +577,7 @@ def _create_parser(parser_type: t.Type[exp.Expression], table_keys: t.List[str])
                     else:
                         props = None
 
-                    value = self.expression(
-                        ModelKind,
-                        this=kind.value,
-                        expressions=props,
-                    )
+                    value = self.expression(ModelKind, this=kind.value, expressions=props)
             elif key == "expression":
                 value = self._parse_conjunction()
             else:
@@ -674,8 +674,6 @@ def format_model_expressions(
     if len(expressions) == 1 and is_meta_expression(expressions[0]):
         return expressions[0].sql(pretty=True, dialect=dialect)
 
-    *statements, query = expressions
-
     if rewrite_casts:
 
         def cast_to_colon(node: exp.Expression) -> exp.Expression:
@@ -696,14 +694,16 @@ def format_model_expressions(
             exp.replace_children(node, cast_to_colon)
             return node
 
-        query = query.copy()
-        exp.replace_children(query, cast_to_colon)
+        new_expressions = []
+        for expression in expressions:
+            expression = expression.copy()
+            exp.replace_children(expression, cast_to_colon)
+            new_expressions.append(expression)
+
+        expressions = new_expressions
 
     return ";\n\n".join(
-        [
-            *(statement.sql(pretty=True, dialect=dialect, **kwargs) for statement in statements),
-            query.sql(pretty=True, dialect=dialect, **kwargs),
-        ]
+        expression.sql(pretty=True, dialect=dialect, **kwargs) for expression in expressions
     ).strip()
 
 

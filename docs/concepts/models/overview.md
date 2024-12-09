@@ -177,7 +177,9 @@ This table lists each engine's support for `TABLE` and `VIEW` object comments:
 
 | Engine        | `TABLE` comments | `VIEW` comments |
 | ------------- | ---------------- | --------------- |
+| Athena        | N                | N               |
 | BigQuery      | Y                | Y               |
+| ClickHouse    | Y                | Y               |
 | Databricks    | Y                | Y               |
 | DuckDB <=0.9  | N                | N               |
 | DuckDB >=0.10 | Y                | Y               |
@@ -343,6 +345,14 @@ Learn more about these properties and their default values in the [model configu
 
 ### enabled
 :   Whether the model is enabled. This attribute is `true` by default. Setting it to `false` causes SQLMesh to ignore this model when loading the project.
+
+### physical_version
+:   Pins the version of this model's physical table to the given value.
+
+    NOTE: This can only be set for forward-only models.
+
+### gateway
+:   Specifies the gateway to use for the execution of this model. When not specified, the default gateway is used.
 
 ## Incremental Model Properties
 

@@ -103,18 +103,15 @@ class BaseExpressionRenderer:
         if should_cache and self._cache:
             return self._cache
 
-        if self._model_fqn and "this_model" not in kwargs:
-            kwargs["this_model"] = exp.to_table(
-                self._to_table_mapping(
-                    (
-                        [snapshots[self._model_fqn]]
-                        if snapshots and self._model_fqn in snapshots
-                        else []
-                    ),
-                    deployability_index,
-                ).get(self._model_fqn, self._model_fqn),
-                dialect=self._dialect,
-            ).sql(dialect=self._dialect, identify=True)
+        this_model = kwargs.pop("this_model", None)
+
+        if not this_model and self._model_fqn:
+            this_snapshot = (snapshots or {}).get(self._model_fqn)
+            this_model = self._resolve_table(
+                self._model_fqn,
+                snapshots={self._model_fqn: this_snapshot} if this_snapshot else None,
+                deployability_index=deployability_index,
+            )
 
         expressions = [self._expression]
 
@@ -128,14 +125,27 @@ class BaseExpressionRenderer:
         }
 
         variables = kwargs.pop("variables", {})
-        jinja_env = self._jinja_macro_registry.build_environment(
+        jinja_env_kwargs = {
             **{**render_kwargs, **prepare_env(self._python_env), **variables},
-            snapshots=(snapshots or {}),
-            table_mapping=table_mapping,
-            deployability_index=deployability_index,
-            default_catalog=self._default_catalog,
-            runtime_stage=runtime_stage.value,
-        )
+            "snapshots": snapshots or {},
+            "table_mapping": table_mapping,
+            "deployability_index": deployability_index,
+            "default_catalog": self._default_catalog,
+            "runtime_stage": runtime_stage.value,
+            "resolve_table": lambda table: self._resolve_table(
+                table,
+                snapshots=snapshots,
+                table_mapping=table_mapping,
+                deployability_index=deployability_index,
+            ).sql(dialect=self._dialect, identify=True, comments=False),
+        }
+        if this_model:
+            render_kwargs["this_model"] = this_model
+            jinja_env_kwargs["this_model"] = this_model.sql(
+                dialect=self._dialect, identify=True, comments=False
+            )
+
+        jinja_env = self._jinja_macro_registry.build_environment(**jinja_env_kwargs)
 
         if isinstance(self._expression, d.Jinja):
             try:
@@ -159,6 +169,7 @@ class BaseExpressionRenderer:
             jinja_env=jinja_env,
             schema=self.schema,
             runtime_stage=runtime_stage,
+            resolve_table=jinja_env.globals["resolve_table"],  # type: ignore
             resolve_tables=lambda e: self._resolve_tables(
                 e,
                 snapshots=snapshots,
@@ -221,6 +232,23 @@ class BaseExpressionRenderer:
 
     def update_cache(self, expression: t.Optional[exp.Expression]) -> None:
         self._cache = [expression]
+
+    def _resolve_table(
+        self,
+        table_name: str | exp.Expression,
+        snapshots: t.Optional[t.Dict[str, Snapshot]] = None,
+        table_mapping: t.Optional[t.Dict[str, str]] = None,
+        deployability_index: t.Optional[DeployabilityIndex] = None,
+    ) -> exp.Table:
+        return exp.replace_tables(
+            exp.maybe_parse(table_name, into=exp.Table, dialect=self._dialect),
+            {
+                **self._to_table_mapping((snapshots or {}).values(), deployability_index),
+                **(table_mapping or {}),
+            },
+            dialect=self._dialect,
+            copy=False,
+        )
 
     def _resolve_tables(
         self,

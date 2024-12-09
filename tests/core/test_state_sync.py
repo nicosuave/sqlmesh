@@ -2225,7 +2225,7 @@ def test_snapshot_batching(state_sync, mocker, make_snapshot):
         call(
             exp.to_table("sqlmesh._snapshots"),
             where=parse_one(
-                f"(name, identifier) in (('\"a\"', '{snapshot_a.identifier}'), ('\"a\"', '{snapshot_b.identifier}'))"
+                f"(name, identifier) in (('\"a\"', '{snapshot_b.identifier}'), ('\"a\"', '{snapshot_a.identifier}'))"
             ),
         ),
         call(

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 import typing as t
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -12,7 +11,7 @@ from sqlglot import exp
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
 from sqlmesh.core import constants as c
-from sqlmesh.core.audit import BUILT_IN_AUDITS, Audit, ModelAudit, StandaloneAudit
+from sqlmesh.core.audit import StandaloneAudit
 from sqlmesh.core.model import Model, ModelKindMixin, ModelKindName, ViewKind, CustomKind
 from sqlmesh.core.model.definition import _Model
 from sqlmesh.core.node import IntervalUnit, NodeType
@@ -38,11 +37,6 @@ from sqlmesh.utils.errors import SQLMeshError
 from sqlmesh.utils.hashing import hash_data
 from sqlmesh.utils.pydantic import PydanticModel, field_validator
 
-if sys.version_info >= (3, 9):
-    from typing import Annotated
-else:
-    from typing_extensions import Annotated
-
 if t.TYPE_CHECKING:
     from sqlglot.dialects.dialect import DialectType
     from sqlmesh.core.environment import EnvironmentNamingInfo
@@ -51,7 +45,7 @@ if t.TYPE_CHECKING:
 Interval = t.Tuple[int, int]
 Intervals = t.List[Interval]
 
-Node = Annotated[t.Union[Model, StandaloneAudit], Field(descriminator="source_type")]
+Node = t.Annotated[t.Union[Model, StandaloneAudit], Field(descriminator="source_type")]
 
 
 class SnapshotChangeCategory(IntEnum):
@@ -497,7 +491,6 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
         fingerprint: A unique hash of the node definition so that nodes can be reused across environments.
         node: Node object that the snapshot encapsulates.
         parents: The list of parent snapshots (upstream dependencies).
-        audits: The list of generic audits used by the node.
         intervals: List of [start, end) intervals showing which time ranges a snapshot has data for.
         dev_intervals: List of [start, end) intervals showing development intervals (forward-only).
         created_ts: Epoch millis timestamp when a snapshot was first created.
@@ -522,7 +515,6 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
     physical_schema_: t.Optional[str] = Field(default=None, alias="physical_schema")
     node: Node
     parents: t.Tuple[SnapshotId, ...]
-    audits: t.Tuple[ModelAudit, ...] = tuple()
     intervals: Intervals = []
     dev_intervals: Intervals = []
     created_ts: int
@@ -616,7 +608,6 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
         nodes: t.Dict[str, Node],
         ttl: str = c.DEFAULT_SNAPSHOT_TTL,
         version: t.Optional[str] = None,
-        audits: t.Optional[t.Dict[str, ModelAudit]] = None,
         cache: t.Optional[t.Dict[str, SnapshotFingerprint]] = None,
         config: t.Optional[Config] = None,
     ) -> Snapshot:
@@ -628,28 +619,18 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
                 If no dictionary is passed in the fingerprint will not be dependent on a node's parents.
             ttl: A TTL to determine how long orphaned (snapshots that are not promoted anywhere) should live.
             version: The version that a snapshot is associated with. Usually set during the planning phase.
-            audits: Available audits by name.
             cache: Cache of node name to fingerprints.
 
         Returns:
             The newly created snapshot.
         """
         created_ts = now_timestamp()
-        kwargs = {}
-        default_audits = (
-            config.model_defaults.audits if (config and config.model_defaults.audits) else []
-        )
-        if node.is_model:
-            kwargs["audits"] = tuple(
-                t.cast(_Model, node).referenced_audits(audits or {}, default_audits)
-            )
 
         return cls(
             name=node.fqn,
             fingerprint=fingerprint_from_node(
                 node,
                 nodes=nodes,
-                audits=audits,
                 cache=cache,
             ),
             node=node,
@@ -659,7 +640,6 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
                     identifier=fingerprint_from_node(
                         parent_node,
                         nodes=nodes,
-                        audits=audits,
                         cache=cache,
                     ).to_identifier(),
                 )
@@ -671,7 +651,6 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             updated_ts=created_ts,
             ttl=ttl,
             version=version,
-            **kwargs,
         )
 
     def __eq__(self, other: t.Any) -> bool:
@@ -918,7 +897,10 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             SnapshotChangeCategory.INDIRECT_NON_BREAKING,
             SnapshotChangeCategory.METADATA,
         )
-        if reuse_previous_version and self.previous_version:
+        if self.is_model and self.model.physical_version:
+            # If the model has a pinned version then use that.
+            self.version = self.model.physical_version
+        elif reuse_previous_version and self.previous_version:
             previous_version = self.previous_version
             self.version = previous_version.data_version.version
             self.physical_schema_ = previous_version.physical_schema
@@ -928,6 +910,9 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
                     previous_version.data_version.temp_version
                     or previous_version.fingerprint.to_version()
                 )
+        elif self.is_model and self.model.forward_only and not self.previous_version:
+            # If this is a new model then use a deterministic version, independent of the fingerprint.
+            self.version = hash_data([self.name, *self.model.kind.data_hash_values])
         else:
             self.version = self.fingerprint.to_version()
 
@@ -1122,6 +1107,10 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
         return None
 
     @property
+    def model_gateway(self) -> t.Optional[str]:
+        return self.model.gateway if self.is_model else None
+
+    @property
     def audit(self) -> StandaloneAudit:
         if self.is_audit:
             return t.cast(StandaloneAudit, self.node)
@@ -1142,19 +1131,6 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
     def depends_on_self(self) -> bool:
         """Whether or not this models depends on self."""
         return self.is_model and self.model.depends_on_self
-
-    @property
-    def audits_with_args(self) -> t.List[t.Tuple[Audit, t.Dict[str, exp.Expression]]]:
-        if self.is_model:
-            audits_by_name = {**BUILT_IN_AUDITS, **{a.name: a for a in self.audits}}
-            return [
-                (audits_by_name[audit_name], audit_args)
-                for audit_name, audit_args in self.model.audits
-            ]
-        elif self.is_audit:
-            return [(self.audit, {})]
-
-        return []
 
     @property
     def name_version(self) -> SnapshotNameVersion:
@@ -1235,7 +1211,7 @@ class DeployabilityIndex(PydanticModel, frozen=True):
         return frozenset(
             {
                 (
-                    cls._snapshot_id_key(snapshot_id)
+                    cls._snapshot_id_key(snapshot_id)  # type: ignore
                     if isinstance(snapshot_id, SnapshotId)
                     else snapshot_id
                 )
@@ -1448,7 +1424,6 @@ def fingerprint_from_node(
     node: Node,
     *,
     nodes: t.Dict[str, Node],
-    audits: t.Optional[t.Dict[str, ModelAudit]] = None,
     cache: t.Optional[t.Dict[str, SnapshotFingerprint]] = None,
 ) -> SnapshotFingerprint:
     """Helper function to generate a fingerprint based on the data and metadata of the node and its parents.
@@ -1461,7 +1436,6 @@ def fingerprint_from_node(
         node: Node to fingerprint.
         nodes: Dictionary of all nodes in the graph to make the fingerprint dependent on parent changes.
             If no dictionary is passed in the fingerprint will not be dependent on a node's parents.
-        audits: Available audits by name.
         cache: Cache of node name to fingerprints.
 
     Returns:
@@ -1471,12 +1445,7 @@ def fingerprint_from_node(
 
     if node.fqn not in cache:
         parents = [
-            fingerprint_from_node(
-                nodes[table],
-                nodes=nodes,
-                audits=audits,
-                cache=cache,
-            )
+            fingerprint_from_node(nodes[table], nodes=nodes, cache=cache)
             for table in node.depends_on
             if table in nodes
         ]
@@ -1489,7 +1458,7 @@ def fingerprint_from_node(
 
         cache[node.fqn] = SnapshotFingerprint(
             data_hash=node.data_hash,
-            metadata_hash=node.metadata_hash(audits or {}),
+            metadata_hash=node.metadata_hash,
             parent_data_hash=parent_data_hash,
             parent_metadata_hash=parent_metadata_hash,
         )
@@ -1672,6 +1641,25 @@ def missing_intervals(
 
 
 @lru_cache(maxsize=None)
+def expand_range(start_ts: int, end_ts: int, interval_unit: IntervalUnit) -> t.List[int]:
+    croniter = interval_unit.croniter(start_ts)
+    timestamps = [start_ts]
+
+    while True:
+        ts = to_timestamp(croniter.get_next(estimate=True))
+
+        if ts > end_ts:
+            if len(timestamps) > 1:
+                timestamps[-1] = end_ts
+            else:
+                timestamps.append(end_ts)
+            break
+
+        timestamps.append(ts)
+    return timestamps
+
+
+@lru_cache(maxsize=None)
 def compute_missing_intervals(
     interval_unit: IntervalUnit,
     intervals: t.Tuple[Interval, ...],
@@ -1696,21 +1684,7 @@ def compute_missing_intervals(
     if start_ts == end_ts:
         return []
 
-    croniter = interval_unit.croniter(start_ts)
-    timestamps = [start_ts]
-
-    while True:
-        ts = to_timestamp(croniter.get_next(estimate=True))
-
-        if ts > end_ts:
-            if len(timestamps) > 1:
-                timestamps[-1] = end_ts
-            else:
-                timestamps.append(end_ts)
-            break
-
-        timestamps.append(ts)
-
+    timestamps = expand_range(start_ts, end_ts, interval_unit)
     missing = set()
 
     for current_ts, next_ts in zip(timestamps, timestamps[1:]):

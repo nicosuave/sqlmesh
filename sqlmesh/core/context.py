@@ -56,7 +56,11 @@ from sqlmesh.core import analytics
 from sqlmesh.core import constants as c
 from sqlmesh.core.analytics import python_api_analytics
 from sqlmesh.core.audit import Audit, ModelAudit, StandaloneAudit
-from sqlmesh.core.config import CategorizerConfig, Config, load_configs
+from sqlmesh.core.config import (
+    CategorizerConfig,
+    Config,
+    load_configs,
+)
 from sqlmesh.core.config.loader import C
 from sqlmesh.core.console import Console, get_console
 from sqlmesh.core.context_diff import ContextDiff
@@ -116,6 +120,7 @@ from sqlmesh.utils.errors import (
     SQLMeshError,
     UncategorizedPlanError,
 )
+from sqlmesh.utils.config import print_config
 from sqlmesh.utils.jinja import JinjaMacroRegistry
 
 if t.TYPE_CHECKING:
@@ -168,6 +173,13 @@ class BaseContext(abc.ABC):
         raise NotImplementedError
 
     def table(self, model_name: str) -> str:
+        logger.warning(
+            "The SQLMesh context's `table` method is deprecated and will be removed "
+            "in a future release. Please use the `resolve_table` method instead."
+        )
+        return self.resolve_table(model_name)
+
+    def resolve_table(self, model_name: str) -> str:
         """Gets the physical table name for a given model.
 
         Args:
@@ -281,7 +293,6 @@ class GenericContext(BaseContext, t.Generic[C]):
     """Encapsulates a SQLMesh environment supplying convenient functions to perform various tasks.
 
     Args:
-        engine_adapter: The default engine adapter to use.
         notification_targets: The notification target to use. Defaults to what is defined in config.
         paths: The directories containing SQLMesh files.
         config: A Config object or the name of a Config object in config.py.
@@ -303,7 +314,6 @@ class GenericContext(BaseContext, t.Generic[C]):
 
     def __init__(
         self,
-        engine_adapter: t.Optional[EngineAdapter] = None,
         notification_targets: t.Optional[t.List[NotificationTarget]] = None,
         state_sync: t.Optional[StateSync] = None,
         paths: t.Union[str | Path, t.Iterable[str | Path]] = "",
@@ -359,18 +369,21 @@ class GenericContext(BaseContext, t.Generic[C]):
         self.environment_ttl = self.config.environment_ttl
         self.pinned_environments = Environment.sanitize_names(self.config.pinned_environments)
         self.auto_categorize_changes = self.config.plan.auto_categorize_changes
+        self.selected_gateway = gateway or self.config.default_gateway_name
 
         self._connection_config = self.config.get_connection(self.gateway)
         self.concurrent_tasks = concurrent_tasks or self._connection_config.concurrent_tasks
-        self._engine_adapter = engine_adapter or self._connection_config.create_engine_adapter()
 
-        self.console = console or get_console(dialect=self._engine_adapter.dialect)
+        self._engine_adapters: t.Dict[str, EngineAdapter] = {
+            self.selected_gateway: self._connection_config.create_engine_adapter()
+        }
 
+        self._snapshot_evaluator: t.Optional[SnapshotEvaluator] = None
+
+        self.console = console or get_console(dialect=self.engine_adapter.dialect)
         self._test_connection_config = self.config.get_test_connection(
             self.gateway, self.default_catalog, default_catalog_dialect=self.engine_adapter.DIALECT
         )
-
-        self._snapshot_evaluator: t.Optional[SnapshotEvaluator] = None
 
         self._provided_state_sync: t.Optional[StateSync] = state_sync
         self._state_sync: t.Optional[StateSync] = None
@@ -398,24 +411,32 @@ class GenericContext(BaseContext, t.Generic[C]):
 
     @property
     def engine_adapter(self) -> EngineAdapter:
-        """Returns an engine adapter."""
-        return self._engine_adapter
+        """Returns the default engine adapter."""
+        return self._engine_adapters[self.selected_gateway]
 
     @property
     def snapshot_evaluator(self) -> SnapshotEvaluator:
         if not self._snapshot_evaluator:
+            if self._snapshot_gateways:
+                self._create_engine_adapters(set(self._snapshot_gateways.values()))
             self._snapshot_evaluator = SnapshotEvaluator(
-                self.engine_adapter.with_log_level(logging.INFO),
+                {
+                    gateway: adapter.with_log_level(logging.INFO)
+                    for gateway, adapter in self._engine_adapters.items()
+                },
                 ddl_concurrent_tasks=self.concurrent_tasks,
+                selected_gateway=self.selected_gateway,
             )
         return self._snapshot_evaluator
 
     def execution_context(
-        self, deployability_index: t.Optional[DeployabilityIndex] = None
+        self,
+        deployability_index: t.Optional[DeployabilityIndex] = None,
+        engine_adapter: t.Optional[EngineAdapter] = None,
     ) -> ExecutionContext:
         """Returns an execution context."""
         return ExecutionContext(
-            engine_adapter=self._engine_adapter,
+            engine_adapter=engine_adapter or self.engine_adapter,
             snapshots=self.snapshots,
             deployability_index=deployability_index,
             default_dialect=self.default_dialect,
@@ -453,12 +474,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             }
         )
 
-        update_model_schemas(
-            self.dag,
-            models=self._models,
-            audits=self._audits,
-            context_path=self.path,
-        )
+        update_model_schemas(self.dag, models=self._models, context_path=self.path)
 
         if model.dialect:
             self._all_dialects.add(model.dialect)
@@ -552,12 +568,8 @@ class GenericContext(BaseContext, t.Generic[C]):
             self._macros.update(project.macros)
             self._models.update(project.models)
             self._metrics.update(project.metrics)
-
-            for name, audit in project.audits.items():
-                if isinstance(audit, StandaloneAudit):
-                    self._standalone_audits[name] = audit
-                else:
-                    self._audits[name] = audit
+            self._audits.update(project.audits)
+            self._standalone_audits.update(project.standalone_audits)
 
         self.dag = DAG({k: v for project in projects for k, v in project.dag.graph.items()})
 
@@ -598,6 +610,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         ignore_cron: bool = False,
         select_models: t.Optional[t.Collection[str]] = None,
         exit_on_env_update: t.Optional[int] = None,
+        no_auto_upstream: bool = False,
     ) -> bool:
         """Run the entire dag through the scheduler.
 
@@ -612,6 +625,7 @@ class GenericContext(BaseContext, t.Generic[C]):
                 upstream dependencies of selected models will also be evaluated.
             exit_on_env_update: If set, exits with the provided code if the run is interrupted by an update
                 to the target environment.
+            no_auto_upstream: Whether to not force upstream models to run. Only applicable when using `select_models`.
 
         Returns:
             True if the run was successful, False otherwise.
@@ -680,6 +694,7 @@ class GenericContext(BaseContext, t.Generic[C]):
                     ignore_cron=ignore_cron,
                     select_models=select_models,
                     circuit_breaker=_has_environment_changed,
+                    no_auto_upstream=no_auto_upstream,
                 )
                 done = True
             except CircuitBreakerError:
@@ -903,7 +918,9 @@ class GenericContext(BaseContext, t.Generic[C]):
         if model.is_seed:
             df = next(
                 model.render(
-                    context=self.execution_context(),
+                    context=self.execution_context(
+                        engine_adapter=self._get_engine_adapter(model.gateway)
+                    ),
                     start=start,
                     end=end,
                     execution_time=execution_time,
@@ -922,7 +939,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             snapshots=snapshots,
             expand=expand,
             deployability_index=deployability_index,
-            engine_adapter=self.engine_adapter,
+            engine_adapter=self._get_engine_adapter(model.gateway),
             **kwargs,
         )
 
@@ -948,7 +965,6 @@ class GenericContext(BaseContext, t.Generic[C]):
             limit: A limit applied to the model.
         """
         snapshot = self.get_snapshot(model_or_snapshot, raise_if_missing=True)
-
         df = self.snapshot_evaluator.evaluate_and_fetch(
             snapshot,
             start=start,
@@ -1457,8 +1473,10 @@ class GenericContext(BaseContext, t.Generic[C]):
         """
         source_alias, target_alias = source, target
 
+        adapter = self.engine_adapter
         if model_or_snapshot:
             model = self.get_model(model_or_snapshot, raise_if_missing=True)
+            adapter = self._get_engine_adapter(model.gateway)
             source_env = self.state_reader.get_environment(source)
             target_env = self.state_reader.get_environment(target)
 
@@ -1493,7 +1511,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             )
 
         table_diff = TableDiff(
-            adapter=self._engine_adapter,
+            adapter=adapter,
             source=source,
             target=target,
             on=on,
@@ -1617,14 +1635,15 @@ class GenericContext(BaseContext, t.Generic[C]):
         }
 
         try:
+            model_to_test = self.get_model(model, raise_if_missing=True)
             test_adapter = self._test_connection_config.create_engine_adapter(
                 register_comments_override=False
             )
             generate_test(
-                model=self.get_model(model, raise_if_missing=True),
+                model=model_to_test,
                 input_queries=input_queries,
                 models=self._models,
-                engine_adapter=self._engine_adapter,
+                engine_adapter=self._get_engine_adapter(model_to_test.gateway),
                 test_engine_adapter=test_adapter,
                 project_path=self.path,
                 overwrite=overwrite,
@@ -1718,7 +1737,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             else self.snapshots.values()
         )
 
-        num_audits = sum(len(snapshot.audits_with_args) for snapshot in snapshots)
+        num_audits = sum(len(snapshot.node.audits_with_args) for snapshot in snapshots)
         self.console.log_status_update(f"Found {num_audits} audit(s).")
         errors = []
         skipped_count = 0
@@ -1728,7 +1747,6 @@ class GenericContext(BaseContext, t.Generic[C]):
                 start=start,
                 end=end,
                 snapshots=self.snapshots,
-                raise_exception=False,
             ):
                 audit_id = f"{audit_result.audit.name}"
                 if audit_result.model:
@@ -1828,6 +1846,14 @@ class GenericContext(BaseContext, t.Generic[C]):
             external_models_yaml = (
                 path / c.EXTERNAL_MODELS_YAML if not deprecated_yaml.exists() else deprecated_yaml
             )
+
+            external_models_gateway: t.Optional[str] = self.gateway or self.config.default_gateway
+            if not external_models_gateway:
+                # can happen if there was no --gateway defined and the default_gateway is ''
+                # which means that the single gateway syntax is being used which means there is
+                # no named gateway which means we should not stamp `gateway:` on the external models
+                external_models_gateway = None
+
             create_external_models_file(
                 path=external_models_yaml,
                 models=UniqueKeyDict(
@@ -1838,16 +1864,16 @@ class GenericContext(BaseContext, t.Generic[C]):
                         if self.config_for_node(model) is config
                     },
                 ),
-                adapter=self._engine_adapter,
+                adapter=self.engine_adapter,
                 state_reader=self.state_reader,
                 dialect=config.model_defaults.dialect,
-                gateway=self.gateway,
+                gateway=external_models_gateway,
                 max_workers=self.concurrent_tasks,
                 strict=strict,
             )
 
     @python_api_analytics
-    def print_info(self, skip_connection: bool = False) -> None:
+    def print_info(self, skip_connection: bool = False, verbose: bool = False) -> None:
         """Prints information about connections, models, macros, etc. to the console."""
         self.console.log_status_update(f"Models: {len(self.models)}")
         self.console.log_status_update(f"Macros: {len(self._macros) - len(macro.get_registry())}")
@@ -1855,8 +1881,17 @@ class GenericContext(BaseContext, t.Generic[C]):
         if skip_connection:
             return
 
-        self._try_connection("data warehouse", self._engine_adapter.ping)
+        if verbose:
+            self.console.log_status_update("")
+            print_config(self.config.get_connection(self.gateway), self.console, "Connection")
+            print_config(
+                self.config.get_test_connection(self.gateway), self.console, "Test Connection"
+            )
+            print_config(
+                self.config.get_state_connection(self.gateway), self.console, "State Connection"
+            )
 
+        self._try_connection("data warehouse", self.engine_adapter.ping)
         state_connection = self.config.get_state_connection(self.gateway)
         if state_connection:
             self._try_connection("state backend", state_connection.connection_validator())
@@ -1878,19 +1913,15 @@ class GenericContext(BaseContext, t.Generic[C]):
         ignore_cron: bool,
         select_models: t.Optional[t.Collection[str]],
         circuit_breaker: t.Optional[t.Callable[[], bool]],
+        no_auto_upstream: bool,
     ) -> bool:
         scheduler = self.scheduler(environment=environment)
         snapshots = scheduler.snapshots
 
         if select_models is not None:
-            models: UniqueKeyDict[str, Model] = UniqueKeyDict(
-                "models", **{s.name: s.model for s in snapshots.values() if s.is_model}
+            select_models = self._select_models_for_run(
+                select_models, no_auto_upstream, snapshots.values()
             )
-            dag: DAG[str] = DAG()
-            for fqn, model in models.items():
-                dag.add(fqn, model.depends_on)
-            model_selector = self._new_selector(models=models, dag=dag)
-            select_models = set(dag.subdag(*model_selector.expand_model_selections(select_models)))
 
         return scheduler.run(
             environment,
@@ -1944,7 +1975,9 @@ class GenericContext(BaseContext, t.Generic[C]):
             result, test_output = self._run_tests()
             if result.testsRun > 0:
                 self.console.log_test_results(
-                    result, test_output, self._test_connection_config._engine_adapter.DIALECT
+                    result,
+                    test_output,
+                    self._test_connection_config._engine_adapter.DIALECT,
                 )
             if not result.wasSuccessful():
                 raise PlanError(
@@ -1974,6 +2007,35 @@ class GenericContext(BaseContext, t.Generic[C]):
             for fqn, snapshot in self.snapshots.items()
         }
 
+    @property
+    def _snapshot_gateways(self) -> t.Dict[str, str]:
+        """Mapping of snapshot name to the gateway if specified in the model."""
+
+        return {
+            fqn: snapshot.model.gateway
+            for fqn, snapshot in self.snapshots.items()
+            if snapshot.is_model and snapshot.model.gateway
+        }
+
+    def _create_engine_adapters(self, gateways: t.Optional[t.Set] = None) -> None:
+        """Create engine adapters for the gateways, when none provided include all defined in the configs."""
+
+        for gateway_name in self.config.gateways:
+            if gateway_name != self.selected_gateway and (
+                gateways is None or gateway_name in gateways
+            ):
+                connection = self.config.get_connection(gateway_name)
+                adapter = connection.create_engine_adapter()
+                self.concurrent_tasks = min(self.concurrent_tasks, connection.concurrent_tasks)
+                self._engine_adapters[gateway_name] = adapter
+
+    def _get_engine_adapter(self, gateway: t.Optional[str] = None) -> EngineAdapter:
+        if gateway:
+            if adapter := self._engine_adapters.get(gateway):
+                return adapter
+            raise SQLMeshError(f"Gateway '{gateway}' not found in the available engine adapters.")
+        return self.engine_adapter
+
     def _snapshots(
         self, models_override: t.Optional[UniqueKeyDict[str, Model]] = None
     ) -> t.Dict[str, Snapshot]:
@@ -1994,15 +2056,10 @@ class GenericContext(BaseContext, t.Generic[C]):
 
         local_nodes = {**(models_override or self._models), **self._standalone_audits}
         nodes = local_nodes.copy()
-        audits = self._audits.copy()
 
         for name, snapshot in remote_snapshots.items():
             if name not in nodes and snapshot.node.project not in projects:
                 nodes[name] = snapshot.node
-                if snapshot.is_model:
-                    for audit in snapshot.audits:
-                        if name not in audits:
-                            audits[name] = audit
 
         def _nodes_to_snapshots(nodes: t.Dict[str, Node]) -> t.Dict[str, Snapshot]:
             snapshots: t.Dict[str, Snapshot] = {}
@@ -2018,7 +2075,6 @@ class GenericContext(BaseContext, t.Generic[C]):
                 snapshot = Snapshot.from_node(
                     node,
                     nodes=nodes,
-                    audits=audits,
                     cache=fingerprint_cache,
                     ttl=ttl,
                     config=self.config_for_node(node),
@@ -2077,7 +2133,9 @@ class GenericContext(BaseContext, t.Generic[C]):
         self._cleanup_environments()
         expired_snapshots = self.state_sync.delete_expired_snapshots(ignore_ttl=ignore_ttl)
         self.snapshot_evaluator.cleanup(
-            expired_snapshots, on_complete=self.console.update_cleanup_progress
+            expired_snapshots,
+            self._snapshot_gateways,
+            on_complete=self.console.update_cleanup_progress,
         )
 
         self.state_sync.compact_intervals()
@@ -2103,7 +2161,6 @@ class GenericContext(BaseContext, t.Generic[C]):
         return Selector(
             self.state_reader,
             models=models or self._models,
-            audits=self._audits,
             context_path=self.path,
             dag=dag,
             default_catalog=self.default_catalog,
@@ -2132,6 +2189,24 @@ class GenericContext(BaseContext, t.Generic[C]):
                 with sys_path(*context_loader.configs):
                     context_loader.loader.load_signals(self)
                     context_loader.loader.load_materializations(self)
+
+    def _select_models_for_run(
+        self,
+        select_models: t.Collection[str],
+        no_auto_upstream: bool,
+        snapshots: t.Collection[Snapshot],
+    ) -> t.Set[str]:
+        models: UniqueKeyDict[str, Model] = UniqueKeyDict(
+            "models", **{s.name: s.model for s in snapshots if s.is_model}
+        )
+        dag: DAG[str] = DAG()
+        for fqn, model in models.items():
+            dag.add(fqn, model.depends_on)
+        model_selector = self._new_selector(models=models, dag=dag)
+        result = set(model_selector.expand_model_selections(select_models))
+        if not no_auto_upstream:
+            result = set(dag.subdag(*result))
+        return result
 
     def _load_requirements(self, path: Path) -> None:
         path = path / c.REQUIREMENTS

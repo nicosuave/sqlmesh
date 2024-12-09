@@ -20,6 +20,7 @@ from sqlmesh.utils.errors import MissingDependencyError
 logger = logging.getLogger(__name__)
 
 SKIP_LOAD_COMMANDS = ("create_external_models", "migrate", "rollback", "run")
+SKIP_CONTEXT_COMMANDS = ("init", "ui")
 
 
 def _sqlmesh_version() -> str:
@@ -80,7 +81,7 @@ def cli(
 
     if len(paths) == 1:
         path = os.path.abspath(paths[0])
-        if ctx.invoked_subcommand in ("init", "ui"):
+        if ctx.invoked_subcommand in SKIP_CONTEXT_COMMANDS:
             ctx.obj = path
             return
         elif ctx.invoked_subcommand in SKIP_LOAD_COMMANDS:
@@ -457,6 +458,11 @@ def plan(
     type=int,
     help="If set, the command will exit with the specified code if the run is interrupted by an update to the target environment.",
 )
+@click.option(
+    "--no-auto-upstream",
+    is_flag=True,
+    help="Do not automatically include upstream models. Only applicable when --select-model is used. Note: this may result in missing / invalid data for the selected models.",
+)
 @click.pass_context
 @error_handler
 @cli_analytics
@@ -669,16 +675,17 @@ def fetchdf(ctx: click.Context, sql: str) -> None:
     is_flag=True,
     help="Skip the connection test.",
 )
+@opt.verbose
 @click.pass_obj
 @error_handler
 @cli_analytics
-def info(obj: Context, skip_connection: bool) -> None:
+def info(obj: Context, skip_connection: bool, verbose: bool) -> None:
     """
     Print information about a SQLMesh project.
 
     Includes counts of project models and macros and connection tests for the data warehouse.
     """
-    obj.print_info(skip_connection=skip_connection)
+    obj.print_info(skip_connection=skip_connection, verbose=verbose)
 
 
 @cli.command("ui")
@@ -696,9 +703,9 @@ def info(obj: Context, skip_connection: bool) -> None:
 )
 @click.option(
     "--mode",
-    type=click.Choice(["ide", "default", "docs", "plan"], case_sensitive=False),
-    default="default",
-    help="Mode to start the UI in. Default: default",
+    type=click.Choice(["ide", "catalog", "docs", "plan"], case_sensitive=False),
+    default="ide",
+    help="Mode to start the UI in. Default: ide",
 )
 @click.pass_context
 @error_handler

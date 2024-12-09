@@ -1,5 +1,4 @@
 # type: ignore
-import sys
 import typing as t
 
 import pandas as pd
@@ -181,15 +180,13 @@ def test_insert_overwrite_by_time_partition_pandas(
     assert execute_mock.call_count == 2
     assert retry_resp.call_count == 1
     assert db_call_mock.call_count == 1
+
     create_temp_table = db_call_mock.call_args_list[0]
     load_temp_table = retry_resp.call_args_list[0]
     merge, drop_temp_table = execute_mock.call_args_list
     merge_sql = merge[0][0]
     drop_temp_table_sql = drop_temp_table[0][0]
-    if sys.version_info < (3, 8):
-        create_temp_table.kwargs = create_temp_table[1]
-        load_temp_table.kwargs = load_temp_table[1]
-        drop_temp_table.kwargs = drop_temp_table[1]
+
     assert create_temp_table.kwargs == {
         "exists_ok": False,
         "table": get_temp_bq_table.return_value,
@@ -322,7 +319,7 @@ def test_create_table_date_partition(
         {"a": exp.DataType.build("int"), "b": exp.DataType.build("int")},
         partitioned_by=partition_by_cols,
         partition_interval_unit=IntervalUnit.DAY,
-        clustered_by=["b"],
+        clustered_by=[exp.column("b")],
     )
 
     sql_calls = _to_sql_calls(execute_mock)
@@ -795,7 +792,7 @@ def test_materialized_view_properties(
         materialized=True,
         materialized_properties={
             "partitioned_by": [exp.column("ds")],
-            "clustered_by": ["a"],
+            "clustered_by": [exp.column("a")],
             "partition_interval_unit": IntervalUnit.DAY,
         },
     )
