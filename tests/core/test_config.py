@@ -18,7 +18,7 @@ from sqlmesh.core.config import (
     BuiltInSchedulerConfig,
     MWAASchedulerConfig,
     AirflowSchedulerConfig,
-    SinglestoreConnectionConfig
+    SingleStoreConnectionConfig
 )
 from sqlmesh.core.config.connection import DuckDBAttachOptions, RedshiftConnectionConfig
 from sqlmesh.core.config.feature_flag import DbtFeatureFlag, FeatureFlag
@@ -717,7 +717,7 @@ def test_multi_gateway_config(tmp_path, mocker: MockerFixture):
         fd.write(
             """
 gateways:
-    redshift:  
+    redshift:
         connection:
             type: redshift
             user: user
@@ -737,7 +737,7 @@ gateways:
             aws_secret_access_key: accesskey
             work_group: group
             s3_warehouse_location: s3://location
-            
+
 default_gateway: redshift
 
 model_defaults:
