@@ -1039,7 +1039,7 @@ class EngineAdapter:
                 exp.Create(
                     this=schema,
                     kind="VIEW",
-                    replace=replace,
+                    replace=False, # needed to override as this is getting called with True for Singlestore?
                     expression=query,
                     **create_kwargs,
                 ),
