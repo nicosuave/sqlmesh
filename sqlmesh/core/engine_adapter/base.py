@@ -1034,6 +1034,9 @@ class EngineAdapter:
         if properties.expressions:
             create_kwargs["properties"] = properties
 
+        # not sure why I'm needing to override here wtf?'
+        self.drop_view(view_name, materialized=materialized)
+
         with source_queries[0] as query:
             self.execute(
                 exp.Create(
