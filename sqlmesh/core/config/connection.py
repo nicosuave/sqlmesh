@@ -1260,6 +1260,10 @@ class MySQLConnectionConfig(ConnectionConfig):
 class SingleStoreConnectionConfig(MySQLConnectionConfig):
     type_: t.Literal["singlestore"] = Field(alias="type", default="singlestore")
 
+    @property
+    def _engine_adapter(self) -> t.Type[EngineAdapter]:
+        return engine_adapter.SingleStoreEngineAdapter
+
 
 class MSSQLConnectionConfig(ConnectionConfig):
     host: str
