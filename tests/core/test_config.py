@@ -303,6 +303,17 @@ def test_load_config_from_env():
         )
 
 
+def test_load_config_from_env_no_config_vars():
+    with mock.patch.dict(
+        os.environ,
+        {
+            "SQLMESH__AIRFLOW__DISABLE_STATE_MIGRATION": "1",
+            "DUMMY_ENV_VAR": "dummy",
+        },
+    ):
+        assert load_config_from_env() == {}
+
+
 def test_load_config_from_env_invalid_variable_name():
     with mock.patch.dict(
         os.environ,
@@ -495,13 +506,13 @@ environment_catalog_mapping:
 
 
 def test_physical_schema_mapping_mutually_exclusive_with_physical_schema_override() -> None:
-    Config(physical_schema_override={"foo": "bar"})
+    Config(physical_schema_override={"foo": "bar"})  # type: ignore
     Config(physical_schema_mapping={"^foo$": "bar"})
 
     with pytest.raises(
         ConfigError, match=r"Only one.*physical_schema_override.*physical_schema_mapping"
     ):
-        Config(physical_schema_override={"foo": "bar"}, physical_schema_mapping={"^foo$": "bar"})
+        Config(physical_schema_override={"foo": "bar"}, physical_schema_mapping={"^foo$": "bar"})  # type: ignore
 
 
 def test_load_feature_flag(tmp_path_factory):
@@ -758,10 +769,85 @@ model_defaults:
         new_callable=mocker.PropertyMock(return_value={"snapshot": "athena"}),
     )
 
-    ctx._create_engine_adapters()
-
     assert isinstance(ctx._connection_config, RedshiftConnectionConfig)
-    assert len(ctx._engine_adapters) == 2
-    assert isinstance(ctx._engine_adapters["athena"], AthenaEngineAdapter)
-    assert isinstance(ctx._engine_adapters["redshift"], RedshiftEngineAdapter)
+    assert len(ctx.engine_adapters) == 2
+    assert isinstance(ctx.engine_adapters["athena"], AthenaEngineAdapter)
+    assert isinstance(ctx.engine_adapters["redshift"], RedshiftEngineAdapter)
     assert ctx.engine_adapter == ctx._get_engine_adapter("redshift")
+
+
+def test_trino_schema_location_mapping_syntax(tmp_path):
+    config_path = tmp_path / "config_trino.yaml"
+    with open(config_path, "w", encoding="utf-8") as fd:
+        fd.write(
+            """
+    gateways:
+      trino:
+        connection:
+          type: trino
+          user: trino
+          host: trino
+          catalog: trino
+          schema_location_mapping:
+            '^utils$': 's3://utils-bucket/@{schema_name}'
+            '^landing\\..*$': 's3://raw-data/@{catalog_name}/@{schema_name}'
+
+    default_gateway: trino
+
+    model_defaults:
+      dialect: trino
+    """
+        )
+
+    config = load_config_from_paths(
+        Config,
+        project_paths=[config_path],
+    )
+
+    from sqlmesh.core.config.connection import TrinoConnectionConfig
+
+    conn = config.gateways["trino"].connection
+    assert isinstance(conn, TrinoConnectionConfig)
+
+    assert len(conn.schema_location_mapping) == 2
+
+
+def test_gcp_postgres_ip_and_scopes(tmp_path):
+    config_path = tmp_path / "config_gcp_postgres.yaml"
+    with open(config_path, "w", encoding="utf-8") as fd:
+        fd.write(
+            """
+    gateways:
+      gcp_postgres:
+        connection:
+          type: gcp_postgres
+          instance_connection_string: something
+          user: user
+          password: password
+          db: db
+          ip_type: private
+          scopes:
+          - https://www.googleapis.com/auth/cloud-platform
+          - https://www.googleapis.com/auth/sqlservice.admin
+
+    default_gateway: gcp_postgres
+
+    model_defaults:
+      dialect: postgres
+    """
+        )
+
+    config = load_config_from_paths(
+        Config,
+        project_paths=[config_path],
+    )
+
+    from sqlmesh.core.config.connection import GCPPostgresConnectionConfig
+
+    conn = config.gateways["gcp_postgres"].connection
+    assert isinstance(conn, GCPPostgresConnectionConfig)
+
+    assert len(conn.scopes) == 2
+    assert conn.scopes[0] == "https://www.googleapis.com/auth/cloud-platform"
+    assert conn.scopes[1] == "https://www.googleapis.com/auth/sqlservice.admin"
+    assert conn.ip_type == "private"

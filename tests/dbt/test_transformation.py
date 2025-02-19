@@ -9,12 +9,13 @@ from unittest.mock import patch
 import pytest
 from dbt.adapters.base import BaseRelation
 from dbt.exceptions import CompilationError
-from freezegun import freeze_time
+import time_machine
 from pytest_mock.plugin import MockerFixture
-from sqlglot import exp
+from sqlglot import exp, parse_one
 from sqlmesh.core import dialect as d
 from sqlmesh.core.audit import StandaloneAudit
 from sqlmesh.core.context import Context
+from sqlmesh.core.console import get_console
 from sqlmesh.core.model import (
     EmbeddedKind,
     FullKind,
@@ -73,8 +74,7 @@ def test_materialization():
     context.project_name = "Test"
     context.target = DuckDbConfig(name="target", schema="foo")
 
-    logger = logging.getLogger("sqlmesh.dbt.model")
-    with patch.object(logger, "warning") as mock_logger:
+    with patch.object(get_console(), "log_warning") as mock_logger:
         model_config = ModelConfig(
             name="model", alias="model", schema="schema", materialized="materialized_view"
         )
@@ -170,6 +170,24 @@ def test_model_kind():
         unique_key=["bar"], dialect="duckdb", forward_only=True, disable_restatement=False
     )
 
+    dbt_incremental_predicate = "DBT_INTERNAL_DEST.session_start > dateadd(day, -7, current_date)"
+    expected_sqlmesh_predicate = parse_one(
+        "__MERGE_TARGET__.session_start > DATEADD(day, -7, CURRENT_DATE)"
+    )
+    ModelConfig(
+        materialized=Materialization.INCREMENTAL,
+        unique_key=["bar"],
+        incremental_strategy="merge",
+        dialect="postgres",
+        merge_filter=[dbt_incremental_predicate],
+    ).model_kind(context) == IncrementalByUniqueKeyKind(
+        unique_key=["bar"],
+        dialect="postgres",
+        forward_only=True,
+        disable_restatement=False,
+        merge_filter=expected_sqlmesh_predicate,
+    )
+
     assert ModelConfig(materialized=Materialization.INCREMENTAL, unique_key=["bar"]).model_kind(
         context
     ) == IncrementalByUniqueKeyKind(
@@ -208,8 +226,13 @@ def test_model_kind():
         unique_key=["bar"],
         disable_restatement=True,
         full_refresh=False,
+        auto_restatement_cron="0 0 * * *",
     ).model_kind(context) == IncrementalByUniqueKeyKind(
-        unique_key=["bar"], dialect="duckdb", forward_only=True, disable_restatement=True
+        unique_key=["bar"],
+        dialect="duckdb",
+        forward_only=True,
+        disable_restatement=True,
+        auto_restatement_cron="0 0 * * *",
     )
 
     assert ModelConfig(
@@ -234,6 +257,22 @@ def test_model_kind():
         partition_by={"field": "bar"},
         forward_only=False,
     ).model_kind(context) == IncrementalByTimeRangeKind(time_column="foo", dialect="duckdb")
+
+    assert ModelConfig(
+        materialized=Materialization.INCREMENTAL,
+        time_column="foo",
+        incremental_strategy="insert_overwrite",
+        partition_by={"field": "bar"},
+        forward_only=False,
+        auto_restatement_cron="0 0 * * *",
+        auto_restatement_intervals=3,
+    ).model_kind(context) == IncrementalByTimeRangeKind(
+        time_column="foo",
+        dialect="duckdb",
+        forward_only=False,
+        auto_restatement_cron="0 0 * * *",
+        auto_restatement_intervals=3,
+    )
 
     assert ModelConfig(
         materialized=Materialization.INCREMENTAL,
@@ -289,6 +328,14 @@ def test_model_kind():
         disable_restatement=True,
     ).model_kind(context) == IncrementalUnmanagedKind(
         insert_overwrite=True, disable_restatement=True
+    )
+
+    assert ModelConfig(
+        materialized=Materialization.INCREMENTAL,
+        incremental_strategy="insert_overwrite",
+        auto_restatement_cron="0 0 * * *",
+    ).model_kind(context) == IncrementalUnmanagedKind(
+        insert_overwrite=True, auto_restatement_cron="0 0 * * *", disable_restatement=False
     )
 
     assert (
@@ -1078,10 +1125,37 @@ def test_is_incremental(sushi_test_project: Project, assert_exp_eq, mocker):
 
     snapshot = mocker.Mock()
     snapshot.intervals = [1]
+    snapshot.is_incremental = True
 
     assert_exp_eq(
         model_config.to_sqlmesh(context).render_query_or_raise(snapshot=snapshot).sql(),
         'SELECT 1 AS "one" FROM "tbl_a" AS "tbl_a" WHERE "ds" > (SELECT MAX("ds") FROM "model" AS "model")',
+    )
+
+
+@pytest.mark.xdist_group("dbt_manifest")
+def test_is_incremental_non_incremental_model(sushi_test_project: Project, assert_exp_eq, mocker):
+    model_config = ModelConfig(
+        name="model",
+        package_name="package",
+        schema="sushi",
+        alias="some_table",
+        sql="""
+        SELECT 1 AS one FROM tbl_a
+        {% if is_incremental() %}
+        WHERE ds > (SELECT MAX(ds) FROM model)
+        {% endif %}
+        """,
+    )
+    context = sushi_test_project.context
+
+    snapshot = mocker.Mock()
+    snapshot.intervals = [1]
+    snapshot.is_incremental = False
+
+    assert_exp_eq(
+        model_config.to_sqlmesh(context).render_query_or_raise(snapshot=snapshot).sql(),
+        'SELECT 1 AS "one" FROM "tbl_a" AS "tbl_a"',
     )
 
 
@@ -1186,8 +1260,7 @@ def test_clickhouse_properties(mocker: MockerFixture):
         sql="""SELECT 1 AS one, ds FROM foo""",
     )
 
-    logger = logging.getLogger("sqlmesh.dbt.model")
-    with patch.object(logger, "warning") as mock_logger:
+    with patch.object(get_console(), "log_warning") as mock_logger:
         model_to_sqlmesh = model_config.to_sqlmesh(context)
 
     assert [call[0][0] for call in mock_logger.call_args_list] == [
@@ -1195,7 +1268,7 @@ def test_clickhouse_properties(mocker: MockerFixture):
         "SQLMesh does not support 'incremental_predicates' - they will not be applied.",
         "SQLMesh does not support the 'query_settings' model configuration parameter. Specify the query settings directly in the model query.",
         "SQLMesh does not support the 'sharding_key' model configuration parameter or distributed materializations.",
-        "Using unmanaged incremental materialization for model '%s'. Some features might not be available. Consider adding either a time_column (%s) or a unique_key (%s) configuration to mitigate this",
+        "Using unmanaged incremental materialization for model '`test`.`model`'. Some features might not be available. Consider adding either a time_column ('delete+insert', 'insert_overwrite') or a unique_key ('merge', 'none') configuration to mitigate this.",
     ]
 
     assert [e.sql("clickhouse") for e in model_to_sqlmesh.partitioned_by] == [
@@ -1233,7 +1306,7 @@ def test_snapshot_json_payload():
 
 
 @pytest.mark.xdist_group("dbt_manifest")
-@freeze_time("2023-01-08 00:00:00")
+@time_machine.travel("2023-01-08 00:00:00 UTC")
 def test_dbt_package_macros(sushi_test_project: Project):
     context = sushi_test_project.context
 
@@ -1376,3 +1449,62 @@ def test_refs_in_jinja_globals(sushi_test_project: Project, mocker: MockerFixtur
         "waiter_revenue_by_day",
         "sushi.waiter_revenue_by_day",
     }
+
+
+def test_dbt_incremental_allow_partials_by_default():
+    context = DbtContext()
+    context._target = SnowflakeConfig(
+        name="target",
+        schema="test",
+        database="test",
+        account="account",
+        user="user",
+        password="password",
+    )
+
+    model = ModelConfig(
+        name="model",
+        alias="model",
+        package_name="package",
+        target_schema="test",
+        sql="SELECT * FROM baz",
+        materialized=Materialization.TABLE.value,
+    )
+    assert model.allow_partials is None
+    assert not model.to_sqlmesh(context).allow_partials
+
+    model.materialized = Materialization.INCREMENTAL.value
+    assert model.allow_partials is None
+    assert model.to_sqlmesh(context).allow_partials
+
+    model.allow_partials = True
+    assert model.to_sqlmesh(context).allow_partials
+
+    model.allow_partials = False
+    assert not model.to_sqlmesh(context).allow_partials
+
+
+def test_grain():
+    context = DbtContext()
+    context._target = SnowflakeConfig(
+        name="target",
+        schema="test",
+        database="test",
+        account="account",
+        user="user",
+        password="password",
+    )
+
+    model = ModelConfig(
+        name="model",
+        alias="model",
+        package_name="package",
+        target_schema="test",
+        sql="SELECT * FROM baz",
+        materialized=Materialization.TABLE.value,
+        grain=["id_a", "id_b"],
+    )
+    assert model.to_sqlmesh(context).grains == [exp.to_column("id_a"), exp.to_column("id_b")]
+
+    model.grain = "id_a"
+    assert model.to_sqlmesh(context).grains == [exp.to_column("id_a")]

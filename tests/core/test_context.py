@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from tempfile import TemporaryDirectory
 from unittest.mock import PropertyMock, call, patch
 
-import freezegun
+import time_machine
 import pytest
 import pandas as pd
 from pathlib import Path
@@ -16,7 +16,7 @@ from sqlglot.errors import SchemaError
 
 from sqlmesh.core.config.gateway import GatewayConfig
 import sqlmesh.core.constants
-import sqlmesh.core.dialect as d
+from sqlmesh.core import dialect as d, constants as c
 from sqlmesh.core.config import (
     Config,
     DuckDBConnectionConfig,
@@ -26,6 +26,7 @@ from sqlmesh.core.config import (
     load_configs,
 )
 from sqlmesh.core.context import Context
+from sqlmesh.core.console import create_console
 from sqlmesh.core.dialect import parse, schema_
 from sqlmesh.core.engine_adapter.duckdb import DuckDBEngineAdapter
 from sqlmesh.core.environment import Environment
@@ -322,8 +323,12 @@ def test_gateway_specific_adapters(copy_to_temp_path, mocker):
     ctx = Context(paths=path, config="isolated_systems_config", gateway="prod")
     assert len(ctx._engine_adapters) == 1
     assert ctx.engine_adapter == ctx._engine_adapters["prod"]
+
     with pytest.raises(SQLMeshError):
-        assert ctx._get_engine_adapter("dev")
+        assert ctx._get_engine_adapter("non_existing")
+
+    # This will create the requested engine adapter
+    assert ctx._get_engine_adapter("dev") == ctx._engine_adapters["dev"]
 
     ctx = Context(paths=path, config="isolated_systems_config")
     assert len(ctx._engine_adapters) == 1
@@ -337,8 +342,7 @@ def test_gateway_specific_adapters(copy_to_temp_path, mocker):
 
     ctx = Context(paths=path, config="isolated_systems_config")
 
-    ctx._create_engine_adapters({"test"})
-    assert len(ctx._engine_adapters) == 2
+    assert len(ctx.engine_adapters) == 3
     assert ctx.engine_adapter == ctx._get_engine_adapter()
     assert ctx._get_engine_adapter("test") == ctx._engine_adapters["test"]
 
@@ -456,20 +460,11 @@ def test_override_builtin_audit_blocking_mode():
         )
     )
 
-    logger = logging.getLogger("sqlmesh.core.scheduler")
-    with patch.object(logger, "warning") as mock_logger:
+    with patch.object(context.console, "log_warning") as mock_logger:
         plan = context.plan(auto_apply=True, no_prompts=True)
         new_snapshot = next(iter(plan.context_diff.new_snapshots.values()))
 
-        version = new_snapshot.fingerprint.to_version()
-        assert mock_logger.mock_calls == [
-            call(
-                "Audit 'not_null' for model 'db.x' failed.\n"
-                "Got 1 results, expected 0.\n"
-                f'SELECT * FROM (SELECT * FROM "sqlmesh__db"."db__x__{version}" AS "db__x__{version}") AS "_q_0" WHERE "c" IS NULL AND TRUE\n'
-                "Audit is non-blocking so proceeding with execution."
-            )
-        ]
+        assert mock_logger.call_args_list[0][0][0] == "\n'not_null' audit error: 1 row failed."
 
     # Even though there are two builtin audits referenced in the above definition, we only
     # store the one that overrides `blocking` in the snapshot; the other one isn't needed
@@ -503,6 +498,8 @@ def test_override_builtin_audit_blocking_mode():
 
 
 def test_python_model_empty_df_raises(sushi_context, capsys):
+    sushi_context.console = create_console()
+
     @model(
         "memory.sushi.test_model",
         columns={"col": "int"},
@@ -521,11 +518,8 @@ def test_python_model_empty_df_raises(sushi_context, capsys):
         sushi_context.plan(no_prompts=True, auto_apply=True)
 
     assert (
-        "Cannot construct source query from an empty \nDataFrame. This error "
-        "is commonly related to Python models that produce no data.\nFor such "
-        "models, consider yielding from an empty generator if the resulting set "
-        "\nis empty, i.e. use `yield from ()`"
-    ) in capsys.readouterr().out
+        "Cannot construct source query from an empty DataFrame. This error is commonly related to Python models that produce no data. For such models, consider yielding from an empty generator if the resulting set is empty, i.e. use"
+    ) in capsys.readouterr().out.replace("\n", "")
 
 
 def test_env_and_default_schema_normalization(mocker: MockerFixture):
@@ -588,6 +582,11 @@ def test_ignore_files(mocker: MockerFixture, tmp_path: pathlib.Path):
     )
     create_temp_file(
         tmp_path,
+        pathlib.Path(models_dir, "ignore", "inner_ignore", "inner_ignore_model.sql"),
+        "MODEL(name ignore.inner_ignore_model); SELECT 1 AS cola",
+    )
+    create_temp_file(
+        tmp_path,
         pathlib.Path(macros_dir, "macro_ignore.py"),
         """
 from sqlmesh.core.macros import macro
@@ -619,7 +618,7 @@ def test():
 """,
     )
     config = Config(
-        ignore_patterns=["models/ignore/*.sql", "macro_ignore.py", ".ipynb_checkpoints/*"]
+        ignore_patterns=["models/ignore/**/*.sql", "macro_ignore.py", ".ipynb_checkpoints/*"]
     )
     context = Context(paths=tmp_path, config=config)
 
@@ -839,18 +838,18 @@ def test_plan_default_end(sushi_context_pre_scheduling: Context):
     assert dev_plan.end is not None
     assert to_date(make_inclusive_end(dev_plan.end)) == plan_end
 
-    forward_only_dev_plan = sushi_context_pre_scheduling.plan(
-        "test_env_forward_only", no_prompts=True, include_unmodified=True, forward_only=True
-    )
+    forward_only_dev_plan = sushi_context_pre_scheduling.plan_builder(
+        "test_env_forward_only", include_unmodified=True, forward_only=True
+    ).build()
     assert forward_only_dev_plan.end is not None
     assert to_date(make_inclusive_end(forward_only_dev_plan.end)) == plan_end
-    assert forward_only_dev_plan.start == plan_end
+    assert to_timestamp(forward_only_dev_plan.start) == to_timestamp(plan_end)
 
 
 @pytest.mark.slow
 def test_plan_start_ahead_of_end(copy_to_temp_path):
     path = copy_to_temp_path("examples/sushi")
-    with freezegun.freeze_time("2024-01-02 00:00:00"):
+    with time_machine.travel("2024-01-02 00:00:00 UTC"):
         context = Context(paths=path, gateway="duckdb_persistent")
         context.plan("prod", no_prompts=True, auto_apply=True)
         assert all(
@@ -858,7 +857,7 @@ def test_plan_start_ahead_of_end(copy_to_temp_path):
             for i in context.state_sync.max_interval_end_per_model("prod").values()
         )
         context.close()
-    with freezegun.freeze_time("2024-01-03 00:00:00"):
+    with time_machine.travel("2024-01-03 00:00:00 UTC"):
         context = Context(paths=path, gateway="duckdb_persistent")
         expression = d.parse(
             """
@@ -1003,8 +1002,7 @@ def test_load_external_models(copy_to_temp_path):
     assert context.resolve_table("raw.demographics") == '"memory"."raw"."demographics"'
     assert context.resolve_table("raw.model2") == '"memory"."raw"."model2"'
 
-    logger = logging.getLogger("sqlmesh.core.context")
-    with patch.object(logger, "warning") as mock_logger:
+    with patch.object(context.console, "log_warning") as mock_logger:
         context.table("raw.model1") == '"memory"."raw"."model1"'
 
         assert mock_logger.mock_calls == [
@@ -1048,6 +1046,27 @@ def test_disabled_model(copy_to_temp_path):
     assert not context.get_model("sushi.disabled_py")
 
 
+def test_disabled_model_python_macro(sushi_context):
+    @model(
+        "memory.sushi.disabled_model_2",
+        columns={"col": "int"},
+        enabled="@IF(@gateway = 'dev', True, False)",
+    )
+    def entrypoint(context, **kwargs):
+        yield pd.DataFrame({"col": []})
+
+    test_model = model.get_registry()["memory.sushi.disabled_model_2"].model(
+        module_path=Path("."), path=Path("."), variables={"gateway": "prod"}
+    )
+    assert not test_model.enabled
+
+    with pytest.raises(
+        SQLMeshError,
+        match="The disabled model 'memory.sushi.disabled_model_2' cannot be upserted",
+    ):
+        sushi_context.upsert_model(test_model)
+
+
 def test_get_model_mixed_dialects(copy_to_temp_path):
     path = copy_to_temp_path("examples/sushi")
 
@@ -1064,7 +1083,7 @@ def test_get_model_mixed_dialects(copy_to_temp_path):
     model = load_sql_based_model(expression, default_catalog=context.default_catalog)
     context.upsert_model(model)
 
-    assert context.get_model("sushi.snowflake_dialect") == model
+    assert context.get_model("sushi.snowflake_dialect").dict() == model.dict()
 
 
 def test_override_dialect_normalization_strategy():
@@ -1113,7 +1132,7 @@ def test_wildcard(copy_to_temp_path: t.Callable):
     parent_path = copy_to_temp_path("examples/multi")[0]
 
     context = Context(paths=f"{parent_path}/*")
-    assert len(context.models) == 4
+    assert len(context.models) == 5
 
 
 def test_duckdb_state_connection_automatic_multithreaded_mode(tmp_path):
@@ -1154,3 +1173,197 @@ def test_duckdb_state_connection_automatic_multithreaded_mode(tmp_path):
     assert isinstance(state_sync, EngineAdapterStateSync)
     assert isinstance(state_sync.engine_adapter, DuckDBEngineAdapter)
     assert isinstance(state_sync.engine_adapter._connection_pool, ThreadLocalConnectionPool)
+
+
+def test_requirements(copy_to_temp_path: t.Callable):
+    from sqlmesh.utils.metaprogramming import Executable
+
+    context_path = copy_to_temp_path("examples/sushi")[0]
+
+    with open(context_path / c.REQUIREMENTS, "w") as f:
+        # Add pandas and test_package and exclude ruamel.yaml
+        f.write("pandas==2.2.2\ntest_package==1.0.0\n^ruamel.yaml\n^ruamel.yaml.clib")
+
+    context = Context(paths=context_path)
+
+    model = context.get_model("sushi.items")
+    model.python_env["ruamel"] = Executable(payload="import ruamel", kind="import")
+    model.python_env["Image"] = Executable(
+        payload="from ipywidgets.widgets.widget_media import Image", kind="import"
+    )
+
+    environment = context.plan(
+        "dev", no_prompts=True, skip_tests=True, skip_backfill=True, auto_apply=True
+    ).environment
+    requirements = {"ipywidgets", "numpy", "pandas", "test_package"}
+    assert environment.requirements["pandas"] == "2.2.2"
+    assert set(environment.requirements) == requirements
+
+    context._requirements = {"numpy": "2.1.2", "pandas": "2.2.1"}
+    context._excluded_requirements = {"ipywidgets", "ruamel.yaml", "ruamel.yaml.clib"}
+    diff = context.plan_builder("dev", skip_tests=True, skip_backfill=True).build().context_diff
+    assert set(diff.previous_requirements) == requirements
+    assert set(diff.requirements) == {"numpy", "pandas"}
+
+
+@pytest.mark.slow
+def test_rendered_diff():
+    ctx = Context(config=Config())
+
+    ctx.upsert_model(
+        load_sql_based_model(
+            parse(
+                """
+                MODEL (
+                    name test,
+                );
+
+                CREATE TABLE IF NOT EXISTS foo AS (SELECT @OR(FALSE, TRUE));
+
+                SELECT 4 + 2;
+
+                CREATE TABLE IF NOT EXISTS foo2 AS (SELECT @AND(TRUE, FALSE));
+
+                ON_VIRTUAL_UPDATE_BEGIN;
+                DROP VIEW @this_model
+                ON_VIRTUAL_UPDATE_END;
+
+                """
+            )
+        )
+    )
+
+    ctx.plan("dev", auto_apply=True, no_prompts=True)
+
+    # Alter the model's query and pre/post/virtual statements to cause the diff
+    ctx.upsert_model(
+        load_sql_based_model(
+            parse(
+                """
+                MODEL (
+                    name test,
+                );
+
+                CREATE TABLE IF NOT EXISTS foo AS (SELECT @AND(TRUE, NULL));
+
+                SELECT 5 + 2;
+
+                CREATE TABLE IF NOT EXISTS foo2 AS (SELECT @OR(TRUE, NULL));
+
+                ON_VIRTUAL_UPDATE_BEGIN;
+                DROP VIEW IF EXISTS @this_model
+                ON_VIRTUAL_UPDATE_END;
+                """
+            )
+        )
+    )
+
+    plan = ctx.plan("dev", auto_apply=True, no_prompts=True, diff_rendered=True)
+
+    assert '''@@ -4,13 +4,13 @@
+
+ CREATE TABLE IF NOT EXISTS "foo" AS
+ (
+   SELECT
+-    FALSE OR TRUE
++    TRUE
+ )
+ SELECT
+-  6 AS "_col_0"
++  7 AS "_col_0"
+ CREATE TABLE IF NOT EXISTS "foo2" AS
+ (
+   SELECT
+-    TRUE AND FALSE
++    TRUE
+ )
+-DROP VIEW "test"
++DROP VIEW IF EXISTS "test"''' in plan.context_diff.text_diff('"test"')
+
+
+def test_plan_enable_preview_default(sushi_context: Context, sushi_dbt_context: Context):
+    assert sushi_context._plan_preview_enabled
+    assert not sushi_dbt_context._plan_preview_enabled
+
+    sushi_dbt_context.engine_adapter.SUPPORTS_CLONING = True
+    assert sushi_dbt_context._plan_preview_enabled
+
+
+def test_catalog_name_needs_to_be_quoted():
+    config = Config(
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+        default_connection=DuckDBConnectionConfig(catalogs={'"foo--bar"': ":memory:"}),
+    )
+    context = Context(config=config)
+    parsed_model = parse("MODEL(name db.x, kind FULL); SELECT 1 AS c")
+    context.upsert_model(load_sql_based_model(parsed_model, default_catalog='"foo--bar"'))
+    context.plan(auto_apply=True, no_prompts=True)
+    assert context.fetchdf('select * from "foo--bar".db.x').to_dict() == {"c": {0: 1}}
+
+
+def test_plan_runs_audits_on_dev_previews(sushi_context: Context, capsys, caplog):
+    sushi_context.console = create_console()
+
+    test_model = """
+    MODEL (
+        name sushi.test_audit_model,
+        kind INCREMENTAL_BY_TIME_RANGE (
+            time_column event_date,
+            forward_only true
+        ),
+        audits (
+            number_of_rows(threshold := 10),
+            not_null(columns := id),
+            at_least_one_non_blocking(column := waiter_id)
+        )
+    );
+
+    SELECT * FROM sushi.orders WHERE event_date BETWEEN @start_ts AND @end_ts
+    """
+
+    sushi_context.upsert_model(
+        load_sql_based_model(parse(test_model), default_catalog=sushi_context.default_catalog)
+    )
+    plan = sushi_context.plan(auto_apply=True)
+
+    assert plan.new_snapshots[0].name == '"memory"."sushi"."test_audit_model"'
+    assert plan.deployability_index.is_deployable(plan.new_snapshots[0])
+
+    # now, we mutate the model and run a plan in dev to create a dev preview
+    test_model = """
+    MODEL (
+        name sushi.test_audit_model,
+        kind INCREMENTAL_BY_TIME_RANGE (
+            time_column event_date,
+            forward_only true
+        ),
+        audits (
+            not_null(columns := new_col),
+            at_least_one_non_blocking(column := new_col)
+        )
+    );
+
+    SELECT *, null as new_col FROM sushi.orders WHERE event_date BETWEEN @start_ts AND @end_ts
+    """
+
+    sushi_context.upsert_model(
+        load_sql_based_model(parse(test_model), default_catalog=sushi_context.default_catalog)
+    )
+
+    capsys.readouterr()  # clear output buffer
+    plan = sushi_context.plan(environment="dev", auto_apply=True)
+
+    assert len(plan.new_snapshots) == 1
+    dev_preview = plan.new_snapshots[0]
+    assert dev_preview.name == '"memory"."sushi"."test_audit_model"'
+    assert dev_preview.is_forward_only
+    assert not plan.deployability_index.is_deployable(
+        dev_preview
+    )  # if something is not deployable to prod, then its by definiton a dev preview
+
+    # we only see audit results if they fail
+    stdout = capsys.readouterr().out
+    log = caplog.text
+    assert "'not_null' audit error:" in log
+    assert "'at_least_one_non_blocking' audit error:" in log
+    assert "Target environment updated successfully" in stdout

@@ -147,6 +147,14 @@ def test_type(request):
             ],
         ),
         pytest.param(
+            "trino_nessie",
+            marks=[
+                pytest.mark.docker,
+                pytest.mark.engine,
+                pytest.mark.trino_nessie,
+            ],
+        ),
+        pytest.param(
             "spark",
             marks=[
                 pytest.mark.docker,
@@ -249,8 +257,8 @@ def test_connection(ctx: TestContext):
 
 def test_catalog_operations(ctx: TestContext):
     if (
-        ctx.engine_adapter.CATALOG_SUPPORT.is_unsupported
-        or ctx.engine_adapter.CATALOG_SUPPORT.is_single_catalog_only
+        ctx.engine_adapter.catalog_support.is_unsupported
+        or ctx.engine_adapter.catalog_support.is_single_catalog_only
     ):
         pytest.skip(
             f"Engine adapter {ctx.engine_adapter.dialect} doesn't support catalog operations"
@@ -306,7 +314,7 @@ def test_drop_schema_catalog(ctx: TestContext, caplog):
         assert len(results.materialized_views) == 0
         assert len(results.non_temp_tables) == 2
 
-    if ctx.engine_adapter.CATALOG_SUPPORT.is_unsupported:
+    if ctx.engine_adapter.catalog_support.is_unsupported:
         pytest.skip(
             f"Engine adapter {ctx.engine_adapter.dialect} doesn't support catalog operations"
         )
@@ -326,7 +334,7 @@ def test_drop_schema_catalog(ctx: TestContext, caplog):
     ctx.create_catalog(catalog_name)
 
     schema = ctx.schema("drop_schema_catalog_test", catalog_name)
-    if ctx.engine_adapter.CATALOG_SUPPORT.is_single_catalog_only:
+    if ctx.engine_adapter.catalog_support.is_single_catalog_only:
         drop_schema_and_validate(schema)
         assert "requires that all catalog operations be against a single catalog" in caplog.text
         return
@@ -1328,6 +1336,8 @@ def test_sushi(ctx: TestContext, tmp_path_factory: pytest.TempPathFactory):
         personal_paths=[pathlib.Path("~/.sqlmesh/config.yaml").expanduser()],
     )
 
+    # To enable parallelism in integration tests
+    config.gateways = {ctx.gateway: config.gateways[ctx.gateway]}
     current_gateway_config = config.gateways[ctx.gateway]
     current_gateway_config.state_schema = sushi_state_schema
 
@@ -1474,10 +1484,6 @@ def test_sushi(ctx: TestContext, tmp_path_factory: pytest.TempPathFactory):
                 "table": "Sushi customer data",
                 "column": {"customer_id": "customer_id uniquely identifies customers"},
             },
-            "marketing": {
-                "table": "Sushi marketing data",
-                "column": {"customer_id": "customer_id uniquely identifies customers \\"},
-            },
             "orders": {
                 "table": "Table of sushi orders.",
             },
@@ -1514,7 +1520,7 @@ def test_sushi(ctx: TestContext, tmp_path_factory: pytest.TempPathFactory):
                     "is_view": x.type == DataObjectType.VIEW,
                 }
                 for x in layer_objects
-                if not x.name.endswith("__temp")
+                if not x.name.endswith("__dev")
             }
 
             for model_name, comment in comments.items():
@@ -1596,7 +1602,7 @@ def test_sushi(ctx: TestContext, tmp_path_factory: pytest.TempPathFactory):
                 if x.name.endswith(table_name_suffix)
             }
             if not check_temp_tables:
-                layer_models = {k: v for k, v in layer_models.items() if not k.endswith("__temp")}
+                layer_models = {k: v for k, v in layer_models.items() if not k.endswith("__dev")}
 
             for model_name, comment in comments.items():
                 layer_table_name = layer_models[model_name]["table_name"]
@@ -1647,14 +1653,13 @@ def test_sushi(ctx: TestContext, tmp_path_factory: pytest.TempPathFactory):
         )
 
     # Ensure that the plan has been applied successfully.
-    no_change_plan: Plan = context.plan(
+    no_change_plan: Plan = context.plan_builder(
         environment="test_dev",
         start=start,
         end=end,
         skip_tests=True,
-        no_prompts=True,
         include_unmodified=True,
-    )
+    ).build()
     assert not no_change_plan.requires_backfill
     assert no_change_plan.context_diff.is_new_environment
 
@@ -1731,6 +1736,8 @@ def test_init_project(ctx: TestContext, tmp_path_factory: pytest.TempPathFactory
     if config.model_defaults.dialect != ctx.dialect:
         config.model_defaults = config.model_defaults.copy(update={"dialect": ctx.dialect})
 
+    # To enable parallelism in integration tests
+    config.gateways = {ctx.gateway: config.gateways[ctx.gateway]}
     current_gateway_config = config.gateways[ctx.gateway]
 
     if ctx.dialect == "athena":
@@ -1769,12 +1776,11 @@ def test_init_project(ctx: TestContext, tmp_path_factory: pytest.TempPathFactory
     assert len(physical_layer_results.tables) == len(physical_layer_results.non_temp_tables) == 3
 
     # make and validate unmodified dev environment
-    no_change_plan: Plan = context.plan(
+    no_change_plan: Plan = context.plan_builder(
         environment="test_dev",
         skip_tests=True,
-        no_prompts=True,
         include_unmodified=True,
-    )
+    ).build()
     assert not no_change_plan.requires_backfill
     assert no_change_plan.context_diff.is_new_environment
 
@@ -2334,6 +2340,8 @@ def test_value_normalization(
                     )
                 ],
             )
+    if ctx.dialect == "tsql" and column_type == exp.DataType.Type.DATETIME:
+        full_column_type = exp.DataType.build("DATETIME2", dialect="tsql")
 
     columns_to_types = {
         "_idx": exp.DataType.build(DATA_TYPE.INT),

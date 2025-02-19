@@ -9,7 +9,7 @@ import typing as t
 from unittest import mock
 
 import pytest
-from freezegun import freeze_time
+import time_machine
 from pytest_mock.plugin import MockerFixture
 from sqlglot import exp
 
@@ -52,7 +52,7 @@ def get_columns(
     return controller._context.engine_adapter.columns(table)
 
 
-@freeze_time("2023-01-01 15:00:00")
+@time_machine.travel("2023-01-01 15:00:00 UTC")
 def test_merge_pr_has_non_breaking_change(
     github_client,
     make_controller,
@@ -248,7 +248,7 @@ def test_merge_pr_has_non_breaking_change(
         )
 
 
-@freeze_time("2023-01-01 15:00:00")
+@time_machine.travel("2023-01-01 15:00:00 UTC")
 def test_merge_pr_has_non_breaking_change_diff_start(
     github_client,
     make_controller,
@@ -379,8 +379,8 @@ def test_merge_pr_has_non_breaking_change_diff_start(
 - `sushi.top_waiters`
 
 
-**Models needing backfill (missing dates):**
-* `sushi.waiter_revenue_by_day`: 2022-12-25 - 2022-12-28
+**Models needing backfill:**
+* `sushi.waiter_revenue_by_day`: [2022-12-25 - 2022-12-28]
 """
     assert prod_plan_preview_checks_runs[2]["output"]["summary"] == expected_prod_plan
 
@@ -447,7 +447,7 @@ def test_merge_pr_has_non_breaking_change_diff_start(
         )
 
 
-@freeze_time("2023-01-01 15:00:00")
+@time_machine.travel("2023-01-01 15:00:00 UTC")
 def test_merge_pr_has_non_breaking_change_no_categorization(
     github_client,
     make_controller,
@@ -757,7 +757,7 @@ def test_merge_pr_has_no_changes(
         )
 
 
-@freeze_time("2023-01-01 15:00:00")
+@time_machine.travel("2023-01-01 15:00:00 UTC")
 def test_no_merge_since_no_deploy_signal(
     github_client,
     make_controller,
@@ -938,7 +938,7 @@ def test_no_merge_since_no_deploy_signal(
         )
 
 
-@freeze_time("2023-01-01 15:00:00")
+@time_machine.travel("2023-01-01 15:00:00 UTC")
 def test_no_merge_since_no_deploy_signal_no_approvers_defined(
     github_client,
     make_controller,
@@ -1066,8 +1066,8 @@ def test_no_merge_since_no_deploy_signal_no_approvers_defined(
 - `sushi.top_waiters`
 
 
-**Models needing backfill (missing dates):**
-* `sushi.waiter_revenue_by_day`: 2022-12-25 - 2022-12-29
+**Models needing backfill:**
+* `sushi.waiter_revenue_by_day`: [2022-12-25 - 2022-12-29]
 """
     assert prod_plan_preview_checks_runs[2]["output"]["title"] == "Prod Plan Preview"
     assert prod_plan_preview_checks_runs[2]["output"]["summary"] == expected_prod_plan
@@ -1098,7 +1098,7 @@ def test_no_merge_since_no_deploy_signal_no_approvers_defined(
         )
 
 
-@freeze_time("2023-01-01 15:00:00")
+@time_machine.travel("2023-01-01 15:00:00 UTC")
 def test_deploy_comment_pre_categorized(
     github_client,
     make_controller,
@@ -1285,7 +1285,7 @@ def test_deploy_comment_pre_categorized(
         )
 
 
-@freeze_time("2023-01-01 15:00:00")
+@time_machine.travel("2023-01-01 15:00:00 UTC")
 def test_error_msg_when_applying_plan_with_bug(
     github_client,
     make_controller,
@@ -1438,7 +1438,7 @@ def test_error_msg_when_applying_plan_with_bug(
         )
 
 
-@freeze_time("2023-01-01 15:00:00")
+@time_machine.travel("2023-01-01 15:00:00 UTC")
 def test_overlapping_changes_models(
     github_client,
     make_controller,
@@ -1644,7 +1644,7 @@ def test_overlapping_changes_models(
         )
 
 
-@freeze_time("2023-01-01 15:00:00")
+@time_machine.travel("2023-01-01 15:00:00 UTC")
 def test_pr_delete_model(
     github_client,
     make_controller,

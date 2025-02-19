@@ -4,7 +4,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
-from freezegun import freeze_time
+import time_machine
 from pytest_mock.plugin import MockerFixture
 from sqlglot import parse_one
 
@@ -41,7 +41,6 @@ from sqlmesh.utils.date import (
     yesterday_ds,
 )
 from sqlmesh.utils.errors import PlanError
-from sqlmesh.utils.metaprogramming import Executable
 
 
 def test_forward_only_plan_sets_version(make_snapshot, mocker: MockerFixture):
@@ -61,6 +60,7 @@ def test_forward_only_plan_sets_version(make_snapshot, mocker: MockerFixture):
             ),
             version="test_version",
             change_category=SnapshotChangeCategory.FORWARD_ONLY,
+            dev_table_suffix="dev",
         ),
     )
     assert not snapshot_b.version
@@ -304,6 +304,7 @@ def test_paused_forward_only_parent(make_snapshot, mocker: MockerFixture):
             ),
             version="test_version",
             change_category=SnapshotChangeCategory.BREAKING,
+            dev_table_suffix="dev",
         ),
     )
     snapshot_a.categorize_as(SnapshotChangeCategory.FORWARD_ONLY)
@@ -363,7 +364,9 @@ def test_forward_only_plan_allow_destructive_models(
         previous_finalized_snapshots=None,
     )
 
-    with pytest.raises(PlanError, match="Plan results in a destructive change to forward-only"):
+    with pytest.raises(
+        PlanError, match="Plan requires a destructive change to a forward-only model"
+    ):
         PlanBuilder(context_diff_a, schema_differ, forward_only=False).build()
 
     logger = logging.getLogger("sqlmesh.core.plan.builder")
@@ -437,13 +440,13 @@ def test_forward_only_plan_allow_destructive_models(
 
     with pytest.raises(
         PlanError,
-        match="""Plan results in a destructive change to forward-only model '"b"'s schema.""",
+        match="""Plan requires a destructive change to a forward-only model.""",
     ):
         PlanBuilder(context_diff_b, schema_differ, forward_only=True).build()
 
     with pytest.raises(
         PlanError,
-        match="""Plan results in a destructive change to forward-only model '"c"'s schema.""",
+        match="""Plan requires a destructive change to a forward-only model.""",
     ):
         PlanBuilder(
             context_diff_b, schema_differ, forward_only=True, allow_destructive_models=['"b"']
@@ -493,7 +496,7 @@ def test_forward_only_model_on_destructive_change(
 
     with pytest.raises(
         PlanError,
-        match="""Plan results in a destructive change to forward-only model '"a"'s schema that drops columns 'one', 'two'.""",
+        match="""Plan requires a destructive change to a forward-only model.""",
     ):
         PlanBuilder(context_diff_1, schema_differ).build()
 
@@ -519,6 +522,7 @@ def test_forward_only_model_on_destructive_change(
                 metadata_hash="test_metadata_hash",
             ),
             version="test_version",
+            dev_table_suffix="dev",
         ),
     )
 
@@ -576,6 +580,7 @@ def test_forward_only_model_on_destructive_change(
                 metadata_hash="test_metadata_hash",
             ),
             version="test_version",
+            dev_table_suffix="dev",
         ),
     )
 
@@ -598,6 +603,7 @@ def test_forward_only_model_on_destructive_change(
                 metadata_hash="test_metadata_hash",
             ),
             version="test_version",
+            dev_table_suffix="dev",
         ),
     )
 
@@ -727,7 +733,7 @@ def test_missing_intervals_lookback(make_snapshot, mocker: MockerFixture):
 
 
 @pytest.mark.slow
-@freeze_time()
+@time_machine.travel(now(), tick=False)
 def test_restate_models(sushi_context_pre_scheduling: Context):
     plan = sushi_context_pre_scheduling.plan(
         restate_models=["sushi.waiter_revenue_by_day", "tag:expensive"], no_prompts=True
@@ -781,15 +787,18 @@ def test_restate_models(sushi_context_pre_scheduling: Context):
 
 
 @pytest.mark.slow
-@freeze_time()
-def test_restate_models_with_existing_missing_intervals(sushi_context: Context):
+@time_machine.travel(now(minute_floor=False), tick=False)
+def test_restate_models_with_existing_missing_intervals(init_and_plan_context: t.Callable):
+    sushi_context, plan = init_and_plan_context("examples/sushi")
+    sushi_context.apply(plan)
+
     yesterday_ts = to_timestamp(yesterday_ds())
 
     assert not sushi_context.plan(no_prompts=True).requires_backfill
     waiter_revenue_by_day = sushi_context.snapshots['"memory"."sushi"."waiter_revenue_by_day"']
-    waiter_revenue_by_day.intervals = [
-        (waiter_revenue_by_day.intervals[0][0], yesterday_ts),
-    ]
+    sushi_context.state_sync.remove_intervals(
+        [(waiter_revenue_by_day, (yesterday_ts, waiter_revenue_by_day.intervals[0][1]))]
+    )
     assert sushi_context.plan(no_prompts=True).requires_backfill
 
     plan = sushi_context.plan(restate_models=["sushi.waiter_revenue_by_day"], no_prompts=True)
@@ -1844,6 +1853,12 @@ def test_disable_restatement(make_snapshot, mocker: MockerFixture):
         snapshot.snapshot_id: (to_timestamp(plan.start), to_timestamp(to_date("today")))
     }
 
+    # We don't want to restate a disable_restatement model if it is unpaused since that would be mean we are violating
+    # the model kind property
+    snapshot.unpaused_ts = 9999999999
+    plan = PlanBuilder(context_diff, schema_differ, is_dev=True, restate_models=['"a"']).build()
+    assert plan.restatements == {}
+
 
 def test_revert_to_previous_value(make_snapshot, mocker: MockerFixture):
     """
@@ -2549,7 +2564,6 @@ def test_plan_start_when_preview_enabled(make_snapshot, mocker: MockerFixture):
 
     default_start_for_preview = "2024-06-09"
 
-    # When a model is added SQLMesh should not consider the backfill to be a preview.
     plan_builder = PlanBuilder(
         context_diff,
         DuckDBEngineAdapter.SCHEMA_DIFFER,
@@ -2557,7 +2571,7 @@ def test_plan_start_when_preview_enabled(make_snapshot, mocker: MockerFixture):
         is_dev=True,
         enable_preview=True,
     )
-    assert plan_builder.build().start == to_timestamp(model_start)
+    assert plan_builder.build().start == default_start_for_preview
 
     # When a model is modified then the backfill should be a preview.
     snapshot = make_snapshot(model)
@@ -2615,29 +2629,6 @@ def test_interval_end_per_model(make_snapshot):
         is_dev=True,
     )
     assert plan_builder.build().interval_end_per_model is None
-
-
-def test_plan_requirements(mocker):
-    context = Context(paths="examples/sushi")
-    model = context.get_model("sushi.items")
-    model.python_env["ruamel"] = Executable(payload="import ruamel", kind="import")
-    model.python_env["Image"] = Executable(
-        payload="from ipywidgets.widgets.widget_media import Image", kind="import"
-    )
-
-    environment = context.plan(
-        "dev", no_prompts=True, skip_tests=True, skip_backfill=True, auto_apply=True
-    ).environment
-    requirements = {"ipywidgets", "numpy", "pandas", "ruamel.yaml", "ruamel.yaml.clib"}
-    assert environment.requirements["pandas"] == "2.2.2"
-    assert set(environment.requirements) == requirements
-
-    mocker.patch(
-        "sqlmesh.core.context_diff.ContextDiff.requirements", {"numpy": "2.1.2", "pandas": "2.2.1"}
-    )
-    diff = context.plan("dev", no_prompts=True, skip_tests=True, skip_backfill=True).context_diff
-    assert set(diff.previous_requirements) == requirements
-    assert set(diff.requirements) == {"numpy", "pandas"}
 
 
 def test_unaligned_start_model_with_forward_only_preview(make_snapshot):
@@ -2706,3 +2697,59 @@ def test_unaligned_start_model_with_forward_only_preview(make_snapshot):
     assert set(plan.restatements) == {new_snapshot_a.snapshot_id, snapshot_b.snapshot_id}
     assert not plan.deployability_index.is_deployable(new_snapshot_a)
     assert not plan.deployability_index.is_deployable(snapshot_b)
+
+
+def test_restate_production_model_in_dev(make_snapshot, mocker: MockerFixture):
+    snapshot = make_snapshot(
+        SqlModel(
+            name="test_model_a",
+            dialect="duckdb",
+            query=parse_one("select 1, ds"),
+            kind=dict(name=ModelKindName.INCREMENTAL_BY_TIME_RANGE, time_column="ds"),
+        )
+    )
+
+    prod_snapshot = make_snapshot(
+        SqlModel(
+            name="test_model_b",
+            dialect="duckdb",
+            query=parse_one("select 2, ds"),
+            kind=dict(name=ModelKindName.INCREMENTAL_BY_TIME_RANGE, time_column="ds"),
+        )
+    )
+    prod_snapshot.unpaused_ts = 1
+
+    context_diff = ContextDiff(
+        environment="test_environment",
+        is_new_environment=False,
+        is_unfinalized_environment=True,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={},
+        snapshots={snapshot.snapshot_id: snapshot, prod_snapshot.snapshot_id: prod_snapshot},
+        new_snapshots={},
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+    )
+
+    mock_console = mocker.Mock()
+
+    plan = PlanBuilder(
+        context_diff,
+        DuckDBEngineAdapter.SCHEMA_DIFFER,
+        is_dev=True,
+        restate_models={snapshot.name, prod_snapshot.name},
+        console=mock_console,
+    ).build()
+
+    assert len(plan.restatements) == 1
+    assert prod_snapshot.snapshot_id not in plan.restatements
+
+    mock_console.log_warning.assert_called_once_with(
+        "Cannot restate model '\"test_model_b\"' because the current version is used in production. "
+        "Run the restatement against the production environment instead to restate this model."
+    )

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import inspect
-import logging
 import sys
 import types
 import typing as t
@@ -10,7 +9,7 @@ from functools import reduce
 from itertools import chain
 from pathlib import Path
 from string import Template
-from datetime import datetime
+from datetime import datetime, date
 
 import sqlglot
 from jinja2 import Environment
@@ -39,7 +38,7 @@ from sqlmesh.utils import (
     columns_to_types_all_known,
     registry_decorator,
 )
-from sqlmesh.utils.date import DatetimeRanges
+from sqlmesh.utils.date import DatetimeRanges, to_datetime, to_date
 from sqlmesh.utils.errors import MacroEvalError, SQLMeshError
 from sqlmesh.utils.jinja import JinjaMacroRegistry, has_jinja
 from sqlmesh.utils.metaprogramming import Executable, prepare_env, print_exception
@@ -57,13 +56,12 @@ else:
     UNION_TYPES = (t.Union,)
 
 
-logger = logging.getLogger(__name__)
-
-
 class RuntimeStage(Enum):
     LOADING = "loading"
     CREATING = "creating"
     EVALUATING = "evaluating"
+    PROMOTING = "promoting"
+    AUDITING = "auditing"
     TESTING = "testing"
 
 
@@ -448,6 +446,14 @@ class MacroEvaluator:
         return self.locals["runtime_stage"]
 
     @property
+    def this_model(self) -> str:
+        """Returns the resolved name of the surrounding model."""
+        this_model = self.locals.get("this_model")
+        if not this_model:
+            raise SQLMeshError("Model name is not available in the macro evaluator.")
+        return this_model.sql(dialect=self.dialect, identify=True, comments=False)
+
+    @property
     def engine_adapter(self) -> EngineAdapter:
         engine_adapter = self.locals.get("engine_adapter")
         if not engine_adapter:
@@ -765,7 +771,9 @@ def star(
     if exclude and not isinstance(exclude, (exp.Array, exp.Tuple)):
         raise SQLMeshError(f"Invalid exclude '{exclude}'. Expected an array.")
     if except_ != exp.tuple_():
-        logger.warning(
+        from sqlmesh.core.console import get_console
+
+        get_console().log_warning(
             "The 'except_' argument in @STAR will soon be deprecated. Use 'exclude' instead."
         )
         if not isinstance(exclude, (exp.Array, exp.Tuple)):
@@ -1177,6 +1185,59 @@ def date_spine(
     return exp.select(alias_name).from_(exploded)
 
 
+@macro()
+def resolve_template(
+    evaluator: MacroEvaluator,
+    template: exp.Literal,
+    mode: str = "literal",
+) -> t.Union[exp.Literal, exp.Table]:
+    """
+    Generates either a String literal or an exp.Table representing a physical table location, based on rendering the provided template String literal.
+
+    Note: It relies on the @this_model variable being available in the evaluation context (@this_model resolves to an exp.Table object
+    representing the current physical table).
+    Therefore, the @resolve_template macro must be used at creation or evaluation time and not at load time.
+
+    Args:
+        template: Template string literal. Can contain the following placeholders:
+            @{catalog_name} -> replaced with the catalog of the exp.Table returned from @this_model
+            @{schema_name} -> replaced with the schema of the exp.Table returned from @this_model
+            @{table_name} -> replaced with the name of the exp.Table returned from @this_model
+        mode: What to return.
+            'literal' -> return an exp.Literal string
+            'table' -> return an exp.Table
+
+    Example:
+        >>> from sqlglot import parse_one, exp
+        >>> from sqlmesh.core.macros import MacroEvaluator, RuntimeStage
+        >>> sql = "@resolve_template('s3://data-bucket/prod/@{catalog_name}/@{schema_name}/@{table_name}')"
+        >>> evaluator = MacroEvaluator(runtime_stage=RuntimeStage.CREATING)
+        >>> evaluator.locals.update({"this_model": exp.to_table("test_catalog.sqlmesh__test.test__test_model__2517971505")})
+        >>> evaluator.transform(parse_one(sql)).sql()
+        "'s3://data-bucket/prod/test_catalog/sqlmesh__test/test__test_model__2517971505'"
+    """
+    if "this_model" in evaluator.locals:
+        this_model = exp.to_table(evaluator.locals["this_model"], dialect=evaluator.dialect)
+        template_str: str = template.this
+        result = (
+            template_str.replace("@{catalog_name}", this_model.catalog)
+            .replace("@{schema_name}", this_model.db)
+            .replace("@{table_name}", this_model.name)
+        )
+
+        if mode.lower() == "table":
+            return exp.to_table(result, dialect=evaluator.dialect)
+        return exp.Literal.string(result)
+    elif evaluator.runtime_stage != RuntimeStage.LOADING.value:
+        # only error if we are CREATING, EVALUATING or TESTING and @this_model is not present; this could indicate a bug
+        # otherwise, for LOADING, it's a no-op
+        raise SQLMeshError(
+            "@this_model must be present in the macro evaluation context in order to use @resolve_template"
+        )
+
+    return template
+
+
 def normalize_macro_name(name: str) -> str:
     """Prefix macro name with @ and upcase"""
     return f"@{name.upper()}"
@@ -1274,6 +1335,10 @@ def _coerce(
             return expr.name
         if base is bool and isinstance(expr, exp.Boolean):
             return expr.this
+        if base is datetime and isinstance(expr, exp.Literal):
+            return to_datetime(expr.this)
+        if base is date and isinstance(expr, exp.Literal):
+            return to_date(expr.this)
         if base is tuple and isinstance(expr, (exp.Tuple, exp.Array)):
             generic = t.get_args(typ)
             if not generic:
@@ -1295,10 +1360,10 @@ def _coerce(
     except Exception:
         if strict:
             raise
-        logger.error(
-            "Coercion of expression '%s' to type '%s' failed. Using non coerced expression at '%s'",
-            expr,
-            typ,
-            path,
+
+        from sqlmesh.core.console import get_console
+
+        get_console().log_error(
+            f"Coercion of expression '{expr}' to type '{typ}' failed. Using non coerced expression at '{path}'",
         )
         return expr

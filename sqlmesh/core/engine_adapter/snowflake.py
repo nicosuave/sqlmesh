@@ -50,7 +50,6 @@ class SnowflakeEngineAdapter(GetCurrentCatalogFromFunctionMixin, ClusteredByMixi
     SUPPORTS_MATERIALIZED_VIEW_SCHEMA = True
     SUPPORTS_CLONING = True
     SUPPORTS_MANAGED_MODELS = True
-    CATALOG_SUPPORT = CatalogSupport.FULL_SUPPORT
     CURRENT_CATALOG_EXPRESSION = exp.func("current_database")
     SCHEMA_DIFFER = SchemaDiffer(
         parameterized_type_defaults={
@@ -108,6 +107,10 @@ class SnowflakeEngineAdapter(GetCurrentCatalogFromFunctionMixin, ClusteredByMixi
                 {"connection": self._connection_pool.get()}
             ).getOrCreate()
         return None
+
+    @property
+    def catalog_support(self) -> CatalogSupport:
+        return CatalogSupport.FULL_SUPPORT
 
     def create_managed_table(
         self,
@@ -204,6 +207,7 @@ class SnowflakeEngineAdapter(GetCurrentCatalogFromFunctionMixin, ClusteredByMixi
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         table_description: t.Optional[str] = None,
         table_kind: t.Optional[str] = None,
+        **kwargs: t.Any,
     ) -> t.Optional[exp.Properties]:
         properties: t.List[exp.Expression] = []
 

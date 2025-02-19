@@ -12,7 +12,6 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 from io import StringIO
-from freezegun import freeze_time
 from pandas.api.types import is_object_dtype
 from sqlglot import Dialect, exp
 from sqlglot.optimizer.annotate_types import annotate_types
@@ -24,7 +23,7 @@ from sqlmesh.core.engine_adapter import EngineAdapter
 from sqlmesh.core.macros import RuntimeStage
 from sqlmesh.core.model import Model, PythonModel, SqlModel
 from sqlmesh.utils import UniqueKeyDict, random_id, type_is_known, yaml
-from sqlmesh.utils.date import date_dict, pandas_timestamp_to_pydatetime
+from sqlmesh.utils.date import date_dict, pandas_timestamp_to_pydatetime, to_datetime
 from sqlmesh.utils.errors import ConfigError, TestError
 from sqlmesh.utils.yaml import load as yaml_load
 
@@ -32,6 +31,7 @@ if t.TYPE_CHECKING:
     from sqlglot.dialects.dialect import DialectType
 
     Row = t.Dict[str, t.Any]
+
 
 TIME_KWARG_KEYS = {
     "start",
@@ -105,15 +105,27 @@ class ModelTest(unittest.TestCase):
         self._transforms = self._test_adapter_dialect.generator_class.TRANSFORMS
         self._execution_time = str(self.body.get("vars", {}).get("execution_time") or "")
 
+        if self._execution_time:
+            # Normalizes the execution time by converting it into UTC timezone
+            self._execution_time = str(to_datetime(self._execution_time))
+
         # When execution_time is set, we mock the CURRENT_* SQL expressions so they always return it
         if self._execution_time:
             exec_time = exp.Literal.string(self._execution_time)
             self._transforms = {
                 **self._transforms,
-                exp.CurrentDate: lambda self, _: self.sql(exp.cast(exec_time, "date")),
-                exp.CurrentDatetime: lambda self, _: self.sql(exp.cast(exec_time, "datetime")),
-                exp.CurrentTime: lambda self, _: self.sql(exp.cast(exec_time, "time")),
-                exp.CurrentTimestamp: lambda self, _: self.sql(exp.cast(exec_time, "timestamp")),
+                exp.CurrentDate: lambda self, _: self.sql(
+                    exp.cast(exec_time, "date", dialect=dialect)
+                ),
+                exp.CurrentDatetime: lambda self, _: self.sql(
+                    exp.cast(exec_time, "datetime", dialect=dialect)
+                ),
+                exp.CurrentTime: lambda self, _: self.sql(
+                    exp.cast(exec_time, "time", dialect=dialect)
+                ),
+                exp.CurrentTimestamp: lambda self, _: self.sql(
+                    exp.cast(exec_time, "timestamp", dialect=dialect)
+                ),
             }
 
         super().__init__()
@@ -219,13 +231,21 @@ class ModelTest(unittest.TestCase):
             if is_object_dtype(actual_types[col]) and len(actual[col]) != 0
         }
         for col, value in object_sentinel_values.items():
-            # can't use `isinstance()` here - https://stackoverflow.com/a/68743663/1707525
-            if type(value) is datetime.date:
-                expected[col] = pd.to_datetime(expected[col], errors="ignore").dt.date  # type: ignore
-            elif type(value) is datetime.time:
-                expected[col] = pd.to_datetime(expected[col], errors="ignore").dt.time  # type: ignore
-            elif type(value) is datetime.datetime:
-                expected[col] = pd.to_datetime(expected[col], errors="ignore").dt.to_pydatetime()  # type: ignore
+            try:
+                # can't use `isinstance()` here - https://stackoverflow.com/a/68743663/1707525
+                if type(value) is datetime.date:
+                    expected[col] = pd.to_datetime(expected[col]).dt.date
+                elif type(value) is datetime.time:
+                    expected[col] = pd.to_datetime(expected[col]).dt.time
+                elif type(value) is datetime.datetime:
+                    expected[col] = pd.to_datetime(expected[col]).dt.to_pydatetime()
+            except Exception as e:
+                from sqlmesh.core.console import get_console
+
+                get_console().log_warning(
+                    f"Failed to convert expected value for {col} into `datetime` "
+                    f"for unit test '{str(self)}'. {str(e)}."
+                )
 
         actual = actual.replace({np.nan: None})
         expected = expected.replace({np.nan: None})
@@ -290,7 +310,7 @@ class ModelTest(unittest.TestCase):
         path: Path | None,
         preserve_fixtures: bool = False,
         default_catalog: str | None = None,
-    ) -> ModelTest:
+    ) -> t.Optional[ModelTest]:
         """Create a SqlModelTest or a PythonModelTest.
 
         Args:
@@ -309,7 +329,12 @@ class ModelTest(unittest.TestCase):
         name = normalize_model_name(name, default_catalog=default_catalog, dialect=dialect)
         model = models.get(name)
         if not model:
-            _raise_error(f"Model '{name}' was not found", path)
+            from sqlmesh.core.console import get_console
+
+            get_console().log_warning(
+                f"Model '{name}' was not found{' at ' + str(path) if path else ''}"
+            )
+            return None
 
         if isinstance(model, SqlModel):
             test_type: t.Type[ModelTest] = SqlModelTest
@@ -649,9 +674,15 @@ class PythonModelTest(ModelTest):
 
     def _execute_model(self) -> pd.DataFrame:
         """Executes the python model and returns a DataFrame."""
-        time_ctx = freeze_time(self._execution_time) if self._execution_time else nullcontext()
+        if self._execution_time:
+            import time_machine
+
+            time_ctx: AbstractContextManager = time_machine.travel(self._execution_time, tick=False)
+        else:
+            time_ctx = nullcontext()
+
         with patch.dict(self._test_adapter_dialect.generator_class.TRANSFORMS, self._transforms):
-            with t.cast(AbstractContextManager, time_ctx):
+            with time_ctx:
                 variables = self.body.get("vars", {}).copy()
                 time_kwargs = {
                     key: variables.pop(key) for key in TIME_KWARG_KEYS if key in variables
@@ -733,6 +764,8 @@ def generate_test(
         path=fixture_path,
         default_catalog=model.default_catalog,
     )
+    if not test:
+        return
 
     test.setUp()
 

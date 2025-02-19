@@ -38,10 +38,75 @@ Configuration options for SQLMesh model properties. Supported by all model kinds
 | `allow_partials`      | Whether this model can process partial (incomplete) data intervals                                                                                                                                                                                                                                                                                          |       bool        |    N     |
 | `enabled`             | Whether the model is enabled. This attribute is `true` by default. Setting it to `false` causes SQLMesh to ignore this model when loading the project.                                                                                                                                                                                                      |       bool        |    N     |
 | `gateway`             | Specifies the gateway to use for the execution of this model. When not specified, the default gateway is used.                                                                                                                                                                                                       |       str        |    N     |
+| `optimize_query`             | Whether the model's query should be optimized. This attribute is `true` by default. Setting it to `false` causes SQLMesh to disable query canonicalization & simplification. This should be turned off only if the optimized query leads to errors such as surpassing text limit.                                                                                                                                                                                                      |       bool        |    N     |
+| `validate_query`             | Whether the model's query will be strictly validated at compile time. This attribute is `false` by default. Setting it to `true` causes SQLMesh to raise an error instead of emitting warnings. This will display invalid columns in your SQL statements along with models containing `SELECT *` that cannot be automatically expanded to list out all columns.                                                                                                                                                                                              |       bool        |    N     |
 
 ### Model defaults
 
 The SQLMesh project-level configuration must contain the `model_defaults` key and must specify a value for its `dialect` key. Other values are set automatically unless explicitly overridden in the model definition. Learn more about project-level configuration in the [configuration guide](../guides/configuration.md).
+
+In `physical_properties`, `virtual_properties`, and `session_properties`, when both project-level and model-specific properties are defined, they are merged, with model-level properties taking precedence. To unset a project-wide property for a specific model, set it to `None` in the `MODEL`'s DDL properties or within the `@model` decorator for Python models.
+
+For example, with the following `model_defaults` configuration:
+
+=== "YAML"
+
+    ```yaml linenums="1"
+    model_defaults:
+      dialect: snowflake
+      start: 2022-01-01
+      physical_properties:
+        partition_expiration_days: 7
+        require_partition_filter: True
+        project_level_property: "value"
+    ```
+
+=== "Python"
+
+    ```python linenums="1"
+    from sqlmesh.core.config import Config, ModelDefaultsConfig
+
+    config = Config(
+      model_defaults=ModelDefaultsConfig(
+        dialect="snowflake",
+        start="2022-01-01",
+        physical_properties={
+          "partition_expiration_days": 7,
+          "require_partition_filter": True,
+          "project_level_property": "value"
+        },
+      ),
+    )
+    ```
+
+To override `partition_expiration_days`, add a new `creatable_type` property and unset `project_level_property`, you can define the model as follows:
+
+=== "SQL"
+
+    ```sql linenums="1"
+    MODEL (
+      ...,
+      physical_properties (
+        partition_expiration_days = 14,
+        creatable_type = TRANSIENT,
+        project_level_property = None,
+      )
+    );
+    ```
+
+=== "Python"
+
+    ```python linenums="1"
+    @model(
+      ...,
+      physical_properties={
+        "partition_expiration_days": 14,
+        "creatable_type": "TRANSIENT",
+        "project_level_property": None
+      },
+    )
+    ```
+
 
 The SQLMesh project-level `model_defaults` key supports the following options, described in the [general model properties](#general-model-properties) table above:
 
@@ -50,10 +115,18 @@ The SQLMesh project-level `model_defaults` key supports the following options, d
 - cron
 - owner
 - start
+- table_format
 - storage_format
+- physical_properties
+- virtual_properties
 - session_properties (on per key basis)
 - on_destructive_change (described [below](#incremental-models))
 - audits (described [here](../concepts/audits.md#generic-audits))
+- optimize_query
+- validate_query
+- allow_partials
+- enabled
+- interval_unit
 
 
 ### Model Naming
@@ -102,12 +175,12 @@ Configuration options for all incremental models (in addition to [general model 
 Configuration options for [`INCREMENTAL_BY_TIME_RANGE` models](../concepts/models/model_kinds.md#incremental_by_time_range) (in addition to [general model properties](#general-model-properties) and [incremental model properties](#incremental-models)).
 
 | Option              | Description                                                                                                                                                                                                                                                                                                                      | Type | Required |
-|---------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:----:|:--------:|
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--: | :------: |
 | `time_column`       | The model column containing each row's timestamp. Should be UTC time zone.                                                                                                                                                                                                                                                       | str  |    Y     |
 | `format`            | Argument to `time_column`. Format of the time column's data. (Default: `%Y-%m-%d`)                                                                                                                                                                                                                                               | str  |    N     |
 | `batch_size`        | The maximum number of intervals that can be evaluated in a single backfill task. If this is `None`, all intervals will be processed as part of a single task. If this is set, a model's backfill will be chunked such that each individual task only contains jobs with the maximum of `batch_size` intervals. (Default: `None`) | int  |    N     |
 | `batch_concurrency` | The maximum number of batches that can run concurrently for this model. (Default: the number of concurrent tasks set in the connection settings)                                                                                                                                                                                 | int  |    N     |
-| `lookback`          | The number of time unit intervals prior to the current interval that should be processed. (Default: `0`)                                                                                                                                                                                                                         | int  |    N     |
+| `lookback`          | The number of `interval_unit`s prior to the current interval that should be processed - [learn more](../concepts/models/overview.md#lookback). (Default: `0`)                                                                                                                                                                                                        | int  |    N     |
 
 Python model kind `name` enum value: [ModelKindName.INCREMENTAL_BY_TIME_RANGE](https://sqlmesh.readthedocs.io/en/stable/_readthedocs/html/sqlmesh/core/model/kind.html#ModelKindName)
 
@@ -119,6 +192,7 @@ Configuration options for [`INCREMENTAL_BY_UNIQUE_KEY` models](../concepts/model
 |----------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------|----------|
 | `unique_key`   | The model column(s) containing each row's unique key                                                                                                                                                                                                                                                                             | str \| array[str] | Y        |
 | `when_matched` | SQL logic used to update columns when a match occurs - only available on engines that support `MERGE`. (Default: update all columns)                                                                                                                                                                                             | str               | N        |
+| `merge_filter` | A single or a conjunction of predicates used to filter data in the ON clause of a MERGE operation - only available on engines that support `MERGE`                                                                                                                                                                               | str               | N        |
 | `batch_size`   | The maximum number of intervals that can be evaluated in a single backfill task. If this is `None`, all intervals will be processed as part of a single task. If this is set, a model's backfill will be chunked such that each individual task only contains jobs with the maximum of `batch_size` intervals. (Default: `None`) | int               | N        |
 | `lookback`     | The number of time unit intervals prior to the current interval that should be processed. (Default: `0`)                                                                                                                                                                                                                         | int               | N        |
 

@@ -46,7 +46,6 @@ class MSSQLEngineAdapter(
     DIALECT: str = "tsql"
     SUPPORTS_TUPLE_IN = False
     SUPPORTS_MATERIALIZED_VIEWS = False
-    CATALOG_SUPPORT = CatalogSupport.REQUIRES_SET_CATALOG
     CURRENT_CATALOG_EXPRESSION = exp.func("db_name")
     COMMENT_CREATION_TABLE = CommentCreationTable.UNSUPPORTED
     COMMENT_CREATION_VIEW = CommentCreationView.UNSUPPORTED
@@ -71,6 +70,13 @@ class MSSQLEngineAdapter(
         },
     )
     VARIABLE_LENGTH_DATA_TYPES = {"binary", "varbinary", "char", "varchar", "nchar", "nvarchar"}
+
+    @property
+    def catalog_support(self) -> CatalogSupport:
+        # MSSQL and AzureSQL both use this engine adapter, but they differ in catalog support.
+        # Therefore, we specify the catalog support in the connection config `_extra_engine_config`
+        # instead of in the adapter itself.
+        return self._extra_config["catalog_support"]
 
     def columns(
         self,
@@ -215,8 +221,8 @@ class MSSQLEngineAdapter(
                 self._convert_df_datetime(df, columns_to_types_create)
                 self.create_table(temp_table, columns_to_types_create)
                 rows: t.List[t.Tuple[t.Any, ...]] = list(
-                    df.replace({np.nan: None}).itertuples(index=False, name=None)
-                )  # type: ignore
+                    df.replace({np.nan: None}).itertuples(index=False, name=None)  # type: ignore
+                )
                 conn = self._connection_pool.get()
                 conn.bulk_copy(temp_table.sql(dialect=self.dialect), rows)
             return exp.select(*self._casted_columns(columns_to_types)).from_(temp_table)  # type: ignore

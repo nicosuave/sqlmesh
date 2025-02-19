@@ -15,10 +15,9 @@ from sqlglot.optimizer.simplify import simplify
 from sqlmesh.core import constants as c
 from sqlmesh.core import dialect as d
 from sqlmesh.core.macros import MacroEvaluator, RuntimeStage
-from sqlmesh.utils.date import TimeLike, date_dict, make_inclusive_end, to_datetime
+from sqlmesh.utils.date import TimeLike, date_dict, make_inclusive, to_datetime
 from sqlmesh.utils.errors import (
     ConfigError,
-    MacroEvalError,
     ParsetimeAdapterCallError,
     SQLMeshError,
     raise_config_error,
@@ -51,6 +50,8 @@ class BaseExpressionRenderer:
         quote_identifiers: bool = True,
         model_fqn: t.Optional[str] = None,
         normalize_identifiers: bool = True,
+        optimize_query: t.Optional[bool] = True,
+        validate_query: t.Optional[bool] = False,
     ):
         self._expression = expression
         self._dialect = dialect
@@ -65,6 +66,8 @@ class BaseExpressionRenderer:
         self.update_schema({} if schema is None else schema)
         self._cache: t.List[t.Optional[exp.Expression]] = []
         self._model_fqn = model_fqn
+        self._optimize_query_flag = optimize_query is not False
+        self._validate_query = validate_query
 
     def update_schema(self, schema: t.Dict[str, t.Any]) -> None:
         self.schema = d.normalize_mapping_schema(schema, dialect=self._dialect)
@@ -111,15 +114,22 @@ class BaseExpressionRenderer:
                 self._model_fqn,
                 snapshots={self._model_fqn: this_snapshot} if this_snapshot else None,
                 deployability_index=deployability_index,
+                table_mapping=table_mapping,
             )
 
         expressions = [self._expression]
 
+        start_time, end_time = (
+            make_inclusive(start or c.EPOCH, end or c.EPOCH, self._dialect)
+            if not self._only_execution_time
+            else (None, None)
+        )
+
         render_kwargs = {
             **date_dict(
                 to_datetime(execution_time or c.EPOCH),
-                to_datetime(start or c.EPOCH) if not self._only_execution_time else None,
-                make_inclusive_end(end or c.EPOCH) if not self._only_execution_time else None,
+                start_time,
+                end_time,
             ),
             **kwargs,
         }
@@ -133,7 +143,7 @@ class BaseExpressionRenderer:
             "default_catalog": self._default_catalog,
             "runtime_stage": runtime_stage.value,
             "resolve_table": lambda table: self._resolve_table(
-                table,
+                d.normalize_model_name(table, self._default_catalog, self._dialect),
                 snapshots=snapshots,
                 table_mapping=table_mapping,
                 deployability_index=deployability_index,
@@ -188,7 +198,7 @@ class BaseExpressionRenderer:
         for definition in self._macro_definitions:
             try:
                 macro_evaluator.evaluate(definition)
-            except MacroEvalError as ex:
+            except Exception as ex:
                 raise_config_error(f"Failed to evaluate macro '{definition}'. {ex}", self._path)
 
         macro_evaluator.locals.update(render_kwargs)
@@ -201,8 +211,11 @@ class BaseExpressionRenderer:
         for expression in expressions:
             try:
                 transformed_expressions = ensure_list(macro_evaluator.transform(expression))
-            except MacroEvalError as ex:
-                raise_config_error(f"Failed to resolve macro for expression. {ex}", self._path)
+            except Exception as ex:
+                raise_config_error(
+                    f"Failed to resolve macros for\n{expression.sql(dialect=self._dialect, pretty=True)}\n{ex}",
+                    self._path,
+                )
 
             for expression in t.cast(t.List[exp.Expression], transformed_expressions):
                 with self._normalize_and_quote(expression) as expression:
@@ -438,6 +451,8 @@ class QueryRenderer(BaseExpressionRenderer):
             runtime_stage, start, end, execution_time, *kwargs.values()
         )
 
+        needs_optimization = needs_optimization and self._optimize_query_flag
+
         if should_cache and self._optimized_cache:
             query = self._optimized_cache
         else:
@@ -520,13 +535,20 @@ class QueryRenderer(BaseExpressionRenderer):
                 missing_deps.add(dep)
 
         if self._model_fqn and not should_optimize and any(s.is_star for s in query.selects):
+            from sqlmesh.core.console import get_console
+
             deps = ", ".join(f"'{dep}'" for dep in sorted(missing_deps))
 
-            logger.warning(
+            warning = (
                 f"SELECT * cannot be expanded due to missing schema(s) for model(s): {deps}. "
                 "Run `sqlmesh create_external_models` and / or make sure that the model "
-                f"'{self._model_fqn}' can be rendered at parse time.",
+                f"'{self._model_fqn}' can be rendered at parse time."
             )
+
+            if self._validate_query:
+                raise_config_error(warning, self._path)
+
+            get_console().log_warning(warning)
 
         try:
             if should_optimize:
@@ -545,11 +567,18 @@ class QueryRenderer(BaseExpressionRenderer):
                     )
                 )
         except SqlglotError as ex:
+            from sqlmesh.core.console import get_console
+
+            warning = (
+                f"{ex} for model '{self._model_fqn}', the column may not exist or is ambiguous."
+            )
+
+            if self._validate_query:
+                raise_config_error(warning, self._path)
+
             query = original
 
-            logger.warning(
-                "%s for model '%s', the column may not exist or is ambiguous", ex, self._model_fqn
-            )
+            get_console().log_warning(warning)
         except Exception as ex:
             raise_config_error(
                 f"Failed to optimize query, please file an issue at https://github.com/TobikoData/sqlmesh/issues/new. {ex}",

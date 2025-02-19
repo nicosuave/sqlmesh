@@ -27,7 +27,7 @@ from sqlmesh.core.snapshot.categorizer import categorize_change
 from sqlmesh.core.snapshot.definition import Interval, SnapshotId
 from sqlmesh.utils import columns_to_types_all_known, random_id
 from sqlmesh.utils.dag import DAG
-from sqlmesh.utils.date import TimeLike, now, to_datetime, yesterday_ds
+from sqlmesh.utils.date import TimeLike, now, to_datetime, yesterday_ds, to_timestamp
 from sqlmesh.utils.errors import NoChangesPlanError, PlanError, SQLMeshError
 
 logger = logging.getLogger(__name__)
@@ -131,7 +131,9 @@ class PlanBuilder:
         self._choices: t.Dict[SnapshotId, SnapshotChangeCategory] = {}
 
         self._start = start
-        if not self._start and self._forward_only_preview_needed:
+        if not self._start and (
+            self._forward_only_preview_needed or self._auto_restatement_preview_needed
+        ):
             self._start = default_start or yesterday_ds()
 
         self._plan_id: str = random_id()
@@ -327,10 +329,17 @@ class PlanBuilder:
             if not snapshot:
                 raise PlanError(f"Cannot restate model '{model_fqn}'. Model does not exist.")
             if not forward_only_preview_needed:
-                if not self._is_dev and snapshot.disable_restatement:
-                    # This is a warning but we print this as error since the Console is lacking API for warnings.
-                    self._console.log_error(
-                        f"Cannot restate model '{model_fqn}'. Restatement is disabled for this model."
+                if self._is_dev and not snapshot.is_paused:
+                    self._console.log_warning(
+                        f"Cannot restate model '{model_fqn}' because the current version is used in production. "
+                        "Run the restatement against the production environment instead to restate this model."
+                    )
+                    continue
+                elif (not self._is_dev or not snapshot.is_paused) and snapshot.disable_restatement:
+                    self._console.log_warning(
+                        f"Cannot restate model '{model_fqn}'. "
+                        "Restatement is disabled for this model to prevent possible data loss."
+                        "If you want to restate this model, change the model's `disable_restatement` setting to `false`."
                     )
                     continue
                 elif snapshot.is_symbolic or snapshot.is_seed:
@@ -341,7 +350,8 @@ class PlanBuilder:
             for downstream_s_id in dag.downstream(snapshot.snapshot_id):
                 if is_restateable_snapshot(self._context_diff.snapshots[downstream_s_id]):
                     restatements[downstream_s_id] = dummy_interval
-        # Get restatement intervals for all restated snapshots and make sure that if a snapshot expands it's
+
+        # Get restatement intervals for all restated snapshots and make sure that if an incremental snapshot expands it's
         # restatement range that it's downstream dependencies all expand their restatement ranges as well.
         for s_id in dag:
             if s_id not in restatements:
@@ -358,11 +368,26 @@ class PlanBuilder:
             # the graph we just have to check our immediate parents in the graph and not the whole upstream graph.
             snapshot_dependencies = snapshot.parents
             possible_intervals = [
-                restatements.get(s, dummy_interval) for s in snapshot_dependencies
+                restatements.get(s, dummy_interval)
+                for s in snapshot_dependencies
+                if self._context_diff.snapshots[s].is_incremental
             ] + [interval]
             snapshot_start = min(i[0] for i in possible_intervals)
             snapshot_end = max(i[1] for i in possible_intervals)
+
+            # We may be tasked with restating a time range smaller than the target snapshot interval unit
+            # For example, restating an hour of Hourly Model A, which has a downstream dependency of Daily Model B
+            # we need to ensure the whole affected day in Model B is restated
+            floored_snapshot_start = snapshot.node.interval_unit.cron_floor(snapshot_start)
+            floored_snapshot_end = snapshot.node.interval_unit.cron_floor(snapshot_end)
+            if to_timestamp(floored_snapshot_end) < snapshot_end:
+                snapshot_start = to_timestamp(floored_snapshot_start)
+                snapshot_end = to_timestamp(
+                    snapshot.node.interval_unit.cron_next(floored_snapshot_end)
+                )
+
             restatements[s_id] = (snapshot_start, snapshot_end)
+
         return restatements
 
     def _build_directly_and_indirectly_modified(
@@ -464,21 +489,20 @@ class PlanBuilder:
                 )
 
                 if has_drop_alteration(schema_diff):
+                    snapshot_name = snapshot.name
                     dropped_column_names = get_dropped_column_names(schema_diff)
-                    dropped_column_str = (
-                        "', '".join(dropped_column_names) if dropped_column_names else None
+                    model_dialect = snapshot.model.dialect
+
+                    get_console().log_destructive_change(
+                        snapshot_name,
+                        dropped_column_names,
+                        schema_diff,
+                        model_dialect,
+                        error=not snapshot.model.on_destructive_change.is_warn,
                     )
-                    dropped_column_msg = (
-                        f" that drops column{'s' if dropped_column_names and len(dropped_column_names) > 1 else ''} '{dropped_column_str}'"
-                        if dropped_column_str
-                        else ""
-                    )
-                    warning_msg = f"Plan results in a destructive change to forward-only model '{snapshot.name}'s schema{dropped_column_msg}."
-                    if snapshot.model.on_destructive_change.is_warn:
-                        logger.warning(warning_msg)
-                    else:
+                    if snapshot.model.on_destructive_change.is_error:
                         raise PlanError(
-                            f"{warning_msg} To allow this, change the model's `on_destructive_change` setting to `warn` or `allow` or include it in the plan's `--allow-destructive-model` option."
+                            "Plan requires a destructive change to a forward-only model."
                         )
 
     def _categorize_snapshots(
@@ -585,7 +609,7 @@ class PlanBuilder:
             if (
                 snapshot.evaluatable
                 and not snapshot.disable_restatement
-                and not snapshot.full_history_restatement_only
+                and (not snapshot.full_history_restatement_only or not snapshot.is_incremental)
             ):
                 snapshot.effective_from = self._effective_from
 
@@ -623,6 +647,8 @@ class PlanBuilder:
         for name, (candidate, promoted) in self._context_diff.modified_snapshots.items():
             if (
                 candidate.snapshot_id not in self._context_diff.new_snapshots
+                and candidate.is_model
+                and not candidate.model.forward_only
                 and promoted.is_forward_only
                 and not promoted.is_paused
                 and not candidate.reuses_previous_version
@@ -673,8 +699,25 @@ class PlanBuilder:
                 self._enable_preview
                 and any(
                     snapshot.model.forward_only
-                    for snapshot, _ in self._context_diff.modified_snapshots.values()
+                    for snapshot in self._modified_and_added_snapshots
                     if snapshot.is_model
                 )
             )
         )
+
+    @cached_property
+    def _auto_restatement_preview_needed(self) -> bool:
+        return self._is_dev and any(
+            snapshot.model.auto_restatement_cron is not None
+            for snapshot in self._modified_and_added_snapshots
+            if snapshot.is_model
+        )
+
+    @cached_property
+    def _modified_and_added_snapshots(self) -> t.List[Snapshot]:
+        return [
+            snapshot
+            for snapshot in self._context_diff.snapshots.values()
+            if snapshot.name in self._context_diff.modified_snapshots
+            or snapshot.snapshot_id in self._context_diff.added
+        ]

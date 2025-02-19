@@ -24,9 +24,9 @@ import sqlmesh
 %context path_to_sqlmesh_project
 ```
 
-### Quick start project
+### Quickstart project
 
-If desired, you can create the [quick start example project](../quick_start.md) with the Python `init_example_project` function. The function requires a default SQL dialect for the project's models; this example uses `snowflake`:
+If desired, you can create the [quickstart example project](../quick_start.md) with the Python `init_example_project` function. The function requires a default SQL dialect for the project's models; this example uses `snowflake`:
 
 ```python
 from sqlmesh.cli.example_project import init_example_project
@@ -103,7 +103,7 @@ options:
             [--no-auto-categorization] [--include-unmodified]
             [--select-model [SELECT_MODEL ...]]
             [--backfill-model [BACKFILL_MODEL ...]] [--no-diff] [--run]
-            [environment]
+            [environment] [--diff-rendered]
 
 Goes through a set of prompts to both establish a plan and apply it
 
@@ -153,6 +153,8 @@ options:
   --no-diff             Hide text differences for changed models.
   --run                 Run latest intervals as part of the plan application
                         (prod environment only).
+  --diff-rendered       Output text differences for the rendered versions of models and standalone audits
+
 ```
 
 #### run_dag

@@ -14,7 +14,7 @@ from sqlmesh.core.macros import MacroRegistry, MacroStrTemplate
 from sqlmesh.utils import str_to_bool
 from sqlmesh.utils.errors import ConfigError, SQLMeshError, raise_config_error
 from sqlmesh.utils.metaprogramming import Executable, build_env, prepare_env, serialize_env
-from sqlmesh.utils.pydantic import field_validator, field_validator_v1_args
+from sqlmesh.utils.pydantic import ValidationInfo, field_validator
 
 if t.TYPE_CHECKING:
     from sqlmesh.utils.jinja import MacroReference
@@ -29,6 +29,7 @@ def make_python_env(
     used_variables: t.Optional[t.Set[str]] = None,
     path: t.Optional[str | Path] = None,
     python_env: t.Optional[t.Dict[str, Executable]] = None,
+    strict_resolution: bool = True,
 ) -> t.Dict[str, Executable]:
     python_env = {} if python_env is None else python_env
     variables = variables or {}
@@ -81,15 +82,25 @@ def make_python_env(
             build_env(used_macro.func, env=env, name=name, path=module_path)
 
     python_env.update(serialize_env(env, path=module_path))
-    return _add_variables_to_python_env(python_env, used_variables, variables)
+    return _add_variables_to_python_env(
+        python_env,
+        used_variables,
+        variables,
+        strict_resolution=strict_resolution,
+    )
 
 
 def _add_variables_to_python_env(
     python_env: t.Dict[str, Executable],
     used_variables: t.Optional[t.Set[str]],
     variables: t.Optional[t.Dict[str, t.Any]],
+    strict_resolution: bool = True,
 ) -> t.Dict[str, Executable]:
-    _, python_used_variables = parse_dependencies(python_env, None)
+    _, python_used_variables = parse_dependencies(
+        python_env,
+        None,
+        strict_resolution=strict_resolution,
+    )
     used_variables = (used_variables or set()) | python_used_variables
 
     variables = {k: v for k, v in (variables or {}).items() if k in used_variables}
@@ -100,12 +111,17 @@ def _add_variables_to_python_env(
 
 
 def parse_dependencies(
-    python_env: t.Dict[str, Executable], entrypoint: t.Optional[str]
+    python_env: t.Dict[str, Executable], entrypoint: t.Optional[str], strict_resolution: bool = True
 ) -> t.Tuple[t.Set[str], t.Set[str]]:
-    """Parses the source of a model function and finds upstream table dependencies and referenced variables based on calls to context / evaluator.
+    """
+    Parses the source of a model function and finds upstream table dependencies
+    and referenced variables based on calls to context / evaluator.
 
     Args:
         python_env: A dictionary of Python definitions.
+        entrypoint: The name of the function.
+        strict_resolution: If true, the arguments of `table` and `resolve_table` calls must
+            be resolvable at parse time, otherwise an exception will be raised.
 
     Returns:
         A tuple containing the set of upstream table dependencies and the set of referenced variables.
@@ -140,9 +156,11 @@ def parse_dependencies(
                         expression = to_source(first_arg)
                         return eval(expression, env)
                     except Exception:
-                        raise ConfigError(
-                            f"Error resolving dependencies for '{executable.path}'. Argument '{expression.strip()}' must be resolvable at parse time."
-                        )
+                        if strict_resolution:
+                            raise ConfigError(
+                                f"Error resolving dependencies for '{executable.path}'. "
+                                f"Argument '{expression.strip()}' must be resolvable at parse time."
+                            )
 
                 if func.value.id == "context" and func.attr in ("table", "resolve_table"):
                     depends_on.add(get_first_arg("model_name"))
@@ -176,11 +194,10 @@ def single_value_or_tuple(values: t.Sequence) -> exp.Identifier | exp.Tuple:
     )
 
 
-@field_validator_v1_args
 def parse_expression(
     cls: t.Type,
     v: t.Union[t.List[str], t.List[exp.Expression], str, exp.Expression, t.Callable, None],
-    values: t.Dict[str, t.Any],
+    info: t.Optional[ValidationInfo],
 ) -> t.List[exp.Expression] | exp.Expression | t.Callable | None:
     """Helper method to deserialize SQLGlot expressions in Pydantic Models."""
     if v is None:
@@ -189,7 +206,7 @@ def parse_expression(
     if callable(v):
         return v
 
-    dialect = values.get("dialect")
+    dialect = info.data.get("dialect") if info else ""
 
     if isinstance(v, list):
         return [
@@ -213,12 +230,14 @@ def parse_bool(v: t.Any) -> bool:
     return str_to_bool(str(v or ""))
 
 
-@field_validator_v1_args
-def parse_properties(cls: t.Type, v: t.Any, values: t.Dict[str, t.Any]) -> t.Optional[exp.Tuple]:
+def parse_properties(
+    cls: t.Type, v: t.Any, info: t.Optional[ValidationInfo]
+) -> t.Optional[exp.Tuple]:
     if v is None:
         return v
 
-    dialect = values.get("dialect")
+    dialect = info.data.get("dialect") if info else ""
+
     if isinstance(v, str):
         v = d.parse_one(v, dialect=dialect)
     if isinstance(v, (exp.Array, exp.Paren, exp.Tuple)):
@@ -254,10 +273,9 @@ def default_catalog(cls: t.Type, v: t.Any) -> t.Optional[str]:
     return str(v)
 
 
-@field_validator_v1_args
-def depends_on(cls: t.Type, v: t.Any, values: t.Dict[str, t.Any]) -> t.Optional[t.Set[str]]:
-    dialect = values.get("dialect")
-    default_catalog = values.get("default_catalog")
+def depends_on(cls: t.Type, v: t.Any, info: ValidationInfo) -> t.Optional[t.Set[str]]:
+    dialect = info.data.get("dialect")
+    default_catalog = info.data.get("default_catalog")
 
     if isinstance(v, exp.Paren):
         v = v.unnest()
@@ -282,18 +300,19 @@ def depends_on(cls: t.Type, v: t.Any, values: t.Dict[str, t.Any]) -> t.Optional[
     return v
 
 
-expression_validator = field_validator(
+expression_validator: t.Callable = field_validator(
     "query",
     "expressions_",
     "pre_statements_",
     "post_statements_",
+    "on_virtual_update_",
     "unique_key",
     mode="before",
     check_fields=False,
 )(parse_expression)
 
 
-bool_validator = field_validator(
+bool_validator: t.Callable = field_validator(
     "skip",
     "blocking",
     "forward_only",
@@ -301,12 +320,14 @@ bool_validator = field_validator(
     "insert_overwrite",
     "allow_partials",
     "enabled",
+    "optimize_query",
+    "validate_query",
     mode="before",
     check_fields=False,
 )(parse_bool)
 
 
-properties_validator = field_validator(
+properties_validator: t.Callable = field_validator(
     "physical_properties_",
     "virtual_properties_",
     "session_properties_",
@@ -316,14 +337,14 @@ properties_validator = field_validator(
 )(parse_properties)
 
 
-default_catalog_validator = field_validator(
+default_catalog_validator: t.Callable = field_validator(
     "default_catalog",
     mode="before",
     check_fields=False,
 )(default_catalog)
 
 
-depends_on_validator = field_validator(
+depends_on_validator: t.Callable = field_validator(
     "depends_on_",
     mode="before",
     check_fields=False,

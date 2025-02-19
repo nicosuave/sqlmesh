@@ -12,16 +12,15 @@ another remote environment and determine if nodes have been added, removed, or m
 
 from __future__ import annotations
 
-import logging
 import sys
 import typing as t
 from difflib import ndiff
 from functools import cached_property
 from sqlmesh.core import constants as c
+from sqlmesh.core.console import get_console
 from sqlmesh.core.snapshot import Snapshot, SnapshotId, SnapshotTableInfo
 from sqlmesh.utils.errors import SQLMeshError
 from sqlmesh.utils.pydantic import PydanticModel
-
 
 if sys.version_info >= (3, 12):
     from importlib import metadata
@@ -33,8 +32,6 @@ if t.TYPE_CHECKING:
     from sqlmesh.core.state_sync import StateReader
 
 IGNORED_PACKAGES = {"sqlmesh", "sqlglot"}
-
-logger = logging.getLogger(__name__)
 
 
 class ContextDiff(PydanticModel):
@@ -74,8 +71,10 @@ class ContextDiff(PydanticModel):
     """Snapshots from the previous finalized state."""
     previous_requirements: t.Dict[str, str] = {}
     """Previous requirements."""
-    provided_requirements: t.Dict[str, str] = {}
-    """Requirements from lock file."""
+    requirements: t.Dict[str, str] = {}
+    """Python dependencies."""
+    diff_rendered: bool = False
+    """Whether the diff should compare raw vs rendered models"""
 
     @classmethod
     def create(
@@ -85,7 +84,9 @@ class ContextDiff(PydanticModel):
         create_from: str,
         state_reader: StateReader,
         ensure_finalized_snapshots: bool = False,
-        requirements: t.Optional[t.Dict[str, str]] = None,
+        provided_requirements: t.Optional[t.Dict[str, str]] = None,
+        excluded_requirements: t.Optional[t.Set[str]] = None,
+        diff_rendered: bool = False,
     ) -> ContextDiff:
         """Create a ContextDiff object.
 
@@ -98,7 +99,8 @@ class ContextDiff(PydanticModel):
             ensure_finalized_snapshots: Whether to compare against snapshots from the latest finalized
                 environment state, or to use whatever snapshots are in the current environment state even if
                 the environment is not finalized.
-            requirements: Fixed requirements to build the context diff with.
+            provided_requirements: Python dependencies sourced from the lock file.
+            excluded_requirements: Python dependencies to exclude.
 
         Returns:
             The ContextDiff object.
@@ -111,7 +113,7 @@ class ContextDiff(PydanticModel):
             env = state_reader.get_environment(create_from.lower())
 
             if not env and create_from != c.PROD:
-                logger.warning(
+                get_console().log_warning(
                     f"The environment name '{create_from}' was passed to the `plan` command's `--create-from` argument, but '{create_from}' does not exist. Initializing new environment '{environment}' from scratch."
                 )
 
@@ -187,6 +189,12 @@ class ContextDiff(PydanticModel):
                         stored[modified_snapshot_info.snapshot_id],
                     )
 
+        requirements = _build_requirements(
+            provided_requirements or {},
+            excluded_requirements or set(),
+            snapshots.values(),
+        )
+
         return ContextDiff(
             environment=environment,
             is_new_environment=is_new_environment,
@@ -203,7 +211,8 @@ class ContextDiff(PydanticModel):
             previously_promoted_snapshot_ids=previously_promoted_snapshot_ids,
             previous_finalized_snapshots=env.previous_finalized_snapshots if env else None,
             previous_requirements=env.requirements if env else {},
-            provided_requirements=requirements,
+            requirements=requirements,
+            diff_rendered=diff_rendered,
         )
 
     @classmethod
@@ -239,7 +248,7 @@ class ContextDiff(PydanticModel):
             previously_promoted_snapshot_ids={s.snapshot_id for s in env.promoted_snapshots},
             previous_finalized_snapshots=env.previous_finalized_snapshots,
             previous_requirements=env.requirements,
-            provided_requirements=env.requirements,
+            requirements=env.requirements,
         )
 
     @property
@@ -291,28 +300,8 @@ class ContextDiff(PydanticModel):
     def snapshots_by_name(self) -> t.Dict[str, Snapshot]:
         return {x.name: x for x in self.snapshots.values()}
 
-    @cached_property
-    def requirements(self) -> t.Dict[str, str]:
-        requirements = self.provided_requirements.copy()
-        distributions = metadata.packages_distributions()
-
-        for snapshot in self.snapshots.values():
-            if snapshot.is_model:
-                for executable in snapshot.model.python_env.values():
-                    if executable.kind == "import":
-                        try:
-                            start = "from " if executable.payload.startswith("from ") else "import "
-                            lib = executable.payload.split(start)[1].split()[0].split(".")[0]
-                            if lib in distributions:
-                                for dist in distributions[lib]:
-                                    if dist not in requirements and dist not in IGNORED_PACKAGES:
-                                        requirements[dist] = metadata.version(dist)
-                        except metadata.PackageNotFoundError:
-                            logger.warning("Failed to find package for %s", lib)
-        return requirements
-
     def requirements_diff(self) -> str:
-        return "\n".join(
+        return "    " + "\n    ".join(
             ndiff(
                 [
                     f"{k}=={self.previous_requirements[k]}"
@@ -402,7 +391,39 @@ class ContextDiff(PydanticModel):
 
         new, old = self.modified_snapshots[name]
         try:
-            return old.node.text_diff(new.node)
+            return old.node.text_diff(new.node, rendered=self.diff_rendered)
         except SQLMeshError as e:
-            logger.warning("Failed to diff model '%s': %s", name, str(e))
+            get_console().log_warning(f"Failed to diff model '{name}': {str(e)}.")
             return ""
+
+
+def _build_requirements(
+    provided_requirements: t.Dict[str, str],
+    excluded_requirements: t.Set[str],
+    snapshots: t.Collection[Snapshot],
+) -> t.Dict[str, str]:
+    requirements = {
+        k: v for k, v in provided_requirements.items() if k not in excluded_requirements
+    }
+    distributions = metadata.packages_distributions()
+
+    for snapshot in snapshots:
+        if snapshot.is_model:
+            for executable in snapshot.model.python_env.values():
+                if executable.kind == "import":
+                    try:
+                        start = "from " if executable.payload.startswith("from ") else "import "
+                        lib = executable.payload.split(start)[1].split()[0].split(".")[0]
+                        if lib in distributions:
+                            for dist in distributions[lib]:
+                                if (
+                                    dist not in requirements
+                                    and dist not in IGNORED_PACKAGES
+                                    and dist not in excluded_requirements
+                                ):
+                                    requirements[dist] = metadata.version(dist)
+                    except metadata.PackageNotFoundError:
+                        from sqlmesh.core.console import get_console
+
+                        get_console().log_warning(f"Failed to find package for {lib}.")
+    return requirements

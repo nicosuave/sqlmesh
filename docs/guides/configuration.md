@@ -334,7 +334,7 @@ With the example configuration above, SQLMesh would evaluate environment names a
 
 SQLMesh compares the current state of project files to an environment when `sqlmesh plan` is run. It detects changes to models, which can be classified as breaking or non-breaking.
 
-SQLMesh can  attempt to automatically [categorize](../concepts/plans.md#change-categories) the changes it detects. The `plan.auto_categorize_changes` option determines whether SQLMesh should attempt automatic change categorization. This option is in the [environments](../reference/configuration.md#environments) section of the configuration reference page.
+SQLMesh can  attempt to automatically [categorize](../concepts/plans.md#change-categories) the changes it detects. The `plan.auto_categorize_changes` option determines whether SQLMesh should attempt automatic change categorization. This option is in the [plan](../reference/configuration.md#plan) section of the configuration reference page.
 
 Supported values:
 
@@ -1058,7 +1058,7 @@ Example enabling debug mode for the CLI command `sqlmesh plan`:
 
 
 ### Python library dependencies
-SQLMesh enables you to write Python models and macros which depend on third-party libraries. To ensure each run / evaluation uses the same version, you can specify versions in a sqlmesh.lock file in the root of your project.
+SQLMesh enables you to write Python models and macros which depend on third-party libraries. To ensure each run / evaluation uses the same version, you can specify versions in a `sqlmesh-requirements.lock` file in the root of your project.
 
 The sqlmesh.lock must be of the format `dep==version`. Only `==` is supported.
 
@@ -1070,3 +1070,12 @@ pandas==2.2.3
 ```
 
 This feature is only available in [Tobiko Cloud](https://tobikodata.com/product.html).
+
+#### Excluding dependencies
+
+You can exclude dependencies by prefixing the dependency with a `^`. For example:
+
+```
+^numpy
+pandas==2.2.3
+```
