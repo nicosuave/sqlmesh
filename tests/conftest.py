@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+
 import datetime
 import logging
 import typing as t
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from shutil import copytree, rmtree
 from tempfile import TemporaryDirectory
 from unittest import mock
 from unittest.mock import PropertyMock
+import os
+import shutil
 
 import duckdb
-import pandas as pd
+import pandas as pd  # noqa: TID253
 import pytest
 from pytest_mock.plugin import MockerFixture
 from sqlglot import exp, maybe_parse, parse_one
@@ -19,9 +23,10 @@ from sqlglot.dialects.dialect import DialectType
 from sqlglot.helper import ensure_list
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
-from sqlmesh.core.config import DuckDBConnectionConfig
+from sqlmesh.core.config import Config, BaseDuckDBConnectionConfig, DuckDBConnectionConfig
+from sqlmesh.core.config.connection import ConnectionConfig
 from sqlmesh.core.context import Context
-from sqlmesh.core.engine_adapter import SparkEngineAdapter
+from sqlmesh.core.engine_adapter import MSSQLEngineAdapter, SparkEngineAdapter
 from sqlmesh.core.engine_adapter.base import EngineAdapter
 from sqlmesh.core.environment import EnvironmentNamingInfo
 from sqlmesh.core import lineage
@@ -35,11 +40,12 @@ from sqlmesh.core.snapshot import (
     SnapshotChangeCategory,
     SnapshotDataVersion,
     SnapshotFingerprint,
+    DeployabilityIndex,
 )
 from sqlmesh.utils import random_id
 from sqlmesh.utils.date import TimeLike, to_date
-
-pytest_plugins = ["tests.common_fixtures"]
+from sqlmesh.utils.windows import IS_WINDOWS, fix_windows_path
+from sqlmesh.core.engine_adapter.shared import CatalogSupport
 
 T = t.TypeVar("T", bound=EngineAdapter)
 
@@ -179,12 +185,11 @@ class SushiDataValidator:
             assert list(results["event_date"].values()) == expected_dates
 
             return results
-        else:
-            raise NotImplementedError(f"Unknown model_name: {model_name}")
+        raise NotImplementedError(f"Unknown model_name: {model_name}")
 
 
 def pytest_collection_modifyitems(items, *args, **kwargs):
-    test_type_markers = {"fast", "slow", "docker", "remote", "isolated"}
+    test_type_markers = {"fast", "slow", "docker", "remote", "isolated", "registry_isolation"}
     for item in items:
         for marker in item.iter_markers():
             if marker.name in test_type_markers:
@@ -217,7 +222,7 @@ def rescope_global_models(request):
 
 @pytest.fixture(scope="function", autouse=True)
 def rescope_duckdb_classvar(request):
-    DuckDBConnectionConfig._data_file_to_adapter = {}
+    BaseDuckDBConnectionConfig._data_file_to_adapter = {}
     yield
 
 
@@ -233,6 +238,13 @@ def rescope_lineage_cache(request):
     yield
 
 
+@pytest.fixture(autouse=True)
+def reset_console():
+    from sqlmesh.core.console import set_console, NoopConsole
+
+    set_console(NoopConsole())
+
+
 @pytest.fixture
 def duck_conn() -> duckdb.DuckDBPyConnection:
     return duckdb.connect()
@@ -245,9 +257,12 @@ def push_plan(context: Context, plan: Plan) -> None:
         context.create_scheduler,
         context.default_catalog,
     )
-    plan_evaluator._push(plan.to_evaluatable(), plan.snapshots)
+    deployability_index = DeployabilityIndex.create(context.snapshots.values())
+    plan_evaluator._push(plan.to_evaluatable(), plan.snapshots, deployability_index)
     promotion_result = plan_evaluator._promote(plan.to_evaluatable(), plan.snapshots)
-    plan_evaluator._update_views(plan.to_evaluatable(), plan.snapshots, promotion_result)
+    plan_evaluator._update_views(
+        plan.to_evaluatable(), plan.snapshots, promotion_result, deployability_index
+    )
 
 
 @pytest.fixture()
@@ -399,6 +414,7 @@ def make_snapshot_on_destructive_change(make_snapshot: t.Callable) -> t.Callable
                 ),
                 version="test_version",
                 change_category=SnapshotChangeCategory.FORWARD_ONLY,
+                dev_table_suffix="dev",
             ),
         )
 
@@ -425,7 +441,11 @@ def sushi_fixed_date_data_validator(sushi_context_fixed_date: Context) -> SushiD
 @pytest.fixture
 def make_mocked_engine_adapter(mocker: MockerFixture) -> t.Callable:
     def _make_function(
-        klass: t.Type[T], dialect: t.Optional[str] = None, register_comments: bool = True
+        klass: t.Type[T],
+        dialect: t.Optional[str] = None,
+        register_comments: bool = True,
+        default_catalog: t.Optional[str] = None,
+        **kwargs: t.Any,
     ) -> T:
         connection_mock = mocker.NonCallableMock()
         cursor_mock = mocker.Mock()
@@ -435,11 +455,18 @@ def make_mocked_engine_adapter(mocker: MockerFixture) -> t.Callable:
             lambda: connection_mock,
             dialect=dialect or klass.DIALECT,
             register_comments=register_comments,
+            default_catalog=default_catalog,
+            **kwargs,
         )
         if isinstance(adapter, SparkEngineAdapter):
             mocker.patch(
                 "sqlmesh.engines.spark.db_api.spark_session.SparkSessionConnection._spark_major_minor",
                 new_callable=PropertyMock(return_value=(3, 5)),
+            )
+        if isinstance(adapter, MSSQLEngineAdapter):
+            mocker.patch(
+                "sqlmesh.core.engine_adapter.mssql.MSSQLEngineAdapter.catalog_support",
+                new_callable=PropertyMock(return_value=CatalogSupport.REQUIRES_SET_CATALOG),
             )
         return adapter
 
@@ -459,10 +486,27 @@ def copy_to_temp_path(tmp_path: Path) -> t.Callable:
         paths: t.Union[t.Union[str, Path], t.Collection[t.Union[str, Path]]],
     ) -> t.List[Path]:
         paths = ensure_list(paths)
+        all_paths = [Path(p) for p in paths]
         temp_dirs = []
-        for path in paths:
+        for path in all_paths:
             temp_dir = Path(tmp_path) / uuid.uuid4().hex
-            copytree(path, temp_dir, symlinks=True, ignore=ignore)
+
+            if IS_WINDOWS:
+                # shutil.copytree just doesnt work properly with the symlinks on Windows, regardless of the `symlinks` setting
+                src = str(path.absolute())
+                dst = str(temp_dir.absolute())
+                os.system(f"robocopy {src} {dst} /E /COPYALL")
+
+                # after copying, delete the files that would have been ignored
+                for root, dirs, _ in os.walk(temp_dir):
+                    for dir in dirs:
+                        full_dir = fix_windows_path(Path(root) / dir)
+                        for ignored in ignore(full_dir, [full_dir]):
+                            shutil.rmtree(ignored)
+
+            else:
+                copytree(path, temp_dir, symlinks=True, ignore=ignore)
+
             temp_dirs.append(temp_dir)
         return temp_dirs
 
@@ -485,3 +529,26 @@ def make_temp_table_name(mocker: MockerFixture) -> t.Callable:
         return temp_table
 
     return _make_function
+
+
+@pytest.fixture(scope="function", autouse=True)
+def set_default_connection(request):
+    request = request.node.get_closest_marker("set_default_connection")
+    disable = request and request.kwargs.get("disable")
+
+    if disable:
+        ctx = nullcontext()
+    else:
+        original_get_connection = Config.get_connection
+
+        def _lax_get_connection(self, gateway_name: t.Optional[str] = None) -> ConnectionConfig:
+            try:
+                connection = original_get_connection(self, gateway_name)
+            except:
+                connection = DuckDBConnectionConfig()
+            return connection
+
+        ctx = mock.patch("sqlmesh.core.config.Config.get_connection", _lax_get_connection)
+
+    with ctx:
+        yield

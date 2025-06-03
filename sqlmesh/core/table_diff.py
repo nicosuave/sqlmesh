@@ -4,18 +4,22 @@ import math
 import typing as t
 from functools import cached_property
 
-import pandas as pd
-
 from sqlmesh.core.dialect import to_schema
 from sqlmesh.core.engine_adapter.mixins import RowDiffMixin
+from sqlmesh.core.engine_adapter.athena import AthenaEngineAdapter
 from sqlglot import exp, parse_one
 from sqlglot.helper import ensure_list
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.optimizer.qualify_columns import quote_identifiers
+from sqlglot.optimizer.scope import find_all_in_scope
 
 from sqlmesh.utils.pydantic import PydanticModel
+from sqlmesh.utils.errors import SQLMeshError
+
 
 if t.TYPE_CHECKING:
+    import pandas as pd
+
     from sqlmesh.core._typing import TableName
     from sqlmesh.core.engine_adapter import EngineAdapter
 
@@ -70,6 +74,22 @@ class RowDiff(PydanticModel, frozen=True):
     source_alias: t.Optional[str] = None
     target_alias: t.Optional[str] = None
     model_name: t.Optional[str] = None
+    decimals: int = 3
+
+    _types_resolved: t.ClassVar[bool] = False
+
+    def __new__(cls, *args: t.Any, **kwargs: t.Any) -> RowDiff:
+        if not cls._types_resolved:
+            cls._resolve_types()
+        return super().__new__(cls)
+
+    @classmethod
+    def _resolve_types(cls) -> None:
+        # Pandas is imported by type checking so we need to resolve the types with the real import before instantiating
+        import pandas as pd  # noqa
+
+        cls.model_rebuild()
+        cls._types_resolved = True
 
     @property
     def source_count(self) -> int:
@@ -80,6 +100,15 @@ class RowDiff(PydanticModel, frozen=True):
     def target_count(self) -> int:
         """Count of the target."""
         return int(self.stats["t_count"])
+
+    @property
+    def empty(self) -> bool:
+        return (
+            self.source_count == 0
+            and self.target_count == 0
+            and self.s_only_count == 0
+            and self.t_only_count == 0
+        )
 
     @property
     def count_pct_change(self) -> float:
@@ -316,7 +345,7 @@ class TableDiff:
                     *(exp.column(c) for c in source_schema),
                     self.source_key_expression.as_(SQLMESH_JOIN_KEY_COL),
                 )
-                .from_(self.source_table)
+                .from_(self.source_table.as_("s"))
                 .where(self.where)
             )
             target_query = (
@@ -324,9 +353,15 @@ class TableDiff:
                     *(exp.column(c) for c in target_schema),
                     self.target_key_expression.as_(SQLMESH_JOIN_KEY_COL),
                 )
-                .from_(self.target_table)
+                .from_(self.target_table.as_("t"))
                 .where(self.where)
             )
+
+            # Ensure every column is qualified with the alias in the source and target queries
+            for col in find_all_in_scope(source_query, exp.Column):
+                col.set("table", exp.to_identifier("s"))
+            for col in find_all_in_scope(target_query, exp.Column):
+                col.set("table", exp.to_identifier("t"))
 
             source_table = exp.table_("__source")
             target_table = exp.table_("__target")
@@ -414,7 +449,26 @@ class TableDiff:
             schema = to_schema(temp_schema, dialect=self.dialect)
             temp_table = exp.table_("diff", db=schema.db, catalog=schema.catalog, quoted=True)
 
-            with self.adapter.temp_table(query, name=temp_table) as table:
+            temp_table_kwargs = {}
+            if isinstance(self.adapter, AthenaEngineAdapter):
+                # Athena has two table formats: Hive (the default) and Iceberg. TableDiff requires that
+                # the formats be the same for the source, target, and temp tables.
+                source_table_type = self.adapter._query_table_type(self.source_table)
+                target_table_type = self.adapter._query_table_type(self.target_table)
+
+                if source_table_type == "iceberg" and target_table_type == "iceberg":
+                    temp_table_kwargs["table_format"] = "iceberg"
+                # Sets the temp table's format to Iceberg.
+                # If neither source nor target table is Iceberg, it defaults to Hive (Athena's default).
+                elif source_table_type == "iceberg" or target_table_type == "iceberg":
+                    raise SQLMeshError(
+                        f"Source table '{self.source}' format '{source_table_type}' and target table '{self.target}' format '{target_table_type}' "
+                        f"do not match for Athena. Diffing between different table formats is not supported."
+                    )
+
+            with self.adapter.temp_table(
+                query, name=temp_table, columns_to_types=None, **temp_table_kwargs
+            ) as table:
                 summary_sums = [
                     exp.func("SUM", "s_exists").as_("s_count"),
                     exp.func("SUM", "t_exists").as_("t_count"),
@@ -438,7 +492,7 @@ class TableDiff:
 
                 summary_query = exp.select(*summary_sums).from_(table)
 
-                stats_df = self.adapter.fetchdf(summary_query, quote_identifiers=True)
+                stats_df = self.adapter.fetchdf(summary_query, quote_identifiers=True).fillna(0)
                 stats_df["s_only_count"] = stats_df["s_count"] - stats_df["join_count"]
                 stats_df["t_only_count"] = stats_df["t_count"] - stats_df["join_count"]
                 stats = stats_df.iloc[0].to_dict()
@@ -576,5 +630,6 @@ class TableDiff:
                     source_alias=self.source_alias,
                     target_alias=self.target_alias,
                     model_name=self.model_name,
+                    decimals=self.decimals,
                 )
         return self._row_diff

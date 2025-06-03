@@ -30,7 +30,8 @@ class LogicalMergeMixin(EngineAdapter):
         source_table: QueryOrDF,
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
         unique_key: t.Sequence[exp.Expression],
-        when_matched: t.Optional[t.Union[exp.When, t.List[exp.When]]] = None,
+        when_matched: t.Optional[exp.Whens] = None,
+        merge_filter: t.Optional[exp.Expression] = None,
     ) -> None:
         logical_merge(
             self,
@@ -39,6 +40,7 @@ class LogicalMergeMixin(EngineAdapter):
             columns_to_types,
             unique_key,
             when_matched=when_matched,
+            merge_filter=merge_filter,
         )
 
 
@@ -105,7 +107,9 @@ class InsertOverwriteWithMergeMixin(EngineAdapter):
                     target_table=table_name,
                     query=query,
                     on=exp.false(),
-                    match_expressions=[when_not_matched_by_source, when_not_matched_by_target],
+                    whens=exp.Whens(
+                        expressions=[when_not_matched_by_source, when_not_matched_by_target]
+                    ),
                 )
 
 
@@ -155,6 +159,7 @@ class HiveMetastoreTablePropertiesMixin(EngineAdapter):
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         table_description: t.Optional[str] = None,
         table_kind: t.Optional[str] = None,
+        **kwargs: t.Any,
     ) -> t.Optional[exp.Properties]:
         properties: t.List[exp.Expression] = []
 
@@ -292,18 +297,20 @@ class VarcharSizeWorkaroundMixin(EngineAdapter):
             and statement.expression.args["limit"].expression.this == "0"
         ):
             assert not isinstance(table_name_or_schema, exp.Schema)
+
             # redshift and mssql have a bug where CTAS statements have non determistic types. if a limit
             # is applied to a ctas statement, VARCHAR types default to 1 in some instances.
             select_statement = statement.expression.copy()
             for select_or_union in select_statement.find_all(exp.Select, exp.SetOperation):
-                select_or_union.set("limit", None)
+                limit = select_or_union.args.get("limit")
+                if limit is not None and limit.expression.this == "0":
+                    limit.pop()
+
                 select_or_union.set("where", None)
 
             temp_view_name = self._get_temp_table("ctas")
 
-            self.create_view(
-                temp_view_name, select_statement, replace=False, no_schema_binding=False
-            )
+            self.create_view(temp_view_name, select_statement, replace=False)
             try:
                 columns_to_types_from_view = self._default_precision_to_max(
                     self.columns(temp_view_name)
@@ -406,7 +413,8 @@ def logical_merge(
     source_table: QueryOrDF,
     columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
     unique_key: t.Sequence[exp.Expression],
-    when_matched: t.Optional[t.Union[exp.When, t.List[exp.When]]] = None,
+    when_matched: t.Optional[exp.Whens] = None,
+    merge_filter: t.Optional[exp.Expression] = None,
 ) -> None:
     """
     Merge implementation for engine adapters that do not support merge natively.
@@ -418,10 +426,12 @@ def logical_merge(
        within the temporary table are ommitted.
     4. Drop the temporary table.
     """
-    if when_matched:
+    if when_matched or merge_filter:
+        prop = "when_matched" if when_matched else "merge_filter"
         raise SQLMeshError(
-            "This engine does not support MERGE expressions and therefore `when_matched` is not supported."
+            f"This engine does not support MERGE expressions and therefore `{prop}` is not supported."
         )
+
     engine_adapter._replace_by_key(
         target_table, source_table, columns_to_types, unique_key, is_unique_key=True
     )

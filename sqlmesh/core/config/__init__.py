@@ -4,6 +4,7 @@ from sqlmesh.core.config.categorizer import (
 )
 from sqlmesh.core.config.common import EnvironmentSuffixTarget as EnvironmentSuffixTarget
 from sqlmesh.core.config.connection import (
+    AthenaConnectionConfig as AthenaConnectionConfig,
     BaseDuckDBConnectionConfig as BaseDuckDBConnectionConfig,
     BigQueryConnectionConfig as BigQueryConnectionConfig,
     ConnectionConfig as ConnectionConfig,
@@ -30,13 +31,8 @@ from sqlmesh.core.config.loader import (
 from sqlmesh.core.config.migration import MigrationConfig as MigrationConfig
 from sqlmesh.core.config.model import ModelDefaultsConfig as ModelDefaultsConfig
 from sqlmesh.core.config.naming import NameInferenceConfig as NameInferenceConfig
+from sqlmesh.core.config.linter import LinterConfig as LinterConfig
 from sqlmesh.core.config.plan import PlanConfig as PlanConfig
 from sqlmesh.core.config.root import Config as Config
 from sqlmesh.core.config.run import RunConfig as RunConfig
-from sqlmesh.core.config.scheduler import (
-    AirflowSchedulerConfig as AirflowSchedulerConfig,
-    BuiltInSchedulerConfig as BuiltInSchedulerConfig,
-    CloudComposerSchedulerConfig as CloudComposerSchedulerConfig,
-    MWAASchedulerConfig as MWAASchedulerConfig,
-    YCAirflowSchedulerConfig as YCAirflowSchedulerConfig,
-)
+from sqlmesh.core.config.scheduler import BuiltInSchedulerConfig as BuiltInSchedulerConfig

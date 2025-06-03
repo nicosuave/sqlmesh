@@ -5,6 +5,7 @@
 The GitHub Actions CI/CD Bot enables teams to automate their SQLMesh projects using GitHub Actions. It can be configured to perform the following things:
 
 * Automatically run unit tests on PRs
+* Automatically run the linter on PRs
 * Automatically create PR environments that represent the code changes in the PR
 * Automatically categorize and backfill data for models that have changed
 * Automatically deploy changes to production with automatic data gap prevention and merge the PR
@@ -112,6 +113,7 @@ In this example we configured the merge method to be `squash`. See [Bot Configur
 
 One way to signal to SQLMesh that a PR is ready to go to production is through the use of "Required Approvers". 
 In this approach users configure their SQLMesh project to list users that are designated as "Required Approver" and then when the bot detects an approval was received from one of these individuals then it determines that it is time to deploy to production.
+The bot will only do the deploy to prod if the base branch is a production branch (as defined in the bot's configuration but defaults to either `main` or `master`).
 This pattern can be a great fit for teams that already have an approval process like this in place and therefore it actually removes an extra step from either the author or the approver since SQLMesh will automate the deployment and merge until of it having to be manually done.
 
 ##### Required Approval Configuration
@@ -284,18 +286,19 @@ Below is an example of how to define the default config for the bot in either YA
 
 ### Configuration Properties
 
-| Option                                | Description                                                                                                                                                                                                                                                                                                                                                                                               |  Type  | Required |
-|---------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:------:|:--------:|
-| `invalidate_environment_after_deploy` | Indicates if the PR environment created should be automatically invalidated after changes are deployed. Invalidated environments are cleaned up automatically by the Janitor. Default: `True`                                                                                                                                                                                                             |  bool  |    N     |
-| `merge_method`                        | The merge method to use when automatically merging a PR after deploying to prod. Defaults to `None` meaning automatic merge is not done. Options: `merge`, `squash`, `rebase`                                                                                                                                                                                                                             | string |    N     |
-| `enable_deploy_command`               | Indicates if the `/deploy` command should be enabled in order to allowed synchronized deploys to production. Default: `False`                                                                                                                                                                                                                                                                             |  bool  |    N     |
-| `command_namespace`                   | The namespace to use for SQLMesh commands. For example if you provide `#SQLMesh` as a value then commands will be expected in the format of `#SQLMesh/<command>`. Default: `None` meaning no namespace is used.                                                                                                                                                                                           | string |    N     |
-| `auto_categorize_changes`             | Auto categorization behavior to use for the bot. If not provided then the project-wide categorization behavior is used. See [Auto-categorize model changes](https://sqlmesh.readthedocs.io/en/stable/guides/configuration/#auto-categorize-model-changes) for details.                                                                                                                                    |  dict  |    N     |
+| Option                                | Description                                                                                                                                                                                                                                                                                                                                                                                              |  Type  | Required |
+|---------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:------:|:--------:|
+| `invalidate_environment_after_deploy` | Indicates if the PR environment created should be automatically invalidated after changes are deployed. Invalidated environments are cleaned up automatically by the Janitor. Default: `True`                                                                                                                                                                                                            |  bool  |    N     |
+| `merge_method`                        | The merge method to use when automatically merging a PR after deploying to prod. Defaults to `None` meaning automatic merge is not done. Options: `merge`, `squash`, `rebase`                                                                                                                                                                                                                            | string |    N     |
+| `enable_deploy_command`               | Indicates if the `/deploy` command should be enabled in order to allowed synchronized deploys to production. Default: `False`                                                                                                                                                                                                                                                                            |  bool  |    N     |
+| `command_namespace`                   | The namespace to use for SQLMesh commands. For example if you provide `#SQLMesh` as a value then commands will be expected in the format of `#SQLMesh/<command>`. Default: `None` meaning no namespace is used.                                                                                                                                                                                          | string |    N     |
+| `auto_categorize_changes`             | Auto categorization behavior to use for the bot. If not provided then the project-wide categorization behavior is used. See [Auto-categorize model changes](https://sqlmesh.readthedocs.io/en/stable/guides/configuration/#auto-categorize-model-changes) for details.                                                                                                                                   |  dict  |    N     |
 | `default_pr_start`                    | Default start when creating PR environment plans. If running in a mode where the bot automatically backfills models (based on `auto_categorize_changes` behavior) then this can be used to limit the amount of data backfilled. Defaults to `None` meaning the start date is set to the earliest model's start or to 1 day ago if [data previews](../concepts/plans.md#data-preview) need to be computed. |  str   |    N     |
-| `skip_pr_backfill`                    | Indicates if the bot should skip backfilling models in the PR environment. Default: `True`                                                                                                                                                                                                                                                                                                                |  bool  |    N     |
-| `pr_include_unmodified`               | Indicates whether to include unmodified models in the PR environment. Default to the project's config value (which defaults to `False`)                                                                                                                                                                                                                                                                   |  bool  |    N     |
-| `run_on_deploy_to_prod`               | Indicates whether to run latest intervals when deploying to prod. If set to false, the deployment will backfill only the changed models up to the existing latest interval in production, ignoring any missing intervals beyond this point. Default: `True`                                                                                                                                               |  bool  |    N     |
-| `pr_environment_name`                 | The name of the PR environment to create for which a PR number will be appended to. Defaults to the repo name if not provided. Note: The name will be normalized to alphanumeric + underscore and lowercase.                                                                                                                                                                                              |  str   |    N     |	
+| `skip_pr_backfill`                    | Indicates if the bot should skip backfilling models in the PR environment. Default: `True`                                                                                                                                                                                                                                                                                                               |  bool  |    N     |
+| `pr_include_unmodified`               | Indicates whether to include unmodified models in the PR environment. Default to the project's config value (which defaults to `False`)                                                                                                                                                                                                                                                                  |  bool  |    N     |
+| `run_on_deploy_to_prod`               | Indicates whether to run latest intervals when deploying to prod. If set to false, the deployment will backfill only the changed models up to the existing latest interval in production, ignoring any missing intervals beyond this point. Default: `False`                                                                                                                                             |  bool  |    N     |
+| `pr_environment_name`                 | The name of the PR environment to create for which a PR number will be appended to. Defaults to the repo name if not provided. Note: The name will be normalized to alphanumeric + underscore and lowercase.                                                                                                                                                                                             |  str   |    N     |
+| `prod_branch_name`                    | The name of the git branch associated with production. Ex: `prod`. Default: `main` or `master` is considered prod                                                                                                                                                                                                                                                                                         |  str   |    N     |
 
 Example with all properties defined:
 
@@ -315,7 +318,8 @@ Example with all properties defined:
         seed: full
       default_pr_start: "1 week ago"
       skip_pr_backfill: false
-      run_on_deploy_to_prod: true
+      run_on_deploy_to_prod: false
+      prod_branch_name: production
     ```
 
 === "Python"
@@ -338,7 +342,8 @@ Example with all properties defined:
             ),
             default_pr_start="1 week ago",
             skip_pr_backfill=False,
-            run_on_deploy_to_prod=True,
+            run_on_deploy_to_prod=False,
+            prod_branch_name="production",
         )
     )
     ```
@@ -350,6 +355,7 @@ These can be used to potentially trigger follow up steps in the workflow.
 These are the possible outputs (based on how the bot is configured) that are created by the bot:
 
 * `run_unit_tests`
+* `linter`
 * `has_required_approval`
 * `pr_environment_synced`
 * `prod_plan_preview`
@@ -373,6 +379,8 @@ In addition, there are custom outputs listed below:
 * `created_pr_environment` - set to `"true"` (a string with a value of `true`) if a PR environment was created for the first time. It is absent, or considered empty string if you check for it, if it is not created for the first time
 * `pr_environment_name` - the name of the PR environment. It is output whenever PR environment synced check reaches a conclusion. Therefore make sure to check the status of `created_pr_environment` or `pr_environment_synced` before acting on this output 
 
+Note: The `linter` step will run only if it's enabled in the project's configuration (`config.yaml` / `config.py`). The step will fail if the linter finds errors, otherwise it'll output only the warnings.
+
 ## Custom Workflow Configuration
 You can configure each individual action to run as a separate step. This can allow for more complex workflows or integrating specific steps with other actions you want to trigger. Run `sqlmesh_cicd github` to see a list of commands that can be supplied and their potential options.
 ```bash
@@ -393,7 +401,7 @@ Commands:
 ```
 
 ## Example Synchronized Full Workflow
-This workflow involves configuring a SQLMesh connection to Databricks and configuring access to GCP to talk to Cloud Composer (Airflow).
+This workflow involves configuring a SQLMesh connection to Databricks.
 
 ```yaml
 name: SQLMesh Bot
@@ -447,11 +455,6 @@ jobs:
       - name: Install Dependencies
         run: pip install -r requirements.txt
         shell: bash
-      - id: auth
-        name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v1
-        with:
-          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
       - name: Run CI/CD Bot
         run: |
           sqlmesh_cicd -p ${{ github.workspace }} github --token ${{ secrets.GITHUB_TOKEN }} run-all
@@ -460,6 +463,10 @@ jobs:
 ## Example Screenshots
 ### Automated Unit Tests with Error Summary
 ![Automated Unit Tests with Error Summary](github/github_test_summary.png)
+### Automated Linting with Error Summary
+![Automated Linting with Error Summary](github/linter_errors.png)
+### Automated Linting with Warning Summary
+![Automated Linting with Warning Summary](github/linter_warnings.png)
 ### Automatically create PR Environments that represent the code changes in the PR
 ![Environment Summary](github/github_env_summary.png)
 ### Enforce that certain reviewers have approved of the PR before it can be merged

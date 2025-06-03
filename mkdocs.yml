@@ -30,9 +30,14 @@ nav:
       - guides/testing.md
       - guides/model_selection.md
     - SQLMesh tools:
-      - guides/ui.md
+      - guides/vscode.md
       - guides/tablediff.md
+      - guides/linter.md
+      - guides/ui.md
       - guides/observer.md
+    - Advanced usage:
+      - guides/customizing_sqlmesh.md
+      - guides/signals.md
   - Concepts:
     - concepts/overview.md
     - Development:
@@ -40,6 +45,7 @@ nav:
       - concepts/environments.md
       - concepts/tests.md
       - concepts/audits.md
+      - concepts/state.md
     - Models:
       - concepts/models/overview.md
       - concepts/models/model_kinds.md
@@ -63,16 +69,17 @@ nav:
   - Examples:
     - examples/overview.md
     - Walkthroughs:
+      - examples/sqlmesh_cli_crash_course.md
       - examples/incremental_time_full_walkthrough.md
   - Integrations:
     - "Overview": integrations/overview.md
     - Tools:
-      - integrations/airflow.md
       - integrations/dbt.md
       - integrations/dlt.md
       - integrations/github.md
     - Execution engines:
       - integrations/engines/athena.md
+      - integrations/engines/azuresql.md
       - integrations/engines/bigquery.md
       - integrations/engines/clickhouse.md
       - integrations/engines/databricks.md
@@ -83,6 +90,7 @@ nav:
       - integrations/engines/postgres.md
       - integrations/engines/gcp-postgres.md
       - integrations/engines/redshift.md
+      - integrations/engines/risingwave.md
       - integrations/engines/snowflake.md
       - integrations/engines/spark.md
       - integrations/engines/trino.md
@@ -103,14 +111,29 @@ nav:
     - "Overview": cloud/cloud_index.md
     - "Getting Started": cloud/tcloud_getting_started.md
     - Cloud Features:
-  #     - "Alerts & Notifications": cloud/features/alerts_notifications.md
+      - "Alerts & Notifications": cloud/features/alerts_notifications.md
       - cloud/features/debugger_view.md
-  #     - cloud/features/data_catalog.md
-  #     - cloud/features/model_freshness.md
-  #     - cloud/features/scheduler.md
-  #     - Observability:
-  #       - cloud/observability/monitoring.md
-  #       - "Measures & Dashboards": cloud/observability/measures_dashboards.md
+      - cloud/features/data_catalog.md
+      - cloud/features/single_sign_on.md
+      - Scheduler:
+        - "Cloud": cloud/features/scheduler/scheduler.md
+        - "Cloud Hybrid Deployments":
+          - "Overview": cloud/features/scheduler/hybrid_executors_overview.md
+          - "Helm Chart example": cloud/features/scheduler/hybrid_executors_helm.md
+          - "Docker Compose example": cloud/features/scheduler/hybrid_executors_docker_compose.md
+        - cloud/features/scheduler/airflow.md
+        - cloud/features/scheduler/dagster.md
+      - Security:
+        - "Security Overview": cloud/features/security/security.md
+#      - Observability:
+#        - cloud/features/observability/overview.md
+#        - cloud/features/observability/model_freshness.md
+#        - cloud/features/observability/prod_environment.md
+#        - cloud/features/observability/development_environment.md
+#        - cloud/features/observability/plan.md
+#        - cloud/features/observability/run.md
+#        - cloud/features/observability/model.md
+#        - "Measures & Dashboards": cloud/features/observability/measures_dashboards.md
 theme:
   name: material
   logo: _readthedocs/html/sqlmesh.png
@@ -162,6 +185,7 @@ markdown_extensions:
   - attr_list
   - md_in_html
   - pymdownx.caret
+  - sane_lists
 extra_css:
   - stylesheets/extra.css
 copyright: Tobiko Data Inc.

@@ -184,6 +184,14 @@ gateways:
 
 Even if you do not have a need for multiple repos now, consider adding a `project` key so that you can easily support multiple repos in the future.
 
+## Running migrations with multiple repositories
+
+When doing a [migration](./migrations.md), pass in a single repo path using the `-p` flag. It doesn't matter which repo you choose.
+
+```
+$ sqlmesh -p examples/multi/repo_1 migrate
+```
+
 ## Multi-Repo dbt projects
 
 SQLMesh also supports multiple repos for dbt projects, allowing it to correctly detect changes and orchestrate backfills even when changes span multiple dbt projects.
@@ -204,4 +212,4 @@ $ sqlmesh -p examples/multi_hybrid/dbt_repo -p examples/multi_hybrid/sqlmesh_rep
 
 SQLMesh will automatically detect dependencies and lineage across both SQLMesh and dbt projects, even when models are sourcing from different project types.
 
-Additionally, macros can be reused across both project types. For an example of this setup, refer to the [mixed SQLMesh and dbt example](https://github.com/TobikoData/sqlmesh/tree/main/examples/multi_hybrid).
+For an example of this setup, refer to the [mixed SQLMesh and dbt example](https://github.com/TobikoData/sqlmesh/tree/main/examples/multi_hybrid).

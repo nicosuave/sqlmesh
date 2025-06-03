@@ -38,14 +38,67 @@ It uses the following five step approach to accomplish this:
 
 5. Modify the semantic representation of the SQL query with the substituted variable values from (3) and functions from (4).
 
+### Embedding variables in strings
+
+SQLMesh always incorporates macro variable values into the semantic representation of a SQL query (step 5 above). To do that, it infers the role each macro variable value plays in the query.
+
+For context, two commonly used types of string in SQL are:
+
+- String literals, which represent text values and are surrounded by single quotes, such as `'the_string'`
+- Identifiers, which reference database objects like column, table, alias, and function names
+    - They may be unquoted or quoted with double quotes, backticks, or brackets, depending on the SQL dialect
+
+In a normal query, SQLMesh can easily determine which role a given string is playing. However, it is more difficult if a macro variable is embedded directly into a string - especially if the string is in the `MODEL` block (and not the query itself).
+
+For example, consider a project that defines a [gateway variable](#gateway-variables) named `gateway_var`. The project includes a model that references `@gateway_var` as part of the schema in the model's `name`, which is a SQL *identifier*.
+
+This is how we might try to write the model:
+
+``` sql title="Incorrectly rendered to string literal"
+MODEL (
+  name the_@gateway_var_schema.table
+);
+```
+
+From SQLMesh's perspective, the model schema is the combination of three sub-strings: `the_`, the value of `@gateway_var`, and `_schema`.
+
+SQLMesh will concatenate those strings, but it does not have the context to know that it is building a SQL identifier and will return a string literal.
+
+To provide the context SQLMesh needs, you must add curly braces to the macro variable reference: `@{gateway_var}` instead of `@gateway_var`:
+
+``` sql title="Correctly rendered to identifier"
+MODEL (
+  name the_@{gateway_var}_schema.table
+);
+```
+
+The curly braces let SQLMesh know that it should treat the string as a SQL identifier, which it will then quote based on the SQL dialect's quoting rules.
+
+The most common use of the curly brace syntax is embedding macro variables into strings, it can also be used to differentiate string literals and identifiers in SQL queries. For example, consider a macro variable `my_variable` whose value is `col`.
+
+If we `SELECT` this value with regular macro syntax, it will render to a string literal:
+
+``` sql
+SELECT @my_variable AS the_column; -- renders to SELECT 'col' AS the_column
+```
+
+`'col'` is surrounded with single quotes, and the SQL engine will use that string as the column's data value.
+
+If we use curly braces, SQLMesh will know that we want to use the rendered string as an identifier:
+
+``` sql
+SELECT @{my_variable} AS the_column; -- renders to SELECT col AS the_column
+```
+
+`col` is not surrounded with single quotes, and the SQL engine will determine that the query is referencing a column or other object named `col`.
 
 ## User-defined variables
 
-SQLMesh supports three kinds of user-defined macro variables: [global](#global-variables), [gateway](#gateway-variables), and [local](#local-variables).
+SQLMesh supports four kinds of user-defined macro variables: [global](#global-variables), [gateway](#gateway-variables), [blueprint](#blueprint-variables) and [local](#local-variables).
 
-Global and gateway macro variables are defined in the project configuration file and can be accessed in any project model. Local macro variables are defined in a model definition and can only be accessed in that model.
+Global and gateway macro variables are defined in the project configuration file and can be accessed in any project model. Blueprint and macro variables are defined in a model definition and can only be accessed in that model.
 
-Macro variables with the same name may be specified at any or all of the global, gateway, and local levels. When variables are specified at multiple levels, the value of the most specific level takes precedence. For example, the value of a local variable takes precedence over the value of a gateway variable with the same name, and the value of a gateway variable takes precedence over the value of a global variable.
+Macro variables with the same name may be specified at any or all of the global, gateway, blueprint and local levels. When variables are specified at multiple levels, the value of the most specific level takes precedence. For example, the value of a local variable takes precedence over the value of a blueprint or gateway variable with the same name, and the value of a gateway variable takes precedence over the value of a global variable.
 
 ### Global variables
 
@@ -152,9 +205,35 @@ Access them in models using the same methods as [global variables](#global-varia
 
 Gateway-specific variable values take precedence over variables with the same name specified in the root `variables` key.
 
+### Blueprint variables
+
+Blueprint macro variables are defined in a model. Blueprint variable values take precedence over [global](#global-variables) or [gateway-specific](#gateway-variables) variables with the same name.
+
+Blueprint variables are defined as a property of the `MODEL` statement, and serve as a mechanism for [creating model templates](../models/sql_models.md):
+
+```sql linenums="1"
+MODEL (
+  name @customer.some_table,
+  kind FULL,
+  blueprints (
+    (customer := customer1, field_a := x, field_b := y),
+    (customer := customer2, field_a := z, field_b := w)
+  )
+);
+
+SELECT
+  @field_a,
+  @{field_b} AS field_b
+FROM @customer.some_source
+```
+
+Note the use of both regular `@field_a` and curly brace syntax `@{field_b}` macro variable references in the model query. Learn more [above](#embedding-variables-in-strings)
+
+Blueprint variables can be accessed using the syntax shown above, or through the `@BLUEPRINT_VAR()` macro function, which also supports specifying default values in case the variable is undefined (similar to `@VAR()`).
+
 ### Local variables
 
-Local macro variables are defined in a model. Local variable values take precedence over [global](#global-variables) or [gateway-specific](#gateway-variables) variables with the same name.
+Local macro variables are defined in a model. Local variable values take precedence over [global](#global-variables), [blueprint](#blueprint-variables), or [gateway-specific](#gateway-variables) variables with the same name.
 
 Define your own local macro variables with the `@DEF` macro operator. For example, you could set the macro variable `macro_var` to the value `1` with:
 
@@ -424,7 +503,13 @@ FROM table
 
 This syntax works regardless of whether the array values are quoted or not.
 
-NOTE: SQLMesh macros support placing macro values at the end of a column name simply using `column_@x`. However if you wish to substitute the variable anywhere else in the identifier, you need to use the more explicit substitution syntax `@{}`. This avoids ambiguity. These are valid uses: `@{x}_column` or `my_@{x}_column`.
+!!! note "Embedding macros in strings"
+
+    SQLMesh macros support placing macro values at the end of a column name using `column_@x`.
+
+    However, if you wish to substitute the variable anywhere else in the identifier, you need to use the more explicit curly brace syntax `@{}` to avoid ambiguity. For example, these are valid uses: `@{x}_column` or `my_@{x}_column`.
+
+    Learn more about embedding macros in strings [above](#embedding-variables-in-strings)
 
 ### @IF
 
@@ -831,7 +916,9 @@ FROM foo
 
 `@UNION` returns a `UNION` query that selects all columns with matching names and data types from the tables.
 
-Its first argument is the `UNION` "type", `'DISTINCT'` (removing duplicated rows) or `'ALL'` (returning all rows). Subsequent arguments are the tables to be combined.
+Its first argument can be either a condition or the `UNION` "type". If the first argument evaluates to a boolean (`TRUE` or `FALSE`), it's treated as a condition. If the condition is `FALSE`, only the first table is returned. If it's `TRUE`, the union operation is performed.
+
+If the first argument is not a boolean condition, it's treated as the `UNION` "type": either `'DISTINCT'` (removing duplicated rows) or `'ALL'` (returning all rows). Subsequent arguments are the tables to be combined.
 
 Let's assume that:
 
@@ -856,6 +943,47 @@ SELECT
   CAST(a AS INT) AS a,
   CAST(c AS TEXT) AS c
 FROM bar
+```
+
+If the union type is omitted, `'ALL'` is used as the default. So the following expression:
+
+```sql linenums="1"
+@UNION(foo, bar)
+```
+
+would be rendered as:
+
+```sql linenums="1"
+SELECT
+  CAST(a AS INT) AS a,
+  CAST(c AS TEXT) AS c
+FROM foo
+UNION ALL
+SELECT
+  CAST(a AS INT) AS a,
+  CAST(c AS TEXT) AS c
+FROM bar
+```
+
+You can also use a condition to control whether the union happens:
+
+```sql linenums="1"
+@UNION(1 > 0, 'all', foo, bar)
+```
+
+This would render the same as above. However, if the condition is `FALSE`:
+
+```sql linenums="1"
+@UNION(1 > 2, 'all', foo, bar)
+```
+
+Only the first table would be selected:
+
+```sql linenums="1"
+SELECT
+  CAST(a AS INT) AS a,
+  CAST(c AS TEXT) AS c
+FROM foo
 ```
 
 ### @HAVERSINE_DISTANCE
@@ -1000,6 +1128,48 @@ Note: This is DuckDB SQL and other dialects will be transpiled accordingly.
 - Recursive CTEs (common table expressions) will be used for `Redshift / MySQL / MSSQL`.
 - For `MSSQL` in particular, there's a recursion limit of approximately 100. If this becomes a problem, you can add an `OPTION (MAXRECURSION 0)` clause after the date spine macro logic to remove the limit. This applies for long date ranges.
 
+### @RESOLVE_TEMPLATE
+
+`@resolve_template` is a helper macro intended to be used in situations where you need to gain access to the *components* of the physical object name. It's intended for use in the following situations:
+
+- Providing explicit control over table locations on a per-model basis for engines that decouple storage and compute (such as Athena, Trino, Spark etc)
+- Generating references to engine-specific metadata tables that are derived from the physical table name, such as the [`<table>$properties`](https://trino.io/docs/current/connector/iceberg.html#metadata-tables) metadata table in Trino.
+
+Under the hood, it uses the `@this_model` variable so it can only be used during the `creating` and `evaluation` [runtime stages](./macro_variables.md#runtime-variables). Attempting to use it at the `loading` runtime stage will result in a no-op.
+
+The `@resolve_template` macro supports the following arguments:
+
+ - `template` - The string template to render into an AST node
+ - `mode` - What type of SQLGlot AST node to return after rendering the template. Valid values are `literal` or `table`. Defaults to `literal`.
+
+The `template` can contain the following placeholders that will be substituted:
+
+  - `@{catalog_name}` - The name of the catalog, eg `datalake`
+  - `@{schema_name}` - The name of the physical schema that SQLMesh is using for the model version table, eg `sqlmesh__landing`
+  - `@{table_name}` - The name of the physical table that SQLMesh is using for the model version, eg `landing__customers__2517971505`
+
+Note the use of the curly brace syntax `@{}` in the template placeholders - learn more [above](#embedding-variables-in-strings).
+
+The `@resolve_template` macro can be used in a `MODEL` block:
+
+```sql linenums="1" hl_lines="5"
+MODEL (
+  name datalake.landing.customers,
+  ...
+  physical_properties (
+    location = @resolve_template('s3://warehouse-data/@{catalog_name}/prod/@{schema_name}/@{table_name}')
+  )
+);
+-- CREATE TABLE "datalake"."sqlmesh__landing"."landing__customers__2517971505" ...
+-- WITH (location = 's3://warehouse-data/datalake/prod/sqlmesh__landing/landing__customers__2517971505')
+```
+
+And also within a query, using `mode := 'table'`:
+
+```sql linenums="1"
+SELECT * FROM @resolve_template('@{catalog_name}.@{schema_name}.@{table_name}$properties', mode := 'table')
+-- SELECT * FROM "datalake"."sqlmesh__landing"."landing__customers__2517971505$properties"
+```
 
 ### @AND
 
@@ -1574,6 +1744,73 @@ def some_macro(evaluator):
     ...
 ```
 
+#### Accessing model, physical table, and virtual layer view names
+
+All SQLMesh models have a name in their `MODEL` specification. We refer to that as the model's "unresolved" name because it may not correspond to any specific object in the SQL engine.
+
+When SQLMesh renders and executes a model, it converts the model name into three forms at different stages:
+
+1. The *fully qualified* name
+
+    - If the model name is of the form `schema.table`, SQLMesh determines the correct catalog and adds it, like `catalog.schema.table`
+    - SQLMesh quotes each component of the name using the SQL engine's quoting and case-sensitivity rules, like `"catalog"."schema"."table"`
+
+2. The *resolved* physical table name
+
+    - The qualified name of the model's underlying physical table
+
+3. The *resolved* virtual layer view name
+
+    - The qualified name of the model's virtual layer view in the environment where the model is being executed
+
+You can access any of these three forms in a Python macro through properties of the `evaluation` context object.
+
+Access the unresolved, fully-qualified name through the `this_model_fqn` property.
+
+```python linenums="1"
+from sqlmesh.core.macros import macro
+
+@macro()
+def some_macro(evaluator):
+    # Example:
+    # Name in model definition: landing.customers
+    # Value returned here: '"datalake"."landing"."customers"'
+    unresolved_model_fqn = evaluator.this_model_fqn
+    ...
+```
+
+Access the resolved physical table and virtual layer view names through the `this_model` property.
+
+The `this_model` property returns different names depending on the runtime stage:
+
+- `promoting` runtime stage: `this_model` resolves to the virtual layer view name
+
+    - Example
+        - Model name is `db.test_model`
+        - `plan` is running in the `dev` environment
+        - `this_model` resolves to `"catalog"."db__dev"."test_model"` (note the `__dev` suffix in the schema name)
+
+- All other runtime stages: `this_model` resolves to the physical table name
+
+    - Example
+        - Model name is `db.test_model`
+        - `plan` is running in any environment
+        - `this_model` resolves to `"catalog"."sqlmesh__project"."project__test_model__684351896"`
+
+```python linenums="1"
+from sqlmesh.core.macros import macro
+
+@macro()
+def some_macro(evaluator):
+    if evaluator.runtime_stage == "promoting":
+        # virtual layer view name '"catalog"."db__dev"."test_model"'
+        resolved_name = evaluator.this_model
+    else:
+        # physical table name '"catalog"."sqlmesh__project"."project__test_model__684351896"'
+        resolved_name = evaluator.this_model
+    ...
+```
+
 #### Accessing model schemas
 
 Model schemas can be accessed within a Python macro function through its evaluation context's `column_to_types()` method, if the column types can be statically determined. For instance, a schema of an [external model](../models/external_models.md) can be accessed only after the `sqlmesh create_external_models` command has been executed.
@@ -1790,6 +2027,8 @@ SQLMesh supports common Python types for typed macros including:
 - `int`
 - `float`
 - `bool`
+- `datetime.datetime`
+- `datetime.date`
 - `SQL` -- When you want the SQL string representation of the argument that's passed in
 - `list[T]` - where `T` is any supported type including sqlglot expressions
 - `tuple[T]` - where `T` is any supported type including sqlglot expressions

@@ -15,6 +15,7 @@ from sqlmesh.core import constants as c
 from sqlmesh.core import dialect as d
 from sqlmesh.utils import AttributeDict
 from sqlmesh.utils.pydantic import PRIVATE_FIELDS, PydanticModel, field_serializer, field_validator
+from sqlmesh.utils.metaprogramming import SqlValue
 
 
 if t.TYPE_CHECKING:
@@ -593,7 +594,10 @@ def jinja_call_arg_name(node: nodes.Node) -> str:
 
 def create_var(variables: t.Dict[str, t.Any]) -> t.Callable:
     def _var(var_name: str, default: t.Optional[t.Any] = None) -> t.Optional[t.Any]:
-        return variables.get(var_name.lower(), default)
+        value = variables.get(var_name.lower(), default)
+        if isinstance(value, SqlValue):
+            return value.sql
+        return value
 
     return _var
 
@@ -603,8 +607,38 @@ def create_builtin_globals(
 ) -> t.Dict[str, t.Any]:
     global_vars.pop(c.GATEWAY, None)
     variables = global_vars.pop(c.SQLMESH_VARS, None) or {}
+    blueprint_variables = global_vars.pop(c.SQLMESH_BLUEPRINT_VARS, None) or {}
     return {
+        **global_vars,
         c.VAR: create_var(variables),
         c.GATEWAY: lambda: variables.get(c.GATEWAY, None),
-        **global_vars,
+        c.BLUEPRINT_VAR: create_var(blueprint_variables),
     }
+
+
+def make_jinja_registry(
+    jinja_macros: JinjaMacroRegistry, package_name: str, jinja_references: t.Set[MacroReference]
+) -> JinjaMacroRegistry:
+    """
+    Creates a Jinja macro registry for a specific package.
+
+    This function takes an existing Jinja macro registry and returns a new
+    registry that includes only the macros associated with the specified
+    package and trims the registry to include only the macros referenced
+    in the provided set of macro references.
+
+    Args:
+        jinja_macros: The original Jinja macro registry containing all macros.
+        package_name: The name of the package for which to create the registry.
+        jinja_references: A set of macro references to retain in the new registry.
+
+    Returns:
+        A new JinjaMacroRegistry containing only the macros for the specified
+        package and the referenced macros.
+    """
+
+    jinja_registry = jinja_macros.copy()
+    jinja_registry.root_macros = jinja_registry.packages.get(package_name) or {}
+    jinja_registry = jinja_registry.trim(jinja_references)
+
+    return jinja_registry

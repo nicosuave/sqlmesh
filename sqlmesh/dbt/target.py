@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import abc
-import logging
 import typing as t
 from pathlib import Path
 
 from dbt.adapters.base import BaseRelation, Column
 from pydantic import Field
 
+from sqlmesh.core.console import get_console
 from sqlmesh.core.config.connection import (
     AthenaConnectionConfig,
     BigQueryConnectionConfig,
@@ -34,13 +34,7 @@ from sqlmesh.dbt.relation import Policy
 from sqlmesh.dbt.util import DBT_VERSION
 from sqlmesh.utils import AttributeDict, classproperty
 from sqlmesh.utils.errors import ConfigError
-from sqlmesh.utils.pydantic import (
-    field_validator,
-    model_validator,
-    model_validator_v1_args,
-)
-
-logger = logging.getLogger(__name__)
+from sqlmesh.utils.pydantic import field_validator, model_validator
 
 IncrementalKind = t.Union[
     t.Type[IncrementalByUniqueKeyKind],
@@ -91,23 +85,23 @@ class TargetConfig(abc.ABC, DbtConfig):
         db_type = data["type"]
         if db_type == "databricks":
             return DatabricksConfig(**data)
-        elif db_type == "duckdb":
+        if db_type == "duckdb":
             return DuckDbConfig(**data)
-        elif db_type == "postgres":
+        if db_type == "postgres":
             return PostgresConfig(**data)
-        elif db_type == "redshift":
+        if db_type == "redshift":
             return RedshiftConfig(**data)
-        elif db_type == "snowflake":
+        if db_type == "snowflake":
             return SnowflakeConfig(**data)
-        elif db_type == "bigquery":
+        if db_type == "bigquery":
             return BigQueryConfig(**data)
-        elif db_type == "sqlserver":
+        if db_type == "sqlserver":
             return MSSQLConfig(**data)
-        elif db_type == "trino":
+        if db_type == "trino":
             return TrinoConfig(**data)
-        elif db_type == "clickhouse":
+        if db_type == "clickhouse":
             return ClickhouseConfig(**data)
-        elif db_type == "athena":
+        if db_type == "athena":
             return AthenaConfig(**data)
 
         raise ConfigError(f"{db_type} not supported.")
@@ -157,6 +151,7 @@ class DuckDbConfig(TargetConfig):
         path: Location of the database file. If not specified, an in memory database is used.
         extensions: A list of autoloadable extensions to load.
         settings: A dictionary of settings to pass into the duckdb connector.
+        secrets: A list of secrets to pass to the secret manager in the duckdb connector.
     """
 
     type: t.Literal["duckdb"] = "duckdb"
@@ -165,22 +160,25 @@ class DuckDbConfig(TargetConfig):
     path: str = DUCKDB_IN_MEMORY
     extensions: t.Optional[t.List[str]] = None
     settings: t.Optional[t.Dict[str, t.Any]] = None
+    secrets: t.Optional[t.List[t.Dict[str, t.Any]]] = None
 
     @model_validator(mode="before")
-    @model_validator_v1_args
-    def validate_authentication(
-        cls, values: t.Dict[str, t.Union[t.Tuple[str, ...], t.Optional[str], t.Dict[str, t.Any]]]
-    ) -> t.Dict[str, t.Union[t.Tuple[str, ...], t.Optional[str], t.Dict[str, t.Any]]]:
-        if "database" not in values and DBT_VERSION >= (1, 5):
-            path = values.get("path")
-            values["database"] = (
+    def validate_authentication(cls, data: t.Any) -> t.Any:
+        if not isinstance(data, dict):
+            return data
+
+        if "database" not in data and DBT_VERSION >= (1, 5, 0):
+            path = data.get("path")
+            data["database"] = (
                 "memory"
                 if path is None or path == DUCKDB_IN_MEMORY
                 else Path(t.cast(str, path)).stem
             )
-        if "threads" in values and t.cast(int, values["threads"]) > 1:
-            logger.warning("DuckDB does not support concurrency - setting threads to 1.")
-        return values
+
+        if "threads" in data and t.cast(int, data["threads"]) > 1:
+            get_console().log_warning("DuckDB does not support concurrency - setting threads to 1.")
+
+        return data
 
     def default_incremental_strategy(self, kind: IncrementalKind) -> str:
         return "delete+insert"
@@ -196,6 +194,8 @@ class DuckDbConfig(TargetConfig):
             kwargs["extensions"] = self.extensions
         if self.settings is not None:
             kwargs["connector_config"] = self.settings
+        if self.secrets is not None:
+            kwargs["secrets"] = self.secrets
         return DuckDBConnectionConfig(
             database=self.path,
             concurrent_tasks=1,
@@ -257,17 +257,16 @@ class SnowflakeConfig(TargetConfig):
     retry_all: bool = False
 
     @model_validator(mode="before")
-    @model_validator_v1_args
-    def validate_authentication(
-        cls, values: t.Dict[str, t.Union[t.Tuple[str, ...], t.Optional[str], t.Dict[str, t.Any]]]
-    ) -> t.Dict[str, t.Union[t.Tuple[str, ...], t.Optional[str], t.Dict[str, t.Any]]]:
-        if (
-            values.get("password")
-            or values.get("authenticator")
-            or values.get("private_key")
-            or values.get("private_key_path")
+    @classmethod
+    def validate_authentication(cls, data: t.Any) -> t.Any:
+        if not isinstance(data, dict) or (
+            data.get("password")
+            or data.get("authenticator")
+            or data.get("private_key")
+            or data.get("private_key_path")
         ):
-            return values
+            return data
+
         raise ConfigError("No supported Snowflake authentication method found in target profile.")
 
     def default_incremental_strategy(self, kind: IncrementalKind) -> str:
@@ -339,14 +338,16 @@ class PostgresConfig(TargetConfig):
     sslmode: t.Optional[str] = None
 
     @model_validator(mode="before")
-    @model_validator_v1_args
-    def validate_database(
-        cls, values: t.Dict[str, t.Union[t.Tuple[str, ...], t.Optional[str], t.Dict[str, t.Any]]]
-    ) -> t.Dict[str, t.Union[t.Tuple[str, ...], t.Optional[str], t.Dict[str, t.Any]]]:
-        values["database"] = values.get("database") or values.get("dbname")
-        if not values["database"]:
+    @classmethod
+    def validate_database(cls, data: t.Any) -> t.Any:
+        if not isinstance(data, dict):
+            return data
+
+        data["database"] = data.get("database") or data.get("dbname")
+        if not data["database"]:
             raise ConfigError("Either database or dbname must be set")
-        return values
+
+        return data
 
     @field_validator("port")
     @classmethod
@@ -401,14 +402,16 @@ class RedshiftConfig(TargetConfig):
     sslmode: t.Optional[str] = None
 
     @model_validator(mode="before")
-    @model_validator_v1_args
-    def validate_database(
-        cls, values: t.Dict[str, t.Union[t.Tuple[str, ...], t.Optional[str], t.Dict[str, t.Any]]]
-    ) -> t.Dict[str, t.Union[t.Tuple[str, ...], t.Optional[str], t.Dict[str, t.Any]]]:
-        values["database"] = values.get("database") or values.get("dbname")
-        if not values["database"]:
+    @classmethod
+    def validate_database(cls, data: t.Any) -> t.Any:
+        if not isinstance(data, dict):
+            return data
+
+        data["database"] = data.get("database") or data.get("dbname")
+        if not data["database"]:
             raise ConfigError("Either database or dbname must be set")
-        return values
+
+        return data
 
     def default_incremental_strategy(self, kind: IncrementalKind) -> str:
         return "append"
@@ -421,12 +424,11 @@ class RedshiftConfig(TargetConfig):
 
     @classproperty
     def column_class(cls) -> t.Type[Column]:
-        if DBT_VERSION < (1, 6):
+        if DBT_VERSION < (1, 6, 0):
             from dbt.adapters.redshift import RedshiftColumn  # type: ignore
 
             return RedshiftColumn
-        else:
-            return super(RedshiftConfig, cls).column_class
+        return super(RedshiftConfig, cls).column_class
 
     def to_sqlmesh(self, **kwargs: t.Any) -> ConnectionConfig:
         return RedshiftConnectionConfig(
@@ -509,6 +511,8 @@ class BigQueryConfig(TargetConfig):
         client_secret: The BigQuery client secret
         token_uri: The BigQuery token URI
         scopes: The BigQuery scopes
+        impersonated_service_account: The service account to impersonate
+        job_creation_timeout_seconds: The maximum amount of time, in seconds, to wait for the underlying job to be created
         job_execution_timeout_seconds: The maximum amount of time, in seconds, to wait for the underlying job to complete
         timeout_seconds: Alias for job_execution_timeout_seconds
         job_retries: The number of times to retry the underlying job if it fails
@@ -537,6 +541,8 @@ class BigQueryConfig(TargetConfig):
         "https://www.googleapis.com/auth/cloud-platform",
         "https://www.googleapis.com/auth/drive",
     )
+    impersonated_service_account: t.Optional[str] = None
+    job_creation_timeout_seconds: t.Optional[int] = None
     job_execution_timeout_seconds: t.Optional[int] = None
     timeout_seconds: t.Optional[int] = None  # To support legacy config
     job_retries: t.Optional[int] = None
@@ -546,17 +552,19 @@ class BigQueryConfig(TargetConfig):
     maximum_bytes_billed: t.Optional[int] = None
 
     @model_validator(mode="before")
-    @model_validator_v1_args
-    def validate_fields(
-        cls, values: t.Dict[str, t.Union[t.Tuple[str, ...], t.Optional[str], t.Dict[str, t.Any]]]
-    ) -> t.Dict[str, t.Union[t.Tuple[str, ...], t.Optional[str], t.Dict[str, t.Any]]]:
-        values["schema"] = values.get("schema") or values.get("dataset")
-        if not values["schema"]:
+    @classmethod
+    def validate_fields(cls, data: t.Any) -> t.Any:
+        if not isinstance(data, dict):
+            return data
+
+        data["schema"] = data.get("schema") or data.get("dataset")
+        if not data["schema"]:
             raise ConfigError("Either schema or dataset must be set")
-        values["database"] = values.get("database") or values.get("project")
-        if not values["database"]:
+        data["database"] = data.get("database") or data.get("project")
+        if not data["database"]:
             raise ConfigError("Either database or project must be set")
-        return values
+
+        return data
 
     def default_incremental_strategy(self, kind: IncrementalKind) -> str:
         return "merge"
@@ -595,6 +603,8 @@ class BigQueryConfig(TargetConfig):
             client_secret=self.client_secret,
             token_uri=self.token_uri,
             scopes=self.scopes,
+            impersonated_service_account=self.impersonated_service_account,
+            job_creation_timeout_seconds=self.job_creation_timeout_seconds,
             job_execution_timeout_seconds=job_execution_timeout_seconds,
             job_retries=job_retries,
             job_retry_deadline_seconds=self.job_retry_deadline_seconds,
@@ -661,23 +671,24 @@ class MSSQLConfig(TargetConfig):
     client_secret: t.Optional[str] = None  # Azure Active Directory auth
 
     @model_validator(mode="before")
-    @model_validator_v1_args
-    def validate_alias_fields(
-        cls, values: t.Dict[str, t.Union[t.Tuple[str, ...], t.Optional[str], t.Dict[str, t.Any]]]
-    ) -> t.Dict[str, t.Union[t.Tuple[str, ...], t.Optional[str], t.Dict[str, t.Any]]]:
-        values["host"] = values.get("host") or values.get("server")
-        if not values["host"]:
+    @classmethod
+    def validate_alias_fields(cls, data: t.Any) -> t.Any:
+        if not isinstance(data, dict):
+            return data
+
+        data["host"] = data.get("host") or data.get("server")
+        if not data["host"]:
             raise ConfigError("Either host or server must be set")
 
-        values["user"] = values.get("user") or values.get("username") or values.get("UID")
-        if not values["user"]:
+        data["user"] = data.get("user") or data.get("username") or data.get("UID")
+        if not data["user"]:
             raise ConfigError("One of user, username, or UID must be set")
 
-        values["password"] = values.get("password") or values.get("PWD")
-        if not values["password"]:
+        data["password"] = data.get("password") or data.get("PWD")
+        if not data["password"]:
             raise ConfigError("Either password or PWD must be set")
 
-        return values
+        return data
 
     @field_validator("authentication")
     @classmethod

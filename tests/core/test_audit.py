@@ -1,3 +1,4 @@
+import json
 import pytest
 from sqlglot import exp, parse_one
 
@@ -678,6 +679,11 @@ def test_standalone_audit(model: Model, assert_exp_eq):
         rendered_query, """SELECT * FROM "db"."test_model" AS "test_model" WHERE "col" IS NULL"""
     )
 
+    with pytest.raises(AuditConfigError) as ex:
+        StandaloneAudit(name="test_audit", query=parse_one("SELECT 1"), blocking=True)
+
+    assert "Standalone audits cannot be blocking: 'test_audit'." in str(ex.value)
+
 
 def test_render_definition():
     expressions = parse(
@@ -844,7 +850,7 @@ def test_load_inline_audits(assert_exp_eq):
         MODEL (
             name db.table,
             dialect spark,
-            audits(does_not_exceed_threshold)
+            audits(does_not_exceed_threshold, assert_positive_id)
         );
 
         SELECT id FROM tbl;
@@ -866,7 +872,7 @@ def test_load_inline_audits(assert_exp_eq):
     )
 
     model = load_sql_based_model(expressions)
-    assert len(model.audits) == 1
+    assert len(model.audits) == 2
     assert len(model.audits_with_args) == 2
     assert isinstance(model.audit_definitions["assert_positive_id"], ModelAudit)
     assert isinstance(model.audit_definitions["does_not_exceed_threshold"], ModelAudit)
@@ -896,5 +902,89 @@ def test_audit_query_normalization():
     )
     assert (
         rendered_audit_query.sql("snowflake")
-        == """SELECT * FROM (SELECT * FROM "DB"."TEST_MODEL" AS "TEST_MODEL") AS "_Q_0" WHERE "A" IS NULL AND TRUE"""
+        == """SELECT * FROM "DB"."TEST_MODEL" AS "TEST_MODEL" WHERE "A" IS NULL AND TRUE"""
     )
+
+
+def test_rendered_diff():
+    audit1 = StandaloneAudit(
+        name="test_audit", query=parse_one("SELECT * FROM 'test' WHERE @AND(TRUE, NULL) > 2")
+    )
+
+    audit2 = StandaloneAudit(
+        name="test_audit", query=parse_one("SELECT * FROM 'test' WHERE @OR(FALSE, NULL) > 2")
+    )
+
+    assert """@@ -6,4 +6,4 @@
+
+   *
+ FROM "test" AS "test"
+ WHERE
+-  TRUE > 2
++  FALSE > 2""" in audit1.text_diff(audit2, rendered=True)
+
+
+def test_multiple_audits_with_same_name():
+    expressions = parse(
+        """
+        MODEL (
+            name db.table,
+            dialect spark,
+            audits(
+                does_not_exceed_threshold(column := id, threshold := 1000),
+                does_not_exceed_threshold(column := price, threshold := 100),
+                does_not_exceed_threshold(column := price, threshold := 100)
+            )
+        );
+
+        SELECT id, price FROM tbl;
+
+        AUDIT (
+            name does_not_exceed_threshold,
+        );
+        SELECT * FROM @this_model
+        WHERE @column >= @threshold;
+        """
+    )
+    model = load_sql_based_model(expressions)
+    assert len(model.audits) == 3
+    assert len(model.audits_with_args) == 3
+    assert len(model.audit_definitions) == 1
+
+    # Testing that audit names are identical
+    assert model.audits[0][0] == model.audits[1][0] == model.audits[2][0]
+
+    # Testing that audit arguments are different for first and second audit
+    assert model.audits[0][1] != model.audits[1][1]
+
+    # Testing that audit arguments are identical for second and third audit
+    # This establishes that identical audits are preserved
+    assert model.audits[1][1] == model.audits[2][1]
+
+
+def test_audit_formatting_flag_serde():
+    expressions = parse(
+        """
+        AUDIT (
+            name my_audit,
+            dialect bigquery,
+            formatting false,
+        );
+
+        SELECT * FROM db.table WHERE col = @VAR('test_var')
+    """
+    )
+
+    audit = load_audit(
+        expressions,
+        path="/path/to/audit",
+        dialect="bigquery",
+        variables={"test_var": "test_val", "test_var_unused": "unused_val"},
+    )
+
+    audit_json = audit.json()
+
+    assert "formatting" not in json.loads(audit_json)
+
+    deserialized_audit = ModelAudit.parse_raw(audit_json)
+    assert deserialized_audit.dict() == audit.dict()

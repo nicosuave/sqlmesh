@@ -1,7 +1,6 @@
 import os
 
 from sqlmesh.core.config import (
-    AirflowSchedulerConfig,
     AutoCategorizationMode,
     BigQueryConnectionConfig,
     CategorizerConfig,
@@ -11,8 +10,8 @@ from sqlmesh.core.config import (
     GatewayConfig,
     ModelDefaultsConfig,
     PlanConfig,
-    SparkConnectionConfig,
 )
+from sqlmesh.core.config.linter import LinterConfig
 from sqlmesh.core.notification_target import (
     BasicSMTPNotificationTarget,
     SlackApiNotificationTarget,
@@ -41,6 +40,16 @@ config = Config(
     },
     default_gateway="duckdb",
     model_defaults=model_defaults,
+    linter=LinterConfig(
+        enabled=False,
+        rules=[
+            "ambiguousorinvalidcolumn",
+            "invalidselectstarexpansion",
+            "noselectstar",
+            "nomissingaudits",
+            "nomissingowner",
+        ],
+    ),
 )
 
 bigquery_config = Config(
@@ -58,34 +67,18 @@ bigquery_config = Config(
 test_config = Config(
     gateways={"in_memory": GatewayConfig(connection=DuckDBConnectionConfig())},
     default_gateway="in_memory",
-    plan=PlanConfig(auto_categorize_changes=CategorizerConfig(sql=AutoCategorizationMode.SEMI)),
-    model_defaults=model_defaults,
-)
-
-airflow_config = Config(
-    default_scheduler=AirflowSchedulerConfig(),
-    gateways=GatewayConfig(
-        connection=SparkConnectionConfig(
-            config_dir=os.path.join(CURRENT_FILE_PATH, "..", "airflow", "spark_conf"),
-            config={
-                "spark.hadoop.javax.jdo.option.ConnectionURL": "jdbc:postgresql://localhost:5432/metastore_db"
-            },
+    plan=PlanConfig(
+        auto_categorize_changes=CategorizerConfig(
+            sql=AutoCategorizationMode.SEMI, python=AutoCategorizationMode.OFF
         )
     ),
-    model_defaults=model_defaults_iceberg,
-)
-
-
-airflow_config_docker = Config(
-    default_scheduler=AirflowSchedulerConfig(airflow_url="http://airflow-webserver:8080/"),
-    gateways=GatewayConfig(connection=SparkConnectionConfig()),
-    model_defaults=model_defaults_iceberg,
+    model_defaults=model_defaults,
 )
 
 # A DuckDB config with a physical schema map.
 map_config = Config(
     default_connection=DuckDBConnectionConfig(),
-    physical_schema_override={"sushi": "company_internal"},
+    physical_schema_mapping={"^sushi$": "company_internal"},
     model_defaults=model_defaults,
 )
 

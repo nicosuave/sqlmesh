@@ -3,7 +3,7 @@ import typing as t
 from datetime import datetime
 from unittest.mock import call
 
-import pandas as pd
+import pandas as pd  # noqa: TID253
 import pytest
 from pytest_mock.plugin import MockerFixture
 from sqlglot import expressions as exp
@@ -901,8 +901,7 @@ def test_alter_table(
     def table_columns(table_name: str) -> t.Dict[str, exp.DataType]:
         if table_name == current_table_name:
             return {k: exp.DataType.build(v) for k, v in current_table.items()}
-        else:
-            return {k: exp.DataType.build(v) for k, v in target_table.items()}
+        return {k: exp.DataType.build(v) for k, v in target_table.items()}
 
     adapter.columns = table_columns
 
@@ -967,7 +966,7 @@ MERGE INTO "target" AS "__MERGE_TARGET__" USING (
 def test_merge_upsert_pandas(make_mocked_engine_adapter: t.Callable):
     adapter = make_mocked_engine_adapter(EngineAdapter)
 
-    df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+    df = pd.DataFrame({"id": [1, 2, 3], "ts": [4, 5, 6], "val": [1, 2, 3]})
     adapter.merge(
         target_table="target",
         source_table=df,
@@ -979,7 +978,7 @@ def test_merge_upsert_pandas(make_mocked_engine_adapter: t.Callable):
         unique_key=[exp.to_identifier("id")],
     )
     adapter.cursor.execute.assert_called_once_with(
-        'MERGE INTO "target" AS "__MERGE_TARGET__" USING (SELECT CAST("id" AS INT) AS "id", CAST("ts" AS TIMESTAMP) AS "ts", CAST("val" AS INT) AS "val" FROM (VALUES (1, 4), (2, 5), (3, 6)) AS "t"("id", "ts", "val")) AS "__MERGE_SOURCE__" ON "__MERGE_TARGET__"."id" = "__MERGE_SOURCE__"."id" '
+        'MERGE INTO "target" AS "__MERGE_TARGET__" USING (SELECT CAST("id" AS INT) AS "id", CAST("ts" AS TIMESTAMP) AS "ts", CAST("val" AS INT) AS "val" FROM (VALUES (1, 4, 1), (2, 5, 2), (3, 6, 3)) AS "t"("id", "ts", "val")) AS "__MERGE_SOURCE__" ON "__MERGE_TARGET__"."id" = "__MERGE_SOURCE__"."id" '
         'WHEN MATCHED THEN UPDATE SET "__MERGE_TARGET__"."id" = "__MERGE_SOURCE__"."id", "__MERGE_TARGET__"."ts" = "__MERGE_SOURCE__"."ts", "__MERGE_TARGET__"."val" = "__MERGE_SOURCE__"."val" '
         'WHEN NOT MATCHED THEN INSERT ("id", "ts", "val") VALUES ("__MERGE_SOURCE__"."id", "__MERGE_SOURCE__"."ts", "__MERGE_SOURCE__"."val")'
     )
@@ -996,7 +995,7 @@ def test_merge_upsert_pandas(make_mocked_engine_adapter: t.Callable):
         unique_key=[exp.to_identifier("id"), exp.to_identifier("ts")],
     )
     adapter.cursor.execute.assert_called_once_with(
-        'MERGE INTO "target" AS "__MERGE_TARGET__" USING (SELECT CAST("id" AS INT) AS "id", CAST("ts" AS TIMESTAMP) AS "ts", CAST("val" AS INT) AS "val" FROM (VALUES (1, 4), (2, 5), (3, 6)) AS "t"("id", "ts", "val")) AS "__MERGE_SOURCE__" ON "__MERGE_TARGET__"."id" = "__MERGE_SOURCE__"."id" AND "__MERGE_TARGET__"."ts" = "__MERGE_SOURCE__"."ts" '
+        'MERGE INTO "target" AS "__MERGE_TARGET__" USING (SELECT CAST("id" AS INT) AS "id", CAST("ts" AS TIMESTAMP) AS "ts", CAST("val" AS INT) AS "val" FROM (VALUES (1, 4, 1), (2, 5, 2), (3, 6, 3)) AS "t"("id", "ts", "val")) AS "__MERGE_SOURCE__" ON "__MERGE_TARGET__"."id" = "__MERGE_SOURCE__"."id" AND "__MERGE_TARGET__"."ts" = "__MERGE_SOURCE__"."ts" '
         'WHEN MATCHED THEN UPDATE SET "__MERGE_TARGET__"."id" = "__MERGE_SOURCE__"."id", "__MERGE_TARGET__"."ts" = "__MERGE_SOURCE__"."ts", "__MERGE_TARGET__"."val" = "__MERGE_SOURCE__"."val" '
         'WHEN NOT MATCHED THEN INSERT ("id", "ts", "val") VALUES ("__MERGE_SOURCE__"."id", "__MERGE_SOURCE__"."ts", "__MERGE_SOURCE__"."val")'
     )
@@ -1014,20 +1013,26 @@ def test_merge_when_matched(make_mocked_engine_adapter: t.Callable, assert_exp_e
             "val": exp.DataType.build("int"),
         },
         unique_key=[exp.to_identifier("ID", quoted=True)],
-        when_matched=exp.When(
-            matched=True,
-            source=False,
-            then=exp.Update(
-                expressions=[
-                    exp.column("val", "__MERGE_TARGET__").eq(exp.column("val", "__MERGE_SOURCE__")),
-                    exp.column("ts", "__MERGE_TARGET__").eq(
-                        exp.Coalesce(
-                            this=exp.column("ts", "__MERGE_SOURCE__"),
-                            expressions=[exp.column("ts", "__MERGE_TARGET__")],
-                        )
+        when_matched=exp.Whens(
+            expressions=[
+                exp.When(
+                    matched=True,
+                    source=False,
+                    then=exp.Update(
+                        expressions=[
+                            exp.column("val", "__MERGE_TARGET__").eq(
+                                exp.column("val", "__MERGE_SOURCE__")
+                            ),
+                            exp.column("ts", "__MERGE_TARGET__").eq(
+                                exp.Coalesce(
+                                    this=exp.column("ts", "__MERGE_SOURCE__"),
+                                    expressions=[exp.column("ts", "__MERGE_TARGET__")],
+                                )
+                            ),
+                        ],
                     ),
-                ],
-            ),
+                )
+            ]
         ),
     )
 
@@ -1061,42 +1066,44 @@ def test_merge_when_matched_multiple(make_mocked_engine_adapter: t.Callable, ass
             "val": exp.DataType.build("int"),
         },
         unique_key=[exp.to_identifier("ID", quoted=True)],
-        when_matched=[
-            exp.When(
-                matched=True,
-                condition=exp.column("ID", "__MERGE_SOURCE__").eq(exp.Literal.number(1)),
-                then=exp.Update(
-                    expressions=[
-                        exp.column("val", "__MERGE_TARGET__").eq(
-                            exp.column("val", "__MERGE_SOURCE__")
-                        ),
-                        exp.column("ts", "__MERGE_TARGET__").eq(
-                            exp.Coalesce(
-                                this=exp.column("ts", "__MERGE_SOURCE__"),
-                                expressions=[exp.column("ts", "__MERGE_TARGET__")],
-                            )
-                        ),
-                    ],
+        when_matched=exp.Whens(
+            expressions=[
+                exp.When(
+                    matched=True,
+                    condition=exp.column("ID", "__MERGE_SOURCE__").eq(exp.Literal.number(1)),
+                    then=exp.Update(
+                        expressions=[
+                            exp.column("val", "__MERGE_TARGET__").eq(
+                                exp.column("val", "__MERGE_SOURCE__")
+                            ),
+                            exp.column("ts", "__MERGE_TARGET__").eq(
+                                exp.Coalesce(
+                                    this=exp.column("ts", "__MERGE_SOURCE__"),
+                                    expressions=[exp.column("ts", "__MERGE_TARGET__")],
+                                )
+                            ),
+                        ],
+                    ),
                 ),
-            ),
-            exp.When(
-                matched=True,
-                source=False,
-                then=exp.Update(
-                    expressions=[
-                        exp.column("val", "__MERGE_TARGET__").eq(
-                            exp.column("val", "__MERGE_SOURCE__")
-                        ),
-                        exp.column("ts", "__MERGE_TARGET__").eq(
-                            exp.Coalesce(
-                                this=exp.column("ts", "__MERGE_SOURCE__"),
-                                expressions=[exp.column("ts", "__MERGE_TARGET__")],
-                            )
-                        ),
-                    ],
+                exp.When(
+                    matched=True,
+                    source=False,
+                    then=exp.Update(
+                        expressions=[
+                            exp.column("val", "__MERGE_TARGET__").eq(
+                                exp.column("val", "__MERGE_SOURCE__")
+                            ),
+                            exp.column("ts", "__MERGE_TARGET__").eq(
+                                exp.Coalesce(
+                                    this=exp.column("ts", "__MERGE_SOURCE__"),
+                                    expressions=[exp.column("ts", "__MERGE_TARGET__")],
+                                )
+                            ),
+                        ],
+                    ),
                 ),
-            ),
-        ],
+            ]
+        ),
     )
 
     assert_exp_eq(
@@ -1114,6 +1121,79 @@ MERGE INTO "target" AS "__MERGE_TARGET__" USING (
   WHEN MATCHED THEN UPDATE SET "__MERGE_TARGET__"."val" = "__MERGE_SOURCE__"."val", "__MERGE_TARGET__"."ts" = COALESCE("__MERGE_SOURCE__"."ts", "__MERGE_TARGET__"."ts")
   WHEN NOT MATCHED THEN INSERT ("ID", "ts", "val")
     VALUES ("__MERGE_SOURCE__"."ID", "__MERGE_SOURCE__"."ts", "__MERGE_SOURCE__"."val")
+""",
+    )
+
+
+def test_merge_filter(make_mocked_engine_adapter: t.Callable, assert_exp_eq):
+    adapter = make_mocked_engine_adapter(EngineAdapter)
+
+    adapter.merge(
+        target_table="target",
+        source_table=t.cast(exp.Select, parse_one('SELECT "ID", ts, val FROM source')),
+        columns_to_types={
+            "ID": exp.DataType.build("int"),
+            "ts": exp.DataType.build("timestamp"),
+            "val": exp.DataType.build("int"),
+        },
+        unique_key=[exp.to_identifier("ID", quoted=True)],
+        when_matched=exp.Whens(
+            expressions=[
+                exp.When(
+                    matched=True,
+                    source=False,
+                    then=exp.Update(
+                        expressions=[
+                            exp.column("val", "__MERGE_TARGET__").eq(
+                                exp.column("val", "__MERGE_SOURCE__")
+                            ),
+                            exp.column("ts", "__MERGE_TARGET__").eq(
+                                exp.Coalesce(
+                                    this=exp.column("ts", "__MERGE_SOURCE__"),
+                                    expressions=[exp.column("ts", "__MERGE_TARGET__")],
+                                )
+                            ),
+                        ],
+                    ),
+                )
+            ]
+        ),
+        merge_filter=exp.And(
+            this=exp.GT(
+                this=exp.column("ID", "__MERGE_SOURCE__"),
+                expression=exp.Literal(this="0", is_string=False),
+            ),
+            expression=exp.LT(
+                this=exp.column("ts", "__MERGE_TARGET__"),
+                expression=exp.Timestamp(this=exp.column("2020-02-05", quoted=True)),
+            ),
+        ),
+    )
+
+    assert_exp_eq(
+        adapter.cursor.execute.call_args[0][0],
+        """
+MERGE INTO "target" AS "__MERGE_TARGET__"
+USING (
+    SELECT "ID", "ts", "val"
+    FROM "source"
+) AS "__MERGE_SOURCE__"
+ON (
+    "__MERGE_SOURCE__"."ID" > 0
+    AND "__MERGE_TARGET__"."ts" < TIMESTAMP("2020-02-05")
+)
+AND "__MERGE_TARGET__"."ID" = "__MERGE_SOURCE__"."ID"
+WHEN MATCHED THEN
+    UPDATE SET
+        "__MERGE_TARGET__"."val" = "__MERGE_SOURCE__"."val",
+        "__MERGE_TARGET__"."ts" = COALESCE("__MERGE_SOURCE__"."ts", "__MERGE_TARGET__"."ts")
+WHEN NOT MATCHED THEN
+    INSERT ("ID", "ts", "val")
+    VALUES (
+        "__MERGE_SOURCE__"."ID",
+        "__MERGE_SOURCE__"."ts",
+        "__MERGE_SOURCE__"."val"
+    );
 """,
     )
 
@@ -1505,7 +1585,11 @@ def test_merge_scd_type_2_pandas(make_mocked_engine_adapter: t.Callable):
             "id2": [4, 5, 6],
             "name": ["muffins", "chips", "soda"],
             "price": [4.0, 5.0, 6.0],
-            "updated_at": ["2020-01-01 10:00:00", "2020-01-02 15:00:00", "2020-01-03 12:00:00"],
+            "test_updated_at": [
+                "2020-01-01 10:00:00",
+                "2020-01-02 15:00:00",
+                "2020-01-03 12:00:00",
+            ],
         }
     )
     adapter.scd_type_2_by_time(
@@ -1706,6 +1790,7 @@ def test_scd_type_2_by_column(make_mocked_engine_adapter: t.Callable):
             "test_valid_to": exp.DataType.build("TIMESTAMP"),
         },
         execution_time=datetime(2020, 1, 1, 0, 0, 0),
+        extra_col_ignore="testing",
     )
 
     assert (
@@ -2990,3 +3075,33 @@ def test_insert_overwrite_by_partition_query_insert_overwrite_strategy(
     assert sql_calls == [
         'INSERT OVERWRITE TABLE "test_schema"."test_table" ("a", "ds", "b") SELECT "a", "ds", "b" FROM "tbl"'
     ]
+
+
+def test_log_sql(make_mocked_engine_adapter: t.Callable, mocker: MockerFixture):
+    adapter = make_mocked_engine_adapter(EngineAdapter)
+
+    mock_logger = mocker.patch("sqlmesh.core.engine_adapter.base.logger")
+
+    df = pd.DataFrame({"id": [1, 2, 3], "value": ["test1", "test2", "test3"]})
+
+    adapter.execute(parse_one("SELECT 1"))
+    adapter.execute(parse_one("INSERT INTO test SELECT * FROM source"))
+    adapter.execute(parse_one("INSERT INTO test (id, value) VALUES (1, 'test')"))
+    adapter.insert_append("test", df)
+    adapter.replace_query("test", df)
+
+    assert mock_logger.log.call_count == 5
+    assert mock_logger.log.call_args_list[0][0][2] == "SELECT 1"
+    assert mock_logger.log.call_args_list[1][0][2] == 'INSERT INTO "test" SELECT * FROM "source"'
+    assert (
+        mock_logger.log.call_args_list[2][0][2]
+        == 'INSERT INTO "test" ("id", "value") VALUES "<REDACTED VALUES>"'
+    )
+    assert (
+        mock_logger.log.call_args_list[3][0][2]
+        == 'INSERT INTO "test" ("id", "value") SELECT CAST("id" AS BIGINT) AS "id", CAST("value" AS TEXT) AS "value" FROM (VALUES "<REDACTED VALUES>") AS "t"("id", "value")'
+    )
+    assert (
+        mock_logger.log.call_args_list[4][0][2]
+        == 'CREATE OR REPLACE TABLE "test" AS SELECT CAST("id" AS BIGINT) AS "id", CAST("value" AS TEXT) AS "value" FROM (SELECT CAST("id" AS BIGINT) AS "id", CAST("value" AS TEXT) AS "value" FROM (VALUES "<REDACTED VALUES>") AS "t"("id", "value")) AS "_subquery"'
+    )

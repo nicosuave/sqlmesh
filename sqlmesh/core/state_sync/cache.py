@@ -46,11 +46,8 @@ class CachingStateSync(DelegatingStateSync):
         return snapshot
 
     def get_snapshots(
-        self, snapshot_ids: t.Optional[t.Iterable[SnapshotIdLike]]
+        self, snapshot_ids: t.Iterable[SnapshotIdLike]
     ) -> t.Dict[SnapshotId, Snapshot]:
-        if snapshot_ids is None:
-            return self.state_sync.get_snapshots(snapshot_ids)
-
         existing = {}
         missing = set()
         now = now_timestamp()
@@ -111,14 +108,25 @@ class CachingStateSync(DelegatingStateSync):
         self.state_sync.delete_snapshots(snapshot_ids)
 
     def delete_expired_snapshots(
-        self, ignore_ttl: bool = False
+        self, ignore_ttl: bool = False, current_ts: t.Optional[int] = None
     ) -> t.List[SnapshotTableCleanupTask]:
+        current_ts = current_ts or now_timestamp()
         self.snapshot_cache.clear()
-        return self.state_sync.delete_expired_snapshots(ignore_ttl=ignore_ttl)
+        return self.state_sync.delete_expired_snapshots(
+            current_ts=current_ts, ignore_ttl=ignore_ttl
+        )
 
     def add_snapshots_intervals(self, snapshots_intervals: t.Sequence[SnapshotIntervals]) -> None:
         for snapshot_intervals in snapshots_intervals:
-            self.snapshot_cache.pop(snapshot_intervals.snapshot_id, None)
+            if snapshot_intervals.snapshot_id:
+                self.snapshot_cache.pop(snapshot_intervals.snapshot_id, None)
+            else:
+                # Evict all snapshots that share the same name
+                self.snapshot_cache = {
+                    snapshot_id: value
+                    for snapshot_id, value in self.snapshot_cache.items()
+                    if snapshot_id.name != snapshot_intervals.name
+                }
         self.state_sync.add_snapshots_intervals(snapshots_intervals)
 
     def remove_intervals(
@@ -135,3 +143,6 @@ class CachingStateSync(DelegatingStateSync):
     ) -> None:
         self.snapshot_cache.clear()
         self.state_sync.unpause_snapshots(snapshots, unpaused_dt)
+
+    def clear_cache(self) -> None:
+        self.snapshot_cache.clear()

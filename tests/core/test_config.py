@@ -29,6 +29,7 @@ from sqlmesh.core.config.loader import (
 )
 from sqlmesh.core.context import Context
 from sqlmesh.core.engine_adapter.athena import AthenaEngineAdapter
+from sqlmesh.core.engine_adapter.duckdb import DuckDBEngineAdapter
 from sqlmesh.core.engine_adapter.redshift import RedshiftEngineAdapter
 from sqlmesh.core.notification_target import ConsoleNotificationTarget
 from sqlmesh.core.user import User
@@ -303,6 +304,25 @@ def test_load_config_from_env():
         )
 
 
+def test_load_config_from_env_fails():
+    with mock.patch.dict(os.environ, {"SQLMESH__GATEWAYS__ABCDEF__CONNECTION__PASSWORD": "..."}):
+        with pytest.raises(
+            ConfigError,
+            match="Missing connection type.\n\nVerify your config.yaml and environment variables.",
+        ):
+            Config.parse_obj(load_config_from_env())
+
+
+def test_load_config_from_env_no_config_vars():
+    with mock.patch.dict(
+        os.environ,
+        {
+            "DUMMY_ENV_VAR": "dummy",
+        },
+    ):
+        assert load_config_from_env() == {}
+
+
 def test_load_config_from_env_invalid_variable_name():
     with mock.patch.dict(
         os.environ,
@@ -335,6 +355,7 @@ model_defaults:
         os.environ,
         {
             "SQLMESH__GATEWAYS__TESTING__STATE_CONNECTION__TYPE": "bigquery",
+            "SQLMESH__GATEWAYS__TESTING__STATE_CONNECTION__CHECK_IMPORT": "false",
             "SQLMESH__DEFAULT_GATEWAY": "testing",
         },
     ):
@@ -345,7 +366,7 @@ model_defaults:
             gateways={
                 "testing": GatewayConfig(
                     connection=MotherDuckConnectionConfig(database="blah"),
-                    state_connection=BigQueryConnectionConfig(),
+                    state_connection=BigQueryConnectionConfig(check_import=False),
                 ),
             },
             model_defaults=ModelDefaultsConfig(dialect="bigquery"),
@@ -365,6 +386,7 @@ config = Config(gateways={"duckdb_gateway": GatewayConfig(connection=DuckDBConne
         os.environ,
         {
             "SQLMESH__GATEWAYS__DUCKDB_GATEWAY__STATE_CONNECTION__TYPE": "bigquery",
+            "SQLMESH__GATEWAYS__DUCKDB_GATEWAY__STATE_CONNECTION__CHECK_IMPORT": "false",
             "SQLMESH__DEFAULT_GATEWAY": "duckdb_gateway",
         },
     ):
@@ -376,7 +398,7 @@ config = Config(gateways={"duckdb_gateway": GatewayConfig(connection=DuckDBConne
             gateways={  # type: ignore
                 "duckdb_gateway": GatewayConfig(
                     connection=DuckDBConnectionConfig(),
-                    state_connection=BigQueryConnectionConfig(),
+                    state_connection=BigQueryConnectionConfig(check_import=False),
                 ),
             },
             model_defaults=ModelDefaultsConfig(dialect=""),
@@ -403,31 +425,6 @@ def test_load_config_from_python_module_invalid_config_object(tmp_path):
         match=r"^Config needs to be a valid object.*",
     ):
         load_config_from_python_module(Config, config_path)
-
-
-def test_cloud_composer_scheduler_config(tmp_path_factory):
-    config_path = tmp_path_factory.mktemp("yaml_config") / "config.yaml"
-    with open(config_path, "w", encoding="utf-8") as fd:
-        fd.write(
-            """
-gateways:
-    another_gateway:
-        connection:
-            type: duckdb
-            database: test_db
-        scheduler:
-            type: cloud_composer
-            airflow_url: https://airflow.url
-
-model_defaults:
-    dialect: bigquery
-        """
-        )
-
-    assert load_config_from_paths(
-        Config,
-        project_paths=[config_path],
-    )
 
 
 @pytest.mark.parametrize(
@@ -495,13 +492,13 @@ environment_catalog_mapping:
 
 
 def test_physical_schema_mapping_mutually_exclusive_with_physical_schema_override() -> None:
-    Config(physical_schema_override={"foo": "bar"})
+    Config(physical_schema_override={"foo": "bar"})  # type: ignore
     Config(physical_schema_mapping={"^foo$": "bar"})
 
     with pytest.raises(
         ConfigError, match=r"Only one.*physical_schema_override.*physical_schema_mapping"
     ):
-        Config(physical_schema_override={"foo": "bar"}, physical_schema_mapping={"^foo$": "bar"})
+        Config(physical_schema_override={"foo": "bar"}, physical_schema_mapping={"^foo$": "bar"})  # type: ignore
 
 
 def test_load_feature_flag(tmp_path_factory):
@@ -565,6 +562,7 @@ def test_connection_config_serialization():
         "pre_ping": False,
         "pretty_sql": False,
         "connector_config": {},
+        "secrets": [],
         "database": "my_db",
     }
     assert serialized["default_test_connection"] == {
@@ -575,6 +573,7 @@ def test_connection_config_serialization():
         "pre_ping": False,
         "pretty_sql": False,
         "connector_config": {},
+        "secrets": [],
         "database": "my_test_db",
     }
 
@@ -681,14 +680,6 @@ def test_scheduler_config(tmp_path_factory):
         fd.write(
             """
 gateways:
-    airflow_gateway:
-        scheduler:
-            type: airflow
-            airflow_url: https://airflow.url
-    mwaa_gateway:
-        scheduler:
-            type: mwaa
-            environment: test_environment
     builtin_gateway:
         scheduler:
             type: builtin
@@ -706,8 +697,6 @@ model_defaults:
         project_paths=[config_path],
     )
     assert isinstance(config.default_scheduler, BuiltInSchedulerConfig)
-    assert isinstance(config.get_gateway("airflow_gateway").scheduler, AirflowSchedulerConfig)
-    assert isinstance(config.get_gateway("mwaa_gateway").scheduler, MWAASchedulerConfig)
     assert isinstance(config.get_gateway("builtin_gateway").scheduler, BuiltInSchedulerConfig)
 
 
@@ -737,6 +726,13 @@ gateways:
             aws_secret_access_key: accesskey
             work_group: group
             s3_warehouse_location: s3://location
+<<<<<<< HEAD
+=======
+    duckdb:
+        connection:
+            type: duckdb
+            database: db.db
+>>>>>>> origin/main
 
 default_gateway: redshift
 
@@ -752,16 +748,289 @@ model_defaults:
 
     ctx = Context(paths=tmp_path, config=config)
 
-    mocker.patch.object(
-        Context,
-        "_snapshot_gateways",
-        new_callable=mocker.PropertyMock(return_value={"snapshot": "athena"}),
+    assert isinstance(ctx.connection_config, RedshiftConnectionConfig)
+    assert len(ctx.engine_adapters) == 3
+    assert isinstance(ctx.engine_adapters["athena"], AthenaEngineAdapter)
+    assert isinstance(ctx.engine_adapters["redshift"], RedshiftEngineAdapter)
+    assert isinstance(ctx.engine_adapters["duckdb"], DuckDBEngineAdapter)
+    assert ctx.engine_adapter == ctx._get_engine_adapter("redshift")
+
+    # The duckdb engine adapter should be have been set as multithreaded as well
+    assert ctx.engine_adapters["duckdb"]._multithreaded
+
+
+def test_multi_gateway_single_threaded_config(tmp_path):
+    config_path = tmp_path / "config_duck_athena.yaml"
+    with open(config_path, "w", encoding="utf-8") as fd:
+        fd.write(
+            """
+gateways:
+    duckdb:
+        connection:
+            type: duckdb
+            database: db.db
+    athena:
+        connection:
+            type: athena
+            aws_access_key_id: '1234'
+            aws_secret_access_key: accesskey
+            work_group: group
+            s3_warehouse_location: s3://location
+default_gateway: duckdb
+model_defaults:
+    dialect: duckdb
+        """
+        )
+
+    config = load_config_from_paths(
+        Config,
+        project_paths=[config_path],
     )
 
-    ctx._create_engine_adapters()
+    ctx = Context(paths=tmp_path, config=config)
+    assert isinstance(ctx.connection_config, DuckDBConnectionConfig)
+    assert len(ctx.engine_adapters) == 2
+    assert ctx.engine_adapter == ctx._get_engine_adapter("duckdb")
+    assert isinstance(ctx.engine_adapters["athena"], AthenaEngineAdapter)
 
-    assert isinstance(ctx._connection_config, RedshiftConnectionConfig)
-    assert len(ctx._engine_adapters) == 2
-    assert isinstance(ctx._engine_adapters["athena"], AthenaEngineAdapter)
-    assert isinstance(ctx._engine_adapters["redshift"], RedshiftEngineAdapter)
-    assert ctx.engine_adapter == ctx._get_engine_adapter("redshift")
+    # In this case athena should use 1 concurrent task as the default gateway is duckdb
+    assert not ctx.engine_adapters["athena"]._multithreaded
+
+
+def test_trino_schema_location_mapping_syntax(tmp_path):
+    config_path = tmp_path / "config_trino.yaml"
+    with open(config_path, "w", encoding="utf-8") as fd:
+        fd.write(
+            """
+    gateways:
+      trino:
+        connection:
+          type: trino
+          user: trino
+          host: trino
+          catalog: trino
+          schema_location_mapping:
+            '^utils$': 's3://utils-bucket/@{schema_name}'
+            '^landing\\..*$': 's3://raw-data/@{catalog_name}/@{schema_name}'
+
+    default_gateway: trino
+
+    model_defaults:
+      dialect: trino
+    """
+        )
+
+    config = load_config_from_paths(
+        Config,
+        project_paths=[config_path],
+    )
+
+    from sqlmesh.core.config.connection import TrinoConnectionConfig
+
+    conn = config.gateways["trino"].connection
+    assert isinstance(conn, TrinoConnectionConfig)
+
+    assert len(conn.schema_location_mapping) == 2
+
+
+def test_gcp_postgres_ip_and_scopes(tmp_path):
+    config_path = tmp_path / "config_gcp_postgres.yaml"
+    with open(config_path, "w", encoding="utf-8") as fd:
+        fd.write(
+            """
+    gateways:
+      gcp_postgres:
+        connection:
+          type: gcp_postgres
+          check_import: false
+          instance_connection_string: something
+          user: user
+          password: password
+          db: db
+          ip_type: private
+          scopes:
+          - https://www.googleapis.com/auth/cloud-platform
+          - https://www.googleapis.com/auth/sqlservice.admin
+
+    default_gateway: gcp_postgres
+
+    model_defaults:
+      dialect: postgres
+    """
+        )
+
+    config = load_config_from_paths(
+        Config,
+        project_paths=[config_path],
+    )
+
+    from sqlmesh.core.config.connection import GCPPostgresConnectionConfig
+
+    conn = config.gateways["gcp_postgres"].connection
+    assert isinstance(conn, GCPPostgresConnectionConfig)
+
+    assert len(conn.scopes) == 2
+    assert conn.scopes[0] == "https://www.googleapis.com/auth/cloud-platform"
+    assert conn.scopes[1] == "https://www.googleapis.com/auth/sqlservice.admin"
+    assert conn.ip_type == "private"
+
+
+def test_gateway_model_defaults(tmp_path):
+    global_defaults = ModelDefaultsConfig(
+        dialect="snowflake", owner="foo", optimize_query=True, enabled=True, cron="@daily"
+    )
+    gateway_defaults = ModelDefaultsConfig(dialect="duckdb", owner="baz", optimize_query=False)
+
+    config = Config(
+        gateways={
+            "duckdb": GatewayConfig(
+                connection=DuckDBConnectionConfig(database="db.db"),
+                model_defaults=gateway_defaults,
+            )
+        },
+        model_defaults=global_defaults,
+        default_gateway="duckdb",
+    )
+
+    ctx = Context(paths=tmp_path, config=config, gateway="duckdb")
+
+    expected = ModelDefaultsConfig(
+        dialect="duckdb", owner="baz", optimize_query=False, enabled=True, cron="@daily"
+    )
+
+    assert ctx.config.model_defaults == expected
+
+
+def test_redshift_merge_flag(tmp_path, mocker: MockerFixture):
+    config_path = tmp_path / "config_redshift_merge.yaml"
+    with open(config_path, "w", encoding="utf-8") as fd:
+        fd.write(
+            """
+gateways:
+    redshift:
+        connection:
+            type: redshift
+            user: user
+            password: '1234'
+            host: host
+            database: db
+            enable_merge: true
+    default:
+        connection:
+            type: redshift
+            user: user
+            password: '1234'
+            host: host
+            database: db
+
+default_gateway: redshift
+
+model_defaults:
+    dialect: redshift
+        """
+        )
+
+    config = load_config_from_paths(
+        Config,
+        project_paths=[config_path],
+    )
+    redshift_connection = config.get_connection("redshift")
+    assert isinstance(redshift_connection, RedshiftConnectionConfig)
+    assert redshift_connection.enable_merge
+    adapter = redshift_connection.create_engine_adapter()
+    assert isinstance(adapter, RedshiftEngineAdapter)
+    assert adapter.enable_merge
+
+    adapter_2 = config.get_connection("default").create_engine_adapter()
+    assert isinstance(adapter_2, RedshiftEngineAdapter)
+    assert not adapter_2.enable_merge
+
+
+def test_environment_statements_config(tmp_path):
+    config_path = tmp_path / "config_before_after_all.yaml"
+    with open(config_path, "w", encoding="utf-8") as fd:
+        fd.write(
+            """
+    gateways:
+      postgres:
+        connection:
+          type: postgres
+          database: db
+          user: postgres
+          password: postgres
+          host: localhost
+          port: 5432
+
+    default_gateway: postgres
+
+    before_all:
+    - CREATE TABLE IF NOT EXISTS custom_analytics (physical_table VARCHAR, evaluation_time VARCHAR);
+    after_all:
+    - "@grant_schema_privileges()"
+    - "GRANT REFERENCES ON FUTURE VIEWS IN DATABASE db TO ROLE admin_role;"
+
+    model_defaults:
+      dialect: postgres
+    """
+        )
+
+    config = load_config_from_paths(
+        Config,
+        project_paths=[config_path],
+    )
+
+    assert config.before_all == [
+        "CREATE TABLE IF NOT EXISTS custom_analytics (physical_table VARCHAR, evaluation_time VARCHAR);"
+    ]
+    assert config.after_all == [
+        "@grant_schema_privileges()",
+        "GRANT REFERENCES ON FUTURE VIEWS IN DATABASE db TO ROLE admin_role;",
+    ]
+
+
+# https://github.com/TobikoData/sqlmesh/pull/4049
+def test_pydantic_import_error() -> None:
+    class TestConfig(DuckDBConnectionConfig):
+        pass
+
+    TestConfig()
+
+
+def test_config_subclassing() -> None:
+    class ConfigSubclass(Config): ...
+
+    ConfigSubclass()
+
+
+def test_config_complex_types_supplied_as_json_strings_from_env(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("""
+    gateways:
+      bigquery:
+        connection:
+          type: bigquery
+          project: unit-test
+
+    default_gateway: bigquery
+
+    model_defaults:
+      dialect: bigquery
+""")
+    with mock.patch.dict(
+        os.environ,
+        {
+            "SQLMESH__GATEWAYS__BIGQUERY__CONNECTION__SCOPES": '     ["a","b","c"]',  # note: leading whitespace is deliberate
+            "SQLMESH__GATEWAYS__BIGQUERY__CONNECTION__KEYFILE_JSON": '{ "foo": "bar" }',
+        },
+    ):
+        config = load_config_from_paths(
+            Config,
+            project_paths=[config_path],
+        )
+
+        conn = config.gateways["bigquery"].connection
+        assert isinstance(conn, BigQueryConnectionConfig)
+
+        assert conn.project == "unit-test"
+        assert conn.scopes == ("a", "b", "c")
+        assert conn.keyfile_json == {"foo": "bar"}

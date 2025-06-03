@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import typing as t
 
 from sqlglot import exp
@@ -9,6 +8,7 @@ from sqlglot.helper import ensure_list
 
 from sqlmesh.core import dialect as d
 from sqlmesh.core.config.base import UpdateStrategy
+from sqlmesh.core.console import get_console
 from sqlmesh.core.model import (
     EmbeddedKind,
     FullKind,
@@ -33,14 +33,12 @@ if t.TYPE_CHECKING:
     from sqlmesh.dbt.context import DbtContext
 
 
-logger = logging.getLogger(__name__)
-
 INCREMENTAL_BY_TIME_STRATEGIES = set(["delete+insert", "insert_overwrite"])
 INCREMENTAL_BY_UNIQUE_KEY_STRATEGIES = set(["merge"])
 
 
 def collection_to_str(collection: t.Iterable) -> str:
-    return ", ".join(f"'{item}'" for item in collection)
+    return ", ".join(f"'{item}'" for item in sorted(collection))
 
 
 class ModelConfig(BaseModelConfig):
@@ -81,6 +79,8 @@ class ModelConfig(BaseModelConfig):
     disable_restatement: t.Optional[bool] = None
     allow_partials: t.Optional[bool] = None
     physical_version: t.Optional[str] = None
+    auto_restatement_cron: t.Optional[str] = None
+    auto_restatement_intervals: t.Optional[int] = None
 
     # DBT configuration fields
     cluster_by: t.Optional[t.List[str]] = None
@@ -188,7 +188,9 @@ class ModelConfig(BaseModelConfig):
                 # dictionary materialization
                 raise ConfigError(msg)
             else:
-                logger.warning(f"{msg} Falling back to the '{fallback[1]}' materialization.")
+                get_console().log_warning(
+                    f"{msg} Falling back to the '{fallback[1]}' materialization."
+                )
 
             return fallback[1]
         return v
@@ -235,18 +237,25 @@ class ModelConfig(BaseModelConfig):
 
             incremental_kind_kwargs["on_destructive_change"] = on_destructive_change
 
+        for field in ("forward_only", "auto_restatement_cron"):
+            field_val = getattr(self, field, None)
+            if field_val is None:
+                field_val = self.meta.get(field, None)
+            if field_val is not None:
+                incremental_kind_kwargs[field] = field_val
+
         if materialization == Materialization.TABLE:
             return FullKind()
         if materialization == Materialization.VIEW:
             return ViewKind()
         if materialization == Materialization.INCREMENTAL:
-            incremental_materialization_kwargs: t.Dict[str, t.Any] = {
-                "dialect": self.dialect(context)
-            }
-            for field in ("batch_size", "batch_concurrency", "lookback", "forward_only"):
-                field_val = getattr(self, field, None) or self.meta.get(field, None)
-                if field_val:
-                    incremental_materialization_kwargs[field] = field_val
+            incremental_by_kind_kwargs: t.Dict[str, t.Any] = {"dialect": self.dialect(context)}
+            for field in ("batch_size", "batch_concurrency", "lookback"):
+                field_val = getattr(self, field, None)
+                if field_val is None:
+                    field_val = self.meta.get(field, None)
+                if field_val is not None:
+                    incremental_by_kind_kwargs[field] = field_val
 
             if self.time_column:
                 strategy = self.incremental_strategy or target.default_incremental_strategy(
@@ -254,11 +263,9 @@ class ModelConfig(BaseModelConfig):
                 )
 
                 if strategy not in INCREMENTAL_BY_TIME_STRATEGIES:
-                    logger.warning(
-                        "SQLMesh incremental by time strategy is not compatible with '%s' incremental strategy in model '%s'. Supported strategies include %s.",
-                        strategy,
-                        self.canonical_name(context),
-                        collection_to_str(INCREMENTAL_BY_TIME_STRATEGIES),
+                    get_console().log_warning(
+                        f"SQLMesh incremental by time strategy is not compatible with '{strategy}' incremental strategy in model '{self.canonical_name(context)}'. "
+                        f"Supported strategies include {collection_to_str(INCREMENTAL_BY_TIME_STRATEGIES)}."
                     )
 
                 return IncrementalByTimeRangeKind(
@@ -266,8 +273,9 @@ class ModelConfig(BaseModelConfig):
                     disable_restatement=(
                         self.disable_restatement if self.disable_restatement is not None else False
                     ),
+                    auto_restatement_intervals=self.auto_restatement_intervals,
                     **incremental_kind_kwargs,
-                    **incremental_materialization_kwargs,
+                    **incremental_by_kind_kwargs,
                 )
 
             disable_restatement = self.disable_restatement
@@ -288,25 +296,37 @@ class ModelConfig(BaseModelConfig):
                         f"{self.canonical_name(context)}: SQLMesh incremental by unique key strategy is not compatible with '{strategy}'"
                         f" incremental strategy. Supported strategies include {collection_to_str(INCREMENTAL_BY_UNIQUE_KEY_STRATEGIES)}."
                     )
+
+                if self.incremental_predicates:
+                    dialect = self.dialect(context)
+                    incremental_kind_kwargs["merge_filter"] = exp.and_(
+                        *[
+                            d.parse_one(predicate, dialect=dialect)
+                            for predicate in self.incremental_predicates
+                        ],
+                        dialect=dialect,
+                    ).transform(d.replace_merge_table_aliases)
+
                 return IncrementalByUniqueKeyKind(
                     unique_key=self.unique_key,
                     disable_restatement=disable_restatement,
                     **incremental_kind_kwargs,
-                    **incremental_materialization_kwargs,
+                    **incremental_by_kind_kwargs,
                 )
 
-            logger.warning(
-                "Using unmanaged incremental materialization for model '%s'. Some features might not be available. Consider adding either a time_column (%s) or a unique_key (%s) configuration to mitigate this",
-                self.canonical_name(context),
-                collection_to_str(INCREMENTAL_BY_TIME_STRATEGIES),
-                collection_to_str(INCREMENTAL_BY_UNIQUE_KEY_STRATEGIES.union(["none"])),
+            incremental_by_time_str = collection_to_str(INCREMENTAL_BY_TIME_STRATEGIES)
+            incremental_by_unique_key_str = collection_to_str(
+                INCREMENTAL_BY_UNIQUE_KEY_STRATEGIES.union(["none"])
+            )
+            get_console().log_warning(
+                f"Using unmanaged incremental materialization for model '{self.canonical_name(context)}'. "
+                f"Some features might not be available. Consider adding either a time_column ({incremental_by_time_str}) or a unique_key ({incremental_by_unique_key_str}) configuration to mitigate this.",
             )
             strategy = self.incremental_strategy or target.default_incremental_strategy(
                 IncrementalUnmanagedKind
             )
             return IncrementalUnmanagedKind(
                 insert_overwrite=strategy in INCREMENTAL_BY_TIME_STRATEGIES,
-                forward_only=incremental_materialization_kwargs.get("forward_only", True),
                 disable_restatement=disable_restatement,
                 **incremental_kind_kwargs,
             )
@@ -483,17 +503,17 @@ class ModelConfig(BaseModelConfig):
                     self.incremental_strategy = "append"
 
                 if self.incremental_strategy == "delete+insert":
-                    logger.warning(
+                    get_console().log_warning(
                         f"The '{self.incremental_strategy}' incremental strategy is not supported - SQLMesh will use the temp table/partition swap strategy."
                     )
 
                 if self.incremental_predicates:
-                    logger.warning(
+                    get_console().log_warning(
                         "SQLMesh does not support 'incremental_predicates' - they will not be applied."
                     )
 
             if self.query_settings:
-                logger.warning(
+                get_console().log_warning(
                     "SQLMesh does not support the 'query_settings' model configuration parameter. Specify the query settings directly in the model query."
                 )
 
@@ -523,7 +543,7 @@ class ModelConfig(BaseModelConfig):
                 physical_properties["primary_key"] = primary_key
 
             if self.sharding_key:
-                logger.warning(
+                get_console().log_warning(
                     "SQLMesh does not support the 'sharding_key' model configuration parameter or distributed materializations."
                 )
 
@@ -538,17 +558,28 @@ class ModelConfig(BaseModelConfig):
             if physical_properties:
                 model_kwargs["physical_properties"] = physical_properties
 
+        kind = self.model_kind(context)
+        allow_partials = model_kwargs.pop("allow_partials", None)
+        if (
+            allow_partials is None
+            and kind.is_materialized
+            and not kind.is_incremental_by_time_range
+        ):
+            # Set allow_partials to True for dbt models to preserve the original semantics.
+            allow_partials = True
+
         model = create_sql_model(
             self.canonical_name(context),
             query,
             dialect=model_dialect,
-            kind=self.model_kind(context),
+            kind=kind,
             start=self.start,
             audit_definitions=audit_definitions,
             # This ensures that we bypass query rendering that would otherwise be required to extract additional
             # dependencies from the model's SQL.
             # Note: any table dependencies that are not referenced using the `ref` macro will not be included.
             extract_dependencies_from_query=False,
+            allow_partials=allow_partials,
             **optional_kwargs,
             **model_kwargs,
         )

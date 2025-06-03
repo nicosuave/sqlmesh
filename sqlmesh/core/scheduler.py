@@ -1,13 +1,12 @@
 from __future__ import annotations
-
 import logging
 import typing as t
-
 from sqlglot import exp
-
 from sqlmesh.core import constants as c
 from sqlmesh.core.console import Console, get_console
-from sqlmesh.core.environment import EnvironmentNamingInfo
+from sqlmesh.core.environment import EnvironmentNamingInfo, execute_environment_statements
+from sqlmesh.core.macros import RuntimeStage
+from sqlmesh.core.model.definition import AuditResult
 from sqlmesh.core.node import IntervalUnit
 from sqlmesh.core.notification_target import (
     NotificationEvent,
@@ -16,25 +15,31 @@ from sqlmesh.core.notification_target import (
 from sqlmesh.core.snapshot import (
     DeployabilityIndex,
     Snapshot,
+    SnapshotId,
     SnapshotEvaluator,
+    apply_auto_restatements,
     earliest_start_date,
     missing_intervals,
+    merge_intervals,
+    snapshots_to_dag,
     Intervals,
 )
-from sqlmesh.core.snapshot.definition import Interval, expand_range
-from sqlmesh.core.snapshot.definition import SnapshotId, merge_intervals
+from sqlmesh.core.snapshot.definition import (
+    Interval,
+    expand_range,
+    parent_snapshots_by_name,
+)
 from sqlmesh.core.state_sync import StateSync
-from sqlmesh.utils import format_exception
+from sqlmesh.utils import CompletionStatus
 from sqlmesh.utils.concurrency import concurrent_apply_to_dag, NodeExecutionFailedError
 from sqlmesh.utils.dag import DAG
 from sqlmesh.utils.date import (
     TimeLike,
-    now,
     now_timestamp,
     to_timestamp,
     validate_date_range,
 )
-from sqlmesh.utils.errors import AuditError, CircuitBreakerError, SQLMeshError
+from sqlmesh.utils.errors import AuditError, NodeAuditsErrors, CircuitBreakerError, SQLMeshError
 
 logger = logging.getLogger(__name__)
 SnapshotToIntervals = t.Dict[Snapshot, Intervals]
@@ -72,6 +77,7 @@ class Scheduler:
     ):
         self.state_sync = state_sync
         self.snapshots = {s.snapshot_id: s for s in snapshots}
+        self.snapshots_by_name = {snapshot.name: snapshot for snapshot in self.snapshots.values()}
         self.snapshot_per_version = _resolve_one_snapshot_per_version(self.snapshots.values())
         self.default_catalog = default_catalog
         self.snapshot_evaluator = snapshot_evaluator
@@ -116,22 +122,24 @@ class Scheduler:
         validate_date_range(start, end)
 
         snapshots: t.Collection[Snapshot] = self.snapshot_per_version.values()
-        if selected_snapshots is not None:
-            snapshots = [s for s in snapshots if s.name in selected_snapshots]
-
-        self.state_sync.refresh_snapshot_intervals(snapshots)
-
-        return compute_interval_params(
+        snapshots_to_intervals = compute_interval_params(
             snapshots,
             start=start or earliest_start_date(snapshots),
-            end=end or now(),
+            end=end or now_timestamp(),
             deployability_index=deployability_index,
-            execution_time=execution_time or now(),
+            execution_time=execution_time or now_timestamp(),
             restatements=restatements,
             interval_end_per_model=interval_end_per_model,
             ignore_cron=ignore_cron,
             end_bounded=end_bounded,
         )
+        # Filtering snapshots after computing missing intervals because we need all snapshots in order
+        # to correctly infer start dates.
+        if selected_snapshots is not None:
+            snapshots_to_intervals = {
+                s: i for s, i in snapshots_to_intervals.items() if s.name in selected_snapshots
+            }
+        return snapshots_to_intervals
 
     def evaluate(
         self,
@@ -141,8 +149,9 @@ class Scheduler:
         execution_time: TimeLike,
         deployability_index: DeployabilityIndex,
         batch_index: int,
+        environment_naming_info: t.Optional[EnvironmentNamingInfo] = None,
         **kwargs: t.Any,
-    ) -> None:
+    ) -> t.List[AuditResult]:
         """Evaluate a snapshot and add the processed interval to the state sync.
 
         Args:
@@ -152,14 +161,15 @@ class Scheduler:
             execution_time: The date/time time reference to use for execution time. Defaults to now.
             deployability_index: Determines snapshots that are deployable in the context of this evaluation.
             batch_index: If the snapshot is part of a batch of related snapshots; which index in the batch is it
+            auto_restatement_enabled: Whether to enable auto restatements.
             kwargs: Additional kwargs to pass to the renderer.
+
+        Returns:
+            Tuple of list of all audit results from the evaluation and list of non-blocking audit errors to warn.
         """
         validate_date_range(start, end)
 
-        snapshots = {
-            self.snapshots[p_sid].name: self.snapshots[p_sid] for p_sid in snapshot.parents
-        }
-        snapshots[snapshot.name] = snapshot
+        snapshots = parent_snapshots_by_name(snapshot, self.snapshots)
 
         is_deployable = deployability_index.is_deployable(snapshot)
 
@@ -173,8 +183,9 @@ class Scheduler:
             batch_index=batch_index,
             **kwargs,
         )
-        audit_results = self.snapshot_evaluator.audit(
+        audit_results = self._audit_snapshot(
             snapshot=snapshot,
+            environment_naming_info=environment_naming_info,
             start=start,
             end=end,
             execution_time=execution_time,
@@ -184,29 +195,8 @@ class Scheduler:
             **kwargs,
         )
 
-        audit_error_to_raise: t.Optional[AuditError] = None
-        for audit_result in (result for result in audit_results if result.count):
-            error = AuditError(
-                audit_name=audit_result.audit.name,
-                model=snapshot.model_or_none,
-                count=t.cast(int, audit_result.count),
-                query=t.cast(exp.Query, audit_result.query),
-                adapter_dialect=self.snapshot_evaluator.adapter.dialect,
-            )
-            self.notification_target_manager.notify(NotificationEvent.AUDIT_FAILURE, error)
-            if is_deployable and snapshot.node.owner:
-                self.notification_target_manager.notify_user(
-                    NotificationEvent.AUDIT_FAILURE, snapshot.node.owner, error
-                )
-            if audit_result.blocking:
-                audit_error_to_raise = error
-            else:
-                logger.warning(f"{error}\nAudit is non-blocking so proceeding with execution.")
-
-        if audit_error_to_raise:
-            raise audit_error_to_raise
-
         self.state_sync.add_interval(snapshot, start, end, is_dev=not is_deployable)
+        return audit_results
 
     def run(
         self,
@@ -221,122 +211,103 @@ class Scheduler:
         selected_snapshots: t.Optional[t.Set[str]] = None,
         circuit_breaker: t.Optional[t.Callable[[], bool]] = None,
         deployability_index: t.Optional[DeployabilityIndex] = None,
-    ) -> bool:
-        """Concurrently runs all snapshots in topological order.
-
-        Args:
-            environment: The environment naming info the user is targeting when applying their change.
-                Can just be the environment name if the user is targeting a remote environment and wants to get the remote
-                naming info
-            start: The start of the run. Defaults to the min node start date.
-            end: The end of the run. Defaults to now.
-            execution_time: The date/time time reference to use for execution time. Defaults to now.
-            restatements: A dict of snapshots to restate and their intervals.
-            interval_end_per_model: The mapping from model FQNs to target end dates.
-            ignore_cron: Whether to ignore the node's cron schedule.
-            end_bounded: If set to true, the evaluated intervals will be bounded by the target end date, disregarding lookback,
-                allow_partials, and other attributes that could cause the intervals to exceed the target end date.
-            selected_snapshots: A set of snapshot names to run. If not provided, all snapshots will be run.
-            circuit_breaker: An optional handler which checks if the run should be aborted.
-            deployability_index: Determines snapshots that are deployable in the context of this render.
-
-        Returns:
-            True if the execution was successful and False otherwise.
-        """
-        restatements = restatements or {}
-        validate_date_range(start, end)
-        if isinstance(environment, str):
-            env = self.state_sync.get_environment(environment)
-            if not env:
-                raise SQLMeshError(
-                    "Was not provided an environment suffix target and the environment doesn't exist."
-                    "Are you running for the first time and need to run plan/apply first?"
-                )
-            environment_naming_info = env.naming_info
-        else:
-            environment_naming_info = environment
-
-        deployability_index = deployability_index or (
-            DeployabilityIndex.create(self.snapshots.values(), start=start)
-            if environment_naming_info.name != c.PROD
-            else DeployabilityIndex.all_deployable()
-        )
-        execution_time = execution_time or now()
-        merged_intervals = self.merged_missing_intervals(
-            start,
-            end,
-            execution_time,
-            deployability_index=deployability_index,
-            restatements=restatements,
+        auto_restatement_enabled: bool = False,
+        run_environment_statements: bool = False,
+    ) -> CompletionStatus:
+        return self._run_or_audit(
+            environment=environment,
+            start=start,
+            end=end,
+            execution_time=execution_time,
+            remove_intervals=restatements,
             interval_end_per_model=interval_end_per_model,
             ignore_cron=ignore_cron,
             end_bounded=end_bounded,
             selected_snapshots=selected_snapshots,
-        )
-        if not merged_intervals:
-            return True
-
-        errors, skipped_intervals = self.run_merged_intervals(
-            merged_intervals=merged_intervals,
-            deployability_index=deployability_index,
-            environment_naming_info=environment_naming_info,
-            execution_time=execution_time,
             circuit_breaker=circuit_breaker,
+            deployability_index=deployability_index,
+            auto_restatement_enabled=auto_restatement_enabled,
+            run_environment_statements=run_environment_statements,
+        )
+
+    def audit(
+        self,
+        environment: str | EnvironmentNamingInfo,
+        start: TimeLike,
+        end: TimeLike,
+        execution_time: t.Optional[TimeLike] = None,
+        interval_end_per_model: t.Optional[t.Dict[str, int]] = None,
+        ignore_cron: bool = False,
+        end_bounded: bool = False,
+        selected_snapshots: t.Optional[t.Set[str]] = None,
+        circuit_breaker: t.Optional[t.Callable[[], bool]] = None,
+        deployability_index: t.Optional[DeployabilityIndex] = None,
+        run_environment_statements: bool = False,
+    ) -> CompletionStatus:
+        # Remove the intervals from the snapshots that will be audited so that they can be recomputed
+        # by _run_or_audit as "missing intervals" to reuse the rest of it's logic
+        remove_intervals = {}
+        for snapshot in self.snapshots.values():
+            removal_intervals = snapshot.get_removal_interval(
+                start, end, execution_time, is_preview=True
+            )
+            remove_intervals[snapshot.snapshot_id] = removal_intervals
+
+        return self._run_or_audit(
+            environment=environment,
             start=start,
             end=end,
+            execution_time=execution_time,
+            remove_intervals=remove_intervals,
+            interval_end_per_model=interval_end_per_model,
+            ignore_cron=ignore_cron,
+            end_bounded=end_bounded,
+            selected_snapshots=selected_snapshots,
+            circuit_breaker=circuit_breaker,
+            deployability_index=deployability_index,
+            run_environment_statements=run_environment_statements,
+            audit_only=True,
         )
-
-        self.console.stop_evaluation_progress(success=not errors)
-
-        skipped_snapshots = {i[0] for i in skipped_intervals}
-        for skipped in skipped_snapshots:
-            log_message = f"SKIPPED snapshot {skipped}\n"
-            self.console.log_status_update(log_message)
-            logger.info(log_message)
-
-        for error in errors:
-            if isinstance(error.__cause__, CircuitBreakerError):
-                raise error.__cause__
-            sid = error.node[0]
-            formatted_exception = "".join(format_exception(error.__cause__ or error))
-            log_message = f"FAILED processing snapshot {sid}\n{formatted_exception}"
-            self.console.log_error(log_message)
-            # Log with INFO level to prevent duplicate messages in the console.
-            logger.info(log_message)
-
-        return not errors
 
     def batch_intervals(
         self,
         merged_intervals: SnapshotToIntervals,
-        start: t.Optional[TimeLike] = None,
-        end: t.Optional[TimeLike] = None,
-        execution_time: t.Optional[TimeLike] = None,
+        deployability_index: t.Optional[DeployabilityIndex],
     ) -> t.Dict[Snapshot, Intervals]:
-        def expand_range_as_interval(
-            start_ts: int, end_ts: int, interval_unit: IntervalUnit
-        ) -> t.List[Interval]:
-            values = expand_range(start_ts, end_ts, interval_unit)
-            return [(values[i], values[i + 1]) for i in range(len(values) - 1)]
+        dag = snapshots_to_dag(merged_intervals)
 
-        dag = DAG[str]()
-
-        for snapshot in merged_intervals:
-            dag.add(snapshot.name, [p.name for p in snapshot.parents])
-
-        snapshot_intervals = {
-            snapshot: [
-                i
-                for interval in intervals
-                for i in expand_range_as_interval(*interval, snapshot.node.interval_unit)
-            ]
+        snapshot_intervals: t.Dict[SnapshotId, t.Tuple[Snapshot, t.List[Interval]]] = {
+            snapshot.snapshot_id: (
+                snapshot,
+                [
+                    i
+                    for interval in intervals
+                    for i in _expand_range_as_interval(*interval, snapshot.node.interval_unit)
+                ],
+            )
             for snapshot, intervals in merged_intervals.items()
         }
         snapshot_batches = {}
         all_unready_intervals: t.Dict[str, set[Interval]] = {}
-        for snapshot, intervals in snapshot_intervals.items():
+        for snapshot_id in dag:
+            if snapshot_id not in snapshot_intervals:
+                continue
+            snapshot, intervals = snapshot_intervals[snapshot_id]
             unready = set(intervals)
-            intervals = snapshot.check_ready_intervals(intervals)
+
+            from sqlmesh.core.context import ExecutionContext
+
+            adapter = self.snapshot_evaluator.get_adapter(snapshot.model_gateway)
+
+            context = ExecutionContext(
+                adapter,
+                self.snapshots_by_name,
+                deployability_index,
+                default_dialect=adapter.dialect,
+                default_catalog=self.default_catalog,
+            )
+
+            intervals = snapshot.check_ready_intervals(intervals, context)
             unready -= set(intervals)
 
             for parent in snapshot.parents:
@@ -373,6 +344,8 @@ class Scheduler:
         circuit_breaker: t.Optional[t.Callable[[], bool]] = None,
         start: t.Optional[TimeLike] = None,
         end: t.Optional[TimeLike] = None,
+        run_environment_statements: bool = False,
+        audit_only: bool = False,
     ) -> t.Tuple[t.List[NodeExecutionFailedError[SchedulingUnit]], t.List[SchedulingUnit]]:
         """Runs precomputed batches of missing intervals.
 
@@ -388,19 +361,34 @@ class Scheduler:
         Returns:
             A tuple of errors and skipped intervals.
         """
-        execution_time = execution_time or now()
+        execution_time = execution_time or now_timestamp()
 
-        batched_intervals = self.batch_intervals(merged_intervals, start, end, execution_time)
+        batched_intervals = self.batch_intervals(merged_intervals, deployability_index)
 
         self.console.start_evaluation_progress(
-            {snapshot: len(intervals) for snapshot, intervals in batched_intervals.items()},
+            batched_intervals,
             environment_naming_info,
             self.default_catalog,
+            audit_only=audit_only,
         )
 
         dag = self._dag(batched_intervals)
 
-        snapshots_by_name = {snapshot.name: snapshot for snapshot in self.snapshots.values()}
+        if run_environment_statements:
+            environment_statements = self.state_sync.get_environment_statements(
+                environment_naming_info.name
+            )
+            execute_environment_statements(
+                adapter=self.snapshot_evaluator.adapter,
+                environment_statements=environment_statements,
+                runtime_stage=RuntimeStage.BEFORE_ALL,
+                environment_naming_info=environment_naming_info,
+                default_catalog=self.default_catalog,
+                snapshots=self.snapshots_by_name,
+                start=start,
+                end=end,
+                execution_time=execution_time,
+            )
 
         def evaluate_node(node: SchedulingUnit) -> None:
             if circuit_breaker and circuit_breaker():
@@ -409,21 +397,50 @@ class Scheduler:
             snapshot_name, ((start, end), batch_idx) = node
             if batch_idx == -1:
                 return
-            snapshot = snapshots_by_name[snapshot_name]
+            snapshot = self.snapshots_by_name[snapshot_name]
 
             self.console.start_snapshot_evaluation_progress(snapshot)
 
             execution_start_ts = now_timestamp()
             evaluation_duration_ms: t.Optional[int] = None
 
+            audit_results: t.List[AuditResult] = []
             try:
                 assert execution_time  # mypy
                 assert deployability_index  # mypy
-                self.evaluate(snapshot, start, end, execution_time, deployability_index, batch_idx)
+
+                if audit_only:
+                    audit_results = self._audit_snapshot(
+                        snapshot=snapshot,
+                        environment_naming_info=environment_naming_info,
+                        deployability_index=deployability_index,
+                        snapshots=self.snapshots_by_name,
+                        start=start,
+                        end=end,
+                        execution_time=execution_time,
+                    )
+                else:
+                    audit_results = self.evaluate(
+                        snapshot=snapshot,
+                        environment_naming_info=environment_naming_info,
+                        start=start,
+                        end=end,
+                        execution_time=execution_time,
+                        deployability_index=deployability_index,
+                        batch_index=batch_idx,
+                    )
+
                 evaluation_duration_ms = now_timestamp() - execution_start_ts
             finally:
+                num_audits = len(audit_results)
+                num_audits_failed = sum(1 for result in audit_results if result.count)
                 self.console.update_snapshot_evaluation_progress(
-                    snapshot, batch_idx, evaluation_duration_ms
+                    snapshot,
+                    batched_intervals[snapshot][batch_idx],
+                    batch_idx,
+                    evaluation_duration_ms,
+                    num_audits - num_audits_failed,
+                    num_audits_failed,
                 )
 
         try:
@@ -435,6 +452,19 @@ class Scheduler:
                     raise_on_error=False,
                 )
         finally:
+            if run_environment_statements:
+                execute_environment_statements(
+                    adapter=self.snapshot_evaluator.adapter,
+                    environment_statements=environment_statements,
+                    runtime_stage=RuntimeStage.AFTER_ALL,
+                    environment_naming_info=environment_naming_info,
+                    default_catalog=self.default_catalog,
+                    snapshots=self.snapshots_by_name,
+                    start=start,
+                    end=end,
+                    execution_time=execution_time,
+                )
+
             self.state_sync.recycle()
 
     def _dag(self, batches: SnapshotToIntervals) -> DAG[SchedulingUnit]:
@@ -493,6 +523,181 @@ class Scheduler:
                         ],
                     )
         return dag
+
+    def _run_or_audit(
+        self,
+        environment: str | EnvironmentNamingInfo,
+        start: t.Optional[TimeLike] = None,
+        end: t.Optional[TimeLike] = None,
+        execution_time: t.Optional[TimeLike] = None,
+        remove_intervals: t.Optional[t.Dict[SnapshotId, Interval]] = None,
+        interval_end_per_model: t.Optional[t.Dict[str, int]] = None,
+        ignore_cron: bool = False,
+        end_bounded: bool = False,
+        selected_snapshots: t.Optional[t.Set[str]] = None,
+        circuit_breaker: t.Optional[t.Callable[[], bool]] = None,
+        deployability_index: t.Optional[DeployabilityIndex] = None,
+        auto_restatement_enabled: bool = False,
+        run_environment_statements: bool = False,
+        audit_only: bool = False,
+    ) -> CompletionStatus:
+        """Concurrently runs or audits all snapshots in topological order.
+
+        Args:
+            environment: The environment naming info the user is targeting when applying their change.
+                Can just be the environment name if the user is targeting a remote environment and wants to get the remote
+                naming info
+            start: The start of the run. Defaults to the min node start date.
+            end: The end of the run. Defaults to now.
+            execution_time: The date/time time reference to use for execution time. Defaults to now.
+            remove_intervals: A dict of snapshots to their intervals. For evaluation, these are the intervals that will be restated. For audits,
+                              these are the intervals that will be reaudited
+            interval_end_per_model: The mapping from model FQNs to target end dates.
+            ignore_cron: Whether to ignore the node's cron schedule.
+            end_bounded: If set to true, the evaluated intervals will be bounded by the target end date, disregarding lookback,
+                allow_partials, and other attributes that could cause the intervals to exceed the target end date.
+            selected_snapshots: A set of snapshot names to run. If not provided, all snapshots will be run.
+            circuit_breaker: An optional handler which checks if the run should be aborted.
+            deployability_index: Determines snapshots that are deployable in the context of this render.
+            auto_restatement_enabled: Whether to enable auto restatements.
+
+        Returns:
+            True if the execution was successful and False otherwise.
+        """
+        validate_date_range(start, end)
+        if isinstance(environment, str):
+            env = self.state_sync.get_environment(environment)
+            if not env:
+                raise SQLMeshError(
+                    "Was not provided an environment suffix target and the environment doesn't exist."
+                    "Are you running for the first time and need to run plan/apply first?"
+                )
+            environment_naming_info = env.naming_info
+        else:
+            environment_naming_info = environment
+
+        deployability_index = deployability_index or (
+            DeployabilityIndex.create(self.snapshots.values(), start=start)
+            if environment_naming_info.name != c.PROD
+            else DeployabilityIndex.all_deployable()
+        )
+        execution_time = execution_time or now_timestamp()
+
+        self.state_sync.refresh_snapshot_intervals(self.snapshots.values())
+        for s_id, interval in (remove_intervals or {}).items():
+            self.snapshots[s_id].remove_interval(interval)
+
+        if auto_restatement_enabled:
+            auto_restated_intervals = apply_auto_restatements(self.snapshots, execution_time)
+            self.state_sync.add_snapshots_intervals(auto_restated_intervals)
+            self.state_sync.update_auto_restatements(
+                {s.name_version: s.next_auto_restatement_ts for s in self.snapshots.values()}
+            )
+
+        merged_intervals = self.merged_missing_intervals(
+            start,
+            end,
+            execution_time,
+            deployability_index=deployability_index,
+            restatements=remove_intervals,
+            interval_end_per_model=interval_end_per_model,
+            ignore_cron=ignore_cron,
+            end_bounded=end_bounded,
+            selected_snapshots=selected_snapshots,
+        )
+        if not merged_intervals:
+            return CompletionStatus.NOTHING_TO_DO
+
+        errors, skipped_intervals = self.run_merged_intervals(
+            merged_intervals=merged_intervals,
+            deployability_index=deployability_index,
+            environment_naming_info=environment_naming_info,
+            execution_time=execution_time,
+            circuit_breaker=circuit_breaker,
+            start=start,
+            end=end,
+            run_environment_statements=run_environment_statements,
+            audit_only=audit_only,
+        )
+
+        self.console.stop_evaluation_progress(success=not errors)
+
+        skipped_snapshots = {i[0] for i in skipped_intervals}
+        self.console.log_skipped_models(skipped_snapshots)
+        for skipped in skipped_snapshots:
+            logger.info(f"SKIPPED snapshot {skipped}\n")
+
+        for error in errors:
+            if isinstance(error.__cause__, CircuitBreakerError):
+                raise error.__cause__
+            logger.info(str(error), exc_info=error)
+
+        self.console.log_failed_models(errors)
+
+        return CompletionStatus.FAILURE if errors else CompletionStatus.SUCCESS
+
+    def _audit_snapshot(
+        self,
+        snapshot: Snapshot,
+        deployability_index: DeployabilityIndex,
+        snapshots: t.Dict[str, Snapshot],
+        start: t.Optional[TimeLike] = None,
+        end: t.Optional[TimeLike] = None,
+        execution_time: t.Optional[TimeLike] = None,
+        wap_id: t.Optional[str] = None,
+        environment_naming_info: t.Optional[EnvironmentNamingInfo] = None,
+        **kwargs: t.Any,
+    ) -> t.List[AuditResult]:
+        is_deployable = deployability_index.is_deployable(snapshot)
+
+        audit_results = self.snapshot_evaluator.audit(
+            snapshot=snapshot,
+            start=start,
+            end=end,
+            execution_time=execution_time,
+            snapshots=snapshots,
+            deployability_index=deployability_index,
+            wap_id=wap_id,
+            **kwargs,
+        )
+
+        audit_errors_to_raise: t.List[AuditError] = []
+        audit_errors_to_warn: t.List[AuditError] = []
+        for audit_result in (result for result in audit_results if result.count):
+            error = AuditError(
+                audit_name=audit_result.audit.name,
+                audit_args=audit_result.audit_args,
+                model=snapshot.model_or_none,
+                count=t.cast(int, audit_result.count),
+                query=t.cast(exp.Query, audit_result.query),
+                adapter_dialect=self.snapshot_evaluator.adapter.dialect,
+            )
+            self.notification_target_manager.notify(NotificationEvent.AUDIT_FAILURE, error)
+            if is_deployable and snapshot.node.owner:
+                self.notification_target_manager.notify_user(
+                    NotificationEvent.AUDIT_FAILURE, snapshot.node.owner, error
+                )
+            if audit_result.blocking:
+                audit_errors_to_raise.append(error)
+            else:
+                audit_errors_to_warn.append(error)
+
+        if audit_errors_to_raise:
+            raise NodeAuditsErrors(audit_errors_to_raise)
+
+        if environment_naming_info:
+            for audit_error in audit_errors_to_warn:
+                display_name = snapshot.display_name(
+                    environment_naming_info,
+                    self.default_catalog,
+                    self.snapshot_evaluator.adapter.dialect,
+                )
+                self.console.log_warning(
+                    f"\n{display_name}: {audit_error}.",
+                    f"{audit_error}. Audit query:\n{audit_error.query.sql(audit_error.adapter_dialect)}",
+                )
+
+        return audit_results
 
 
 def compute_interval_params(
@@ -611,3 +816,10 @@ def _resolve_one_snapshot_per_version(
                 snapshot_per_version[key] = snapshot
 
     return snapshot_per_version
+
+
+def _expand_range_as_interval(
+    start_ts: int, end_ts: int, interval_unit: IntervalUnit
+) -> t.List[Interval]:
+    values = expand_range(start_ts, end_ts, interval_unit)
+    return [(values[i], values[i + 1]) for i in range(len(values) - 1)]

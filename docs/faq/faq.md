@@ -128,7 +128,11 @@
 
     SQLMesh’s `plan` command is the primary tool for understanding the effects of changes you make to your project. If your project files have changed or are different from the state of an environment, you execute `sqlmesh plan [environment name]` to synchronize the environment's state with your project files. `sqlmesh plan` will generate a summary of the actions needed to implement the changes, automatically run unit tests, and prompt you to `apply` the plan and implement the changes.
 
-    If your project files have not changed, you execute `sqlmesh run` to run your project's models and audits. You can execute `sqlmesh run` yourself or with the native [Airflow integration](../integrations/airflow.md). If running it yourself, a sensible approach is to use Linux’s `cron` tool to execute `sqlmesh run` on a cadence at least as frequent as your briefest SQLMesh model `cron` parameter. For example, if your most frequent model’s `cron` is hour, your `cron` tool should execute `sqlmesh run` at least every hour.
+    If your project files have not changed, you execute `sqlmesh run` to run your project's models and audits.
+
+    `sqlmesh run` does not use models, macros, or audits from your local project files. Everything it executes is based on the model, macro, and audit versions currently promoted in the target environment. Those versions are stored in the metadata SQLMesh captures about the state of your environment.
+
+    A sensible approach to executing `sqlmesh run` is to use Linux’s `cron` tool to execute `sqlmesh run` on a cadence at least as frequent as your briefest SQLMesh model `cron` parameter. For example, if your most frequent model’s `cron` is hour, your `cron` tool should execute `sqlmesh run` at least every hour.
 
 ??? question "What are start date and end date for?"
     SQLMesh uses the ["intervals" approach](https://tobikodata.com/data_load_patterns_101.html) to determine the date ranges that should be included in an incremental by time model query. It divides time into disjoint intervals and tracks which intervals have ever been processed.
@@ -149,6 +153,11 @@
 
     You can retroactively apply the forward-only plan's changes to existing data in the production environment with [`plan`'s `--effective-from` option](../reference/cli.md#plan).
 
+??? question "How can I force a model to run now?"
+    Ensure that the model's `allow_partials` attribute is set to `true` and execute the `run` command with the `--ignore-cron` option: `sqlmesh run --ignore-cron`.
+
+    See the documentation for [allow_partials](../concepts/models/overview.md#allow_partials) to understand the rationale behind this.
+
 
 ## Databases/Engines
 
@@ -158,14 +167,17 @@
 ## Scheduling
 
 ??? question "How do I run SQLMesh models on a schedule?"
-    You can run SQLMesh models using the [built-in scheduler](../guides/scheduling.md#built-in-scheduler) or with the native [Airflow integration](../integrations/airflow.md).
+    You can run SQLMesh models using the [built-in scheduler](../guides/scheduling.md#built-in-scheduler) or using [Tobiko Cloud](../cloud/features/scheduler/scheduler.md)
 
     Both approaches use each model's `cron` parameter to determine when the model should run - see the [question about `cron` above](#cron-question) for more information.
 
     The built-in scheduler works by executing the command `sqlmesh run`. A sensible approach to running on your project on a schedule is to use Linux’s `cron` tool to execute `sqlmesh run` on a cadence at least as frequent as your briefest SQLMesh model `cron` parameter. For example, if your most frequent model’s `cron` is hour, the `cron` tool should execute `sqlmesh run` at least every hour.
 
 ??? question "How do I use SQLMesh with Airflow?"
-    SQLMesh has first-class support for Airflow - learn more [here](../integrations/airflow.md).
+    Tobiko Cloud offers first-class support for Airflow - learn more [here](../cloud/features/scheduler/airflow.md)
+
+??? question "How do I use SQLMesh with Dagster?"
+    Tobiko Cloud offers first-class support for Dagster - learn more [here](../cloud/features/scheduler/dagster.md)
 
 ## Warnings and Errors
 

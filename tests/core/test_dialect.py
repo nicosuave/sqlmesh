@@ -26,6 +26,7 @@ def test_format_model_expressions():
      a,
      (b, c) as d,
      ),  -- c
+       @macro_prop_with_comment(proper := 'foo'), -- k
      audits [
     not_null(columns=[
       foo_id,
@@ -91,6 +92,7 @@ def test_format_model_expressions():
   name a.b, /* a */
   kind FULL, /* b */
   references (a, (b, c) AS d), /* c */
+  @macro_prop_with_comment(proper := 'foo'), /* k */
   audits ARRAY(
     NOT_NULL(
       columns = ARRAY(
@@ -220,9 +222,48 @@ SELECT
   CAST(1 AS INT) AS bla"""
     )
 
+    x = format_model_expressions(
+        parse(
+            """MODEL(name foo);
+SELECT CAST(1 AS INT) AS bla;
+            on_virtual_update_begin;
+CREATE OR REPLACE VIEW test_view FROM demo_db.table;GRANT SELECT ON VIEW @this_model TO ROLE owner_name;
+JINJA_STATEMENT_BEGIN; GRANT SELECT ON VIEW {{this_model}} TO ROLE admin;        JINJA_END;
+    GRANT REFERENCES, SELECT ON FUTURE VIEWS IN DATABASE demo_db TO ROLE owner_name;
+@resolve_parent_name('parent');GRANT SELECT ON VIEW demo_db.table /* sqlglot.meta replace=false */ TO ROLE admin;
+ON_VIRTUAL_update_end;"""
+        )
+    )
+
+    assert (
+        x
+        == """MODEL (
+  name foo
+);
+
+SELECT
+  1::INT AS bla;
+
+ON_VIRTUAL_UPDATE_BEGIN;
+CREATE OR REPLACE VIEW test_view AS
+SELECT
+  *
+FROM demo_db.table;
+GRANT SELECT ON VIEW @this_model TO ROLE owner_name;
+JINJA_STATEMENT_BEGIN;
+GRANT SELECT ON VIEW {{this_model}} TO ROLE admin;
+JINJA_END;
+GRANT REFERENCES, SELECT ON FUTURE VIEWS IN DATABASE demo_db TO ROLE owner_name;
+@resolve_parent_name('parent');
+GRANT SELECT ON VIEW demo_db.table /* sqlglot.meta replace=false */ TO ROLE admin;
+ON_VIRTUAL_UPDATE_END;"""
+    )
+
 
 def test_macro_format():
     assert parse_one("@EACH(ARRAY(1,2), x -> x)").sql() == "@EACH(ARRAY(1, 2), x -> x)"
+    assert parse_one("INTERVAL @x DAY").sql() == "INTERVAL @x DAY"
+    assert parse_one("INTERVAL @'@{bar}' DAY").sql() == "INTERVAL @'@{bar}' DAY"
 
 
 def test_format_body_macros():
@@ -230,7 +271,7 @@ def test_format_body_macros():
         format_model_expressions(
             parse(
                 """
-    Model ( name foo );
+    Model ( name foo , @macro_dialect(), @properties_macro(prop_1 := 'max', prop_2 := 33));
     @WITH(TRUE) x AS (SELECT 1)
     SELECT col::int
     FROM foo
@@ -242,7 +283,9 @@ def test_format_body_macros():
             )
         )
         == """MODEL (
-  name foo
+  name foo,
+  @macro_dialect(),
+  @properties_macro(prop_1 := 'max', prop_2 := 33)
 );
 
 @WITH(TRUE) x AS (
@@ -571,7 +614,7 @@ def test_model_normalization_multiple_serde(
     expressions = parse(
         f"""
         MODEL (
-            name {table},
+            name {exp.maybe_parse(table, into=exp.Table).sql(dialect=normalization_dialect)},
             kind INCREMENTAL_BY_TIME_RANGE(
                 time_column ds
             ),
@@ -639,3 +682,24 @@ def test_conditional_statement():
 
     q = parse_one("@IF(cond, VACUUM ANALYZE);", read="postgres")
     assert q.sql(dialect="postgres") == "@IF(cond, VACUUM ANALYZE)"
+
+
+def test_model_name_cannot_be_string():
+    with pytest.raises(ParseError) as parse_error:
+        parse(
+            """
+            MODEL(
+              name 'schema.table',
+              kind FULL
+            );
+
+            SELECT
+              1 AS c
+            """
+        )
+
+    assert "\\'name\\' property cannot be a string value" in str(parse_error)
+
+
+def test_parse_snowflake_create_schema_ddl():
+    assert parse_one("CREATE SCHEMA d.s", dialect="snowflake").sql() == "CREATE SCHEMA d.s"

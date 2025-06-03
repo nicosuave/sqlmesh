@@ -57,9 +57,15 @@ Models **require** a start date for backfilling data through use of the `start` 
 
 ### Configuration
 
-SQLMesh determines a project's configuration settings from its dbt configuration files.
+SQLMesh derives a project's configuration from its dbt configuration files. This section outlines additional settings specific to SQLMesh that can be defined.
 
-This section describes using runtime variables to create multiple configurations and how to disable SQLMesh's automatic model description and comment registration.
+#### Selecting a different state connection
+
+[Certain engines](https://sqlmesh.readthedocs.io/en/stable/guides/configuration/?h=unsupported#state-connection), like Trino, cannot be used to store SQLMesh's state.
+
+As a workaround, we recommend specifying a supported state engine using the `state_connection` argument instead.
+
+Learn more about how to configure state connections in Python [here](https://sqlmesh.readthedocs.io/en/stable/guides/configuration/#state-connection).
 
 #### Runtime vars
 
@@ -201,6 +207,8 @@ The [`lookback` parameter](../concepts/models/overview.md#lookback) is used to c
 
 **Note:** By default, all incremental dbt models are configured to be [forward-only](../concepts/plans.md#forward-only-plans). However, you can change this behavior by setting the `forward_only: false` setting either in the configuration of an individual model or globally for all models in the `dbt_project.yaml` file. The [forward-only](../concepts/plans.md#forward-only-plans) mode aligns more closely with the typical operation of dbt and therefore better meets user's expectations.
 
+Similarly, the [allow_partials](../concepts/models/overview.md#allow_partials) parameter is set to `true` by default for incremental dbt models unless the time column is specified, or the `allow_partials` parameter is explicitly set to `false` in the model configuration.
+
 #### on_schema_change
 
 SQLMesh automatically detects destructive schema changes to [forward-only incremental models](../guides/incremental_time.md#forward-only-models) and to all incremental models in [forward-only plans](../concepts/plans.md#destructive-changes).
@@ -270,33 +278,6 @@ SQLMesh does not have its own package manager; however, SQLMesh's dbt adapter is
 ## Documentation
 Model documentation is available in the [SQLMesh UI](../quickstart/ui.md#2-open-the-sqlmesh-web-ui).
 
-## Using Airflow
-To use SQLMesh and dbt projects with Airflow, first configure SQLMesh to use Airflow as described in the [Airflow integrations documentation](./airflow.md).
-
-Then, install dbt-core within airflow.
-
-Finally, replace the contents of `config.py` with:
-
-```bash
-> from pathlib import Path
->
-> from sqlmesh.core.config import AirflowSchedulerConfig
-> from sqlmesh.dbt.loader import sqlmesh_config
->
-> config = sqlmesh_config(
->     Path(__file__).parent,
->     default_scheduler=AirflowSchedulerConfig(
->         airflow_url="https://<Airflow Webserver Host>:<Airflow Webserver Port>/",
->         username="<Airflow Username>",
->         password="<Airflow Password>",
->     )
-> )
-```
-
-See the [Airflow configuration documentation](https://airflow.apache.org/docs/apache-airflow/2.1.0/configurations-ref.html) for a list of all AirflowSchedulerConfig configuration options. Note: only the python config file format is supported for dbt at this time.
-
-The project is now configured to use airflow. Going forward, this also means that the engine configured in airflow will be used instead of the target engine specified in profiles.yml.
-
 ## Supported dbt jinja methods
 
 SQLMesh supports running dbt projects using the majority of dbt jinja methods, including:
@@ -322,7 +303,6 @@ The dbt jinja methods that are not currently supported are:
 * selected_sources
 * adapter.expand_target_column_types
 * adapter.rename_relation
-* schemas
 * graph.nodes.values
 * graph.metrics.values
 

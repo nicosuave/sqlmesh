@@ -2,18 +2,22 @@ import typing as t
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from tenacity import retry, stop_after_attempt
 
-import pandas as pd
+import re
+import pandas as pd  # noqa: TID253
 import pytest
 import sqlglot
 from pytest_mock.plugin import MockerFixture
 from sqlglot import exp
 from sqlglot import exp as expressions
-from sqlglot.expressions import to_table
+from sqlglot.expressions import SQLGLOT_META, to_table
+from sqlglot.optimizer.pushdown_projections import SELECT_ALL
 
 import tests.utils.test_date as test_date
 from sqlmesh.core.dialect import normalize_model_name
 from sqlmesh.core import constants as c
+from sqlmesh.core.macros import RuntimeStage
 from sqlmesh.utils.errors import SQLMeshError
 from sqlmesh.utils.metaprogramming import (
     Executable,
@@ -44,26 +48,29 @@ def test_print_exception(mocker: MockerFixture):
     except Exception as ex:
         print_exception(ex, test_env, out_mock)
 
-    expected_message = f"""Traceback (most recent call last):
-
-  File "{__file__}", line 43, in test_print_exception
-    eval("test_fun()", env)
+    expected_message = r"""  File ".*?.tests.utils.test_metaprogramming\.py", line 47, in test_print_exception
+    eval\("test_fun\(\)", env\)
 
   File "<string>", line 1, in <module>
 
-  File '/test/path.py' (or imported file), line 2, in test_fun
-    def test_fun():
-        raise RuntimeError("error")
-
-
-RuntimeError: error
+  File '/test/path.py' \(or imported file\), line 2, in test_fun
+    def test_fun\(\):
+        raise RuntimeError\("error"\)
+      RuntimeError: error
 """
-    out_mock.write.assert_called_once_with(expected_message)
+    actual_message = out_mock.write.call_args_list[0][0][0]
+    assert isinstance(actual_message, str)
+
+    expected_message = "".join(expected_message.split())
+    actual_message = "".join(actual_message.split())
+
+    assert re.match(expected_message, actual_message)
 
 
 X = 1
 Y = 2
 Z = 3
+W = 0
 
 my_lambda = lambda: print("z")  # noqa: E731
 
@@ -97,19 +104,29 @@ def other_func(a: int) -> int:
     pd.DataFrame([{"x": 1}])
     to_table("y")
     my_lambda()  # type: ignore
-    return X + a
-
-
-def noop_metadata() -> None:
-    return None
-
-
-setattr(noop_metadata, c.SQLMESH_METADATA, True)
+    return X + a + W
 
 
 @contextmanager
-def test_context_manager():
+def sample_context_manager():
     yield
+
+
+@retry(stop=stop_after_attempt(3))
+def fetch_data():
+    return "'test data'"
+
+
+def custom_decorator(_func):
+    def wrapper(*args, **kwargs):
+        return _func(*args, **kwargs)
+
+    return wrapper
+
+
+@custom_decorator
+def function_with_custom_decorator():
+    return
 
 
 def main_func(y: int, foo=exp.true(), *, bar=expressions.Literal.number(1) + 2) -> int:
@@ -117,16 +134,29 @@ def main_func(y: int, foo=exp.true(), *, bar=expressions.Literal.number(1) + 2) 
     sqlglot.parse_one("1")
     MyClass()
     DataClass(x=y)
-    noop_metadata()
-    normalize_model_name("test")
+    normalize_model_name("test" + SQLGLOT_META)
+    fetch_data()
+    function_with_custom_decorator()
 
     def closure(z: int) -> int:
         return z + Z
 
-    with test_context_manager():
+    with sample_context_manager():
         pass
 
     return closure(y) + other_func(Y)
+
+
+def macro1() -> str:
+    print("macro1 hello there")
+    print(RuntimeStage.CREATING)
+    return "1"
+
+
+def macro2() -> str:
+    print("macro2 hello there")
+    print(RuntimeStage.LOADING)
+    return "2"
 
 
 def test_func_globals() -> None:
@@ -135,16 +165,19 @@ def test_func_globals() -> None:
         "Z": 3,
         "DataClass": DataClass,
         "MyClass": MyClass,
-        "noop_metadata": noop_metadata,
         "normalize_model_name": normalize_model_name,
         "other_func": other_func,
         "sqlglot": sqlglot,
         "exp": exp,
         "expressions": exp,
-        "test_context_manager": test_context_manager,
+        "fetch_data": fetch_data,
+        "sample_context_manager": sample_context_manager,
+        "function_with_custom_decorator": function_with_custom_decorator,
+        "SQLGLOT_META": SQLGLOT_META,
     }
     assert func_globals(other_func) == {
         "X": 1,
+        "W": 0,
         "my_lambda": my_lambda,
         "pd": pd,
         "to_table": to_table,
@@ -172,12 +205,13 @@ def test_normalize_source() -> None:
     sqlglot.parse_one('1')
     MyClass()
     DataClass(x=y)
-    noop_metadata()
-    normalize_model_name('test')
+    normalize_model_name('test' + SQLGLOT_META)
+    fetch_data()
+    function_with_custom_decorator()
 
     def closure(z: int):
         return z + Z
-    with test_context_manager():
+    with sample_context_manager():
         pass
     return closure(y) + other_func(Y)"""
     )
@@ -190,24 +224,28 @@ def test_normalize_source() -> None:
     pd.DataFrame([{'x': 1}])
     to_table('y')
     my_lambda()
-    return X + a"""
+    return X + a + W"""
     )
 
 
 def test_serialize_env_error() -> None:
     with pytest.raises(SQLMeshError):
         # pretend to be the module pandas
-        serialize_env({"test_date": test_date}, path=Path("tests/utils"))
+        serialize_env({"test_date": (test_date, None)}, path=Path("tests/utils"))
+
+    with pytest.raises(SQLMeshError):
+        serialize_env({"select_all": (SELECT_ALL, None)}, path=Path("tests/utils"))
 
 
 def test_serialize_env() -> None:
-    env: t.Dict[str, t.Any] = {}
     path = Path("tests/utils")
-    build_env(main_func, env=env, name="MAIN", path=path)
-    env = serialize_env(env, path=path)  # type: ignore
+    env: t.Dict[str, t.Tuple[t.Any, t.Optional[bool]]] = {}
 
-    assert prepare_env(env)
-    assert env == {
+    build_env(main_func, env=env, name="MAIN", path=path)
+    serialized_env = serialize_env(env, path=path)  # type: ignore
+    assert prepare_env(serialized_env)
+
+    expected_env = {
         "MAIN": Executable(
             name="main_func",
             alias="MAIN",
@@ -217,18 +255,20 @@ def test_serialize_env() -> None:
     sqlglot.parse_one('1')
     MyClass()
     DataClass(x=y)
-    noop_metadata()
-    normalize_model_name('test')
+    normalize_model_name('test' + SQLGLOT_META)
+    fetch_data()
+    function_with_custom_decorator()
 
     def closure(z: int):
         return z + Z
-    with test_context_manager():
+    with sample_context_manager():
         pass
     return closure(y) + other_func(Y)""",
         ),
         "X": Executable(payload="1", kind=ExecutableKind.VALUE),
         "Y": Executable(payload="2", kind=ExecutableKind.VALUE),
         "Z": Executable(payload="3", kind=ExecutableKind.VALUE),
+        "W": Executable(payload="0", kind=ExecutableKind.VALUE),
         "_GeneratorContextManager": Executable(
             payload="from contextlib import _GeneratorContextManager", kind=ExecutableKind.IMPORT
         ),
@@ -278,9 +318,9 @@ class DataClass:
         ),
         "func": Executable(
             payload="""@contextmanager
-def test_context_manager():
+def sample_context_manager():
     yield""",
-            name="test_context_manager",
+            name="sample_context_manager",
             path="test_metaprogramming.py",
             alias="func",
         ),
@@ -288,13 +328,6 @@ def test_context_manager():
             name="my_lambda",
             path="test_metaprogramming.py",
             payload="my_lambda = lambda : print('z')",
-        ),
-        "noop_metadata": Executable(
-            name="noop_metadata",
-            path="test_metaprogramming.py",
-            payload="""def noop_metadata():
-    return None""",
-            is_metadata=True,
         ),
         "normalize_model_name": Executable(
             payload="from sqlmesh.core.dialect import normalize_model_name",
@@ -309,11 +342,120 @@ def test_context_manager():
     pd.DataFrame([{'x': 1}])
     to_table('y')
     my_lambda()
-    return X + a""",
+    return X + a + W""",
         ),
-        "test_context_manager": Executable(
-            payload="from tests.utils.test_metaprogramming import test_context_manager",
-            kind=ExecutableKind.IMPORT,
+        "sample_context_manager": Executable(
+            payload="""@contextmanager
+def sample_context_manager():
+    yield""",
+            name="sample_context_manager",
+            path="test_metaprogramming.py",
         ),
         "wraps": Executable(payload="from functools import wraps", kind=ExecutableKind.IMPORT),
+        "functools": Executable(payload="import functools", kind=ExecutableKind.IMPORT),
+        "retry": Executable(payload="from tenacity import retry", kind=ExecutableKind.IMPORT),
+        "stop_after_attempt": Executable(
+            payload="from tenacity.stop import stop_after_attempt", kind=ExecutableKind.IMPORT
+        ),
+        "wrapped_f": Executable(
+            payload='''@retry(stop=stop_after_attempt(3))
+def fetch_data():
+    return "'test data'"''',
+            name="fetch_data",
+            path="test_metaprogramming.py",
+            alias="wrapped_f",
+        ),
+        "fetch_data": Executable(
+            payload='''@retry(stop=stop_after_attempt(3))
+def fetch_data():
+    return "'test data'"''',
+            name="fetch_data",
+            path="test_metaprogramming.py",
+        ),
+        "f": Executable(
+            payload='''@retry(stop=stop_after_attempt(3))
+def fetch_data():
+    return "'test data'"''',
+            name="fetch_data",
+            path="test_metaprogramming.py",
+            alias="f",
+        ),
+        "function_with_custom_decorator": Executable(
+            name="wrapper",
+            path="test_metaprogramming.py",
+            payload="""def wrapper(*args, **kwargs):
+    return _func(*args, **kwargs)""",
+            alias="function_with_custom_decorator",
+        ),
+        "custom_decorator": Executable(
+            name="custom_decorator",
+            path="test_metaprogramming.py",
+            payload="""def custom_decorator(_func):
+
+    def wrapper(*args, **kwargs):
+        return _func(*args, **kwargs)
+    return wrapper""",
+        ),
+        "_func": Executable(
+            name="function_with_custom_decorator",
+            path="test_metaprogramming.py",
+            payload="""@custom_decorator
+def function_with_custom_decorator():
+    return""",
+            alias="_func",
+        ),
+        "SQLGLOT_META": Executable.value("sqlglot.meta"),
     }
+
+    assert all(is_metadata is None for (_, is_metadata) in env.values())
+    assert serialized_env == expected_env
+
+    # Annotate the entrypoint as "metadata only" to show how it propagates
+    setattr(main_func, c.SQLMESH_METADATA, True)
+
+    env = {}
+
+    build_env(main_func, env=env, name="MAIN", path=path)
+    serialized_env = serialize_env(env, path=path)  # type: ignore
+    assert prepare_env(serialized_env)
+
+    expected_env = {k: Executable(**v.dict(), is_metadata=True) for k, v in expected_env.items()}
+
+    # Every object is treated as "metadata only", transitively
+    assert all(is_metadata for (_, is_metadata) in env.values())
+    assert serialized_env == expected_env
+
+
+def test_serialize_env_with_enum_import_appearing_in_two_functions() -> None:
+    path = Path("tests/utils")
+    env: t.Dict[str, t.Tuple[t.Any, t.Optional[bool]]] = {}
+
+    build_env(macro1, env=env, name="macro1", path=path)
+    build_env(macro2, env=env, name="macro2", path=path)
+
+    serialized_env = serialize_env(env, path=path)  # type: ignore
+    assert prepare_env(serialized_env)
+
+    expected_env = {
+        "RuntimeStage": Executable(
+            payload="from sqlmesh.core.macros import RuntimeStage", kind=ExecutableKind.IMPORT
+        ),
+        "macro1": Executable(
+            payload="""def macro1():
+    print('macro1 hello there')
+    print(RuntimeStage.CREATING)
+    return '1'""",
+            name="macro1",
+            path="test_metaprogramming.py",
+        ),
+        "macro2": Executable(
+            payload="""def macro2():
+    print('macro2 hello there')
+    print(RuntimeStage.LOADING)
+    return '2'""",
+            name="macro2",
+            path="test_metaprogramming.py",
+        ),
+    }
+
+    assert serialized_env == expected_env

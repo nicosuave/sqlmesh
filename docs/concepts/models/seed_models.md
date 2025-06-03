@@ -14,6 +14,10 @@ Seed models are a good fit for static datasets that change infrequently or not a
 * Names of national holidays and their dates
 * A static list of identifiers that should be excluded
 
+!!! warning "Not supported in Python models"
+
+    Python models do not support the `SEED` [model kind](./model_kinds.md) - use a SQL model instead.
+
 ## Creating a seed model
 
 Similar to [SQL models](./sql_models.md), `SEED` models are defined in files with the `.sql` extension in the `models/` directory of the SQLMesh project.
@@ -194,3 +198,32 @@ ALTER SESSION SET TIMEZONE = 'UTC';
 -- These are post-statements
 ALTER SESSION SET TIMEZONE = 'PST';
 ```
+
+## On-virtual-update statements
+
+Seed models also support on-virtual-update statements, which are executed after the completion of the [Virtual Update](#virtual-update).
+
+These must be enclosed within an `ON_VIRTUAL_UPDATE_BEGIN;` ...; `ON_VIRTUAL_UPDATE_END;` block:
+
+```sql linenums="1" hl_lines="8-13"
+MODEL (
+  name test_db.national_holidays,
+  kind SEED (
+    path 'national_holidays.csv'
+  )
+);
+
+ON_VIRTUAL_UPDATE_BEGIN;
+GRANT SELECT ON VIEW @this_model TO ROLE dev_role;
+JINJA_STATEMENT_BEGIN;
+GRANT SELECT ON VIEW {{ this_model }} TO ROLE admin_role;
+JINJA_END;
+ON_VIRTUAL_UPDATE_END;
+```
+
+
+[Jinja expressions](../macros/jinja_macros.md) can also be used within them, as demonstrated in the example above. These expressions must be properly nested within a `JINJA_STATEMENT_BEGIN;` and `JINJA_END;` block.
+
+!!! note
+
+    Table resolution for these statements occurs at the virtual layer. This means that table names, including `@this_model` macro, are resolved to their qualified view names. For instance, when running the plan in an environment named `dev`, `db.customers` and `@this_model` would resolve to `db__dev.customers` and not to the physical table name.

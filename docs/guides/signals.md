@@ -28,7 +28,7 @@ Signal checking functions examines a batch of time intervals. The function is al
 
 To define a signal, create a `signals` directory in your project folder. Define your signal in a file named `__init__.py` in that directory (you can have additional python file names as well).
 
-A signal is a function that accepts a batch (DateTimeRanges: t.List[t.Tuple[datetime, datetime]]) and returns a batch or a boolean. It needs use the @signal decorator.
+A signal is a function that accepts a batch (`DateTimeRanges: t.List[t.Tuple[datetime, datetime]]`) and returns a batch or a boolean. It needs to use the `@signal` decorator.
 
 We now demonstrate signals of varying complexity.
 
@@ -116,3 +116,34 @@ MODEL (
 
 SELECT @start_ds AS ds
 ```
+
+### Accessing execution context / engine adapter
+It is possible to access the execution context in a signal and access the engine adapter (warehouse connection).
+
+```python
+import typing as t
+
+from sqlmesh import signal, DatetimeRanges, ExecutionContext
+
+
+# add the context argument to your function
+@signal()
+def one_week_ago(batch: DatetimeRanges, context: ExecutionContext) -> t.Union[bool, DatetimeRanges]:
+    return len(context.engine_adapter.fetchdf("SELECT 1")) > 1
+```
+
+### Testing Signals
+Signals only evaluate on `run` or with `check_intervals`.
+
+To test signals with the [check_intervals](../reference/cli.md#check_intervals) command:
+
+1. Deploy your changes to an environment with `sqlmesh plan my_dev`.
+2. Run `sqlmesh check_intervals my_dev`.
+
+   * To check a subset of models use the --select-model flag.
+   * To turn off signals and just check missing intervals, use the --no-signals flag.
+
+3. To iterate, make changes to the signal, and redeploy with step 1.
+
+!!! note
+    `check_intervals` only works on remote models in an environment. Local signal changes are never run.

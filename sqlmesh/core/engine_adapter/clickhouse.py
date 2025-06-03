@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import typing as t
 import logging
-import pandas as pd
 import re
 from sqlglot import exp, maybe_parse
 from sqlmesh.core.dialect import to_schema
@@ -19,6 +18,8 @@ from sqlmesh.core.engine_adapter.shared import (
 from sqlmesh.core.schema_diff import SchemaDiffer
 
 if t.TYPE_CHECKING:
+    import pandas as pd
+
     from sqlmesh.core._typing import SchemaName, TableName
     from sqlmesh.core.engine_adapter._typing import DF, Query, QueryOrDF
 
@@ -711,6 +712,7 @@ class ClickhouseEngineAdapter(EngineAdapterWithIndexSupport, LogicalMergeMixin):
         table_description: t.Optional[str] = None,
         table_kind: t.Optional[str] = None,
         empty_ctas: bool = False,
+        **kwargs: t.Any,
     ) -> t.Optional[exp.Properties]:
         properties: t.List[exp.Expression] = []
 
@@ -784,8 +786,9 @@ class ClickhouseEngineAdapter(EngineAdapterWithIndexSupport, LogicalMergeMixin):
                 )
             )
 
-        if partitioned_by and (
-            partitioned_by_prop := self._build_partitioned_by_exp(partitioned_by)
+        if (
+            partitioned_by
+            and (partitioned_by_prop := self._build_partitioned_by_exp(partitioned_by)) is not None
         ):
             properties.append(partitioned_by_prop)
 

@@ -1,6 +1,8 @@
 import typing as t
 import pytest
+from pytest import FixtureRequest
 from sqlglot import exp
+from pathlib import Path
 from sqlglot.optimizer.qualify_columns import quote_identifiers
 from sqlglot.helper import seq_get
 from sqlmesh.core.engine_adapter import SnowflakeEngineAdapter
@@ -9,18 +11,32 @@ import sqlmesh.core.dialect as d
 from sqlmesh.core.model import SqlModel, load_sql_based_model
 from sqlmesh.core.plan import Plan
 from tests.core.engine_adapter.integration import TestContext
+from sqlmesh import model, ExecutionContext
+from sqlmesh.core.model import ModelKindName
+from datetime import datetime
 
-pytestmark = [pytest.mark.engine, pytest.mark.remote, pytest.mark.snowflake]
+from tests.core.engine_adapter.integration import (
+    TestContext,
+    generate_pytest_params,
+    ENGINES_BY_NAME,
+    IntegrationTestEngine,
+)
+
+
+@pytest.fixture(
+    params=list(generate_pytest_params(ENGINES_BY_NAME["snowflake"], show_variant_in_test_id=False))
+)
+def ctx(
+    request: FixtureRequest,
+    create_test_context: t.Callable[[IntegrationTestEngine, str, str], t.Iterable[TestContext]],
+) -> t.Iterable[TestContext]:
+    yield from create_test_context(*request.param)
 
 
 @pytest.fixture
-def mark_gateway() -> t.Tuple[str, str]:
-    return "snowflake", "inttest_snowflake"
-
-
-@pytest.fixture
-def test_type() -> str:
-    return "query"
+def engine_adapter(ctx: TestContext) -> SnowflakeEngineAdapter:
+    assert isinstance(ctx.engine_adapter, SnowflakeEngineAdapter)
+    return ctx.engine_adapter
 
 
 def test_get_alter_expressions_includes_clustering(
@@ -163,3 +179,95 @@ def test_mutating_clustered_by_forward_only(
 
     metadata = _get_data_object(target_table_1)
     assert not metadata.is_clustered
+
+
+def test_create_iceberg_table(ctx: TestContext, engine_adapter: SnowflakeEngineAdapter) -> None:
+    # Note: this test relies on a default Catalog and External Volume being configured in Snowflake
+    # ref: https://docs.snowflake.com/en/user-guide/tables-iceberg-configure-catalog-integration#set-a-default-catalog-at-the-account-database-or-schema-level
+    # ref: https://docs.snowflake.com/en/user-guide/tables-iceberg-configure-external-volume#set-a-default-external-volume-at-the-account-database-or-schema-level
+    # This has been done on the Snowflake account used by CI
+
+    model_name = ctx.table("TEST")
+    managed_model_name = ctx.table("TEST_DYNAMIC")
+    sqlmesh = ctx.create_context()
+
+    model = load_sql_based_model(
+        d.parse(f"""
+            MODEL (
+                name {model_name},
+                kind FULL,
+                table_format iceberg,
+                dialect 'snowflake'
+            );
+
+            select 1 as "ID", 'foo' as "NAME";
+            """)
+    )
+
+    managed_model = load_sql_based_model(
+        d.parse(f"""
+            MODEL (
+                name {managed_model_name},
+                kind MANAGED,
+                physical_properties (
+                    target_lag = '20 minutes'
+                ),
+                table_format iceberg,
+                dialect 'snowflake'
+            );
+
+            select "ID", "NAME" from {model_name};
+            """)
+    )
+
+    sqlmesh.upsert_model(model)
+    sqlmesh.upsert_model(managed_model)
+
+    result = sqlmesh.plan(auto_apply=True)
+
+    assert len(result.new_snapshots) == 2
+
+
+def test_snowpark_concurrency(ctx: TestContext) -> None:
+    from snowflake.snowpark import DataFrame
+
+    table = ctx.table("my_model")
+
+    # this model will insert 10 records in batches of 1, with 4 batches at a time running concurrently
+    @model(
+        name=table.sql(),
+        kind=dict(
+            name=ModelKindName.INCREMENTAL_BY_TIME_RANGE,
+            time_column="ds",
+            batch_size=1,
+            batch_concurrency=4,
+        ),
+        columns={"id": "int", "ds": "date"},
+        start="2020-01-01",
+        end="2020-01-10",
+    )
+    def execute(context: ExecutionContext, start: datetime, **kwargs) -> DataFrame:
+        if snowpark := context.snowpark:
+            return snowpark.create_dataframe([(start.day, start.date())], schema=["id", "ds"])
+
+        raise ValueError("Snowpark not present!")
+
+    m = model.get_registry()[table.sql().lower()].model(
+        module_path=Path("."), path=Path("."), dialect="snowflake"
+    )
+
+    sqlmesh = ctx.create_context()
+
+    # verify that we are actually running in multithreaded mode
+    assert sqlmesh.concurrent_tasks > 1
+    assert ctx.engine_adapter._multithreaded
+
+    sqlmesh.upsert_model(m)
+
+    plan = sqlmesh.plan(auto_apply=True)
+
+    assert len(plan.new_snapshots) == 1
+
+    query = exp.select("*").from_(table)
+    df = ctx.engine_adapter.fetchdf(query, quote_identifiers=True)
+    assert len(df) == 10

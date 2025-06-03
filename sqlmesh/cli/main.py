@@ -7,19 +7,30 @@ import typing as t
 
 import click
 
-from sqlmesh import configure_logging
+from sqlmesh import configure_logging, remove_excess_logs
 from sqlmesh.cli import error_handler
 from sqlmesh.cli import options as opt
 from sqlmesh.cli.example_project import ProjectTemplate, init_example_project
 from sqlmesh.core.analytics import cli_analytics
+from sqlmesh.core.console import configure_console, get_console
+from sqlmesh.utils import Verbosity
 from sqlmesh.core.config import load_configs
 from sqlmesh.core.context import Context
 from sqlmesh.utils.date import TimeLike
-from sqlmesh.utils.errors import MissingDependencyError
+from sqlmesh.utils.errors import MissingDependencyError, SQLMeshError
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-SKIP_LOAD_COMMANDS = ("create_external_models", "migrate", "rollback", "run")
+SKIP_LOAD_COMMANDS = (
+    "create_external_models",
+    "migrate",
+    "rollback",
+    "run",
+    "environments",
+    "invalidate",
+    "table_name",
+)
 SKIP_CONTEXT_COMMANDS = ("init", "ui")
 
 
@@ -86,14 +97,21 @@ def cli(
         if ctx.invoked_subcommand in SKIP_CONTEXT_COMMANDS:
             ctx.obj = path
             return
-        elif ctx.invoked_subcommand in SKIP_LOAD_COMMANDS:
+        if ctx.invoked_subcommand in SKIP_LOAD_COMMANDS:
             load = False
+
+    configure_logging(
+        debug,
+        log_to_stdout,
+        log_file_dir=log_file_dir,
+        ignore_warnings=ignore_warnings,
+    )
+    configure_console(ignore_warnings=ignore_warnings)
 
     configs = load_configs(config, Context.CONFIG_TYPE, paths)
     log_limit = list(configs.values())[0].log_limit
-    configure_logging(
-        debug, ignore_warnings, log_to_stdout, log_limit=log_limit, log_file_dir=log_file_dir
-    )
+
+    remove_excess_logs(log_file_dir, log_limit)
 
     try:
         context = Context(
@@ -121,12 +139,17 @@ def cli(
     "-t",
     "--template",
     type=str,
-    help="Project template. Supported values: airflow, dbt, dlt, default, empty.",
+    help="Project template. Supported values: dbt, dlt, default, empty.",
 )
 @click.option(
     "--dlt-pipeline",
     type=str,
     help="DLT pipeline for which to generate a SQLMesh project. Use alongside template: dlt",
+)
+@click.option(
+    "--dlt-path",
+    type=str,
+    help="The directory where the DLT pipeline resides. Use alongside template: dlt",
 )
 @click.pass_context
 @error_handler
@@ -136,6 +159,7 @@ def init(
     sql_dialect: t.Optional[str] = None,
     template: t.Optional[str] = None,
     dlt_pipeline: t.Optional[str] = None,
+    dlt_path: t.Optional[str] = None,
 ) -> None:
     """Create a new SQLMesh repository."""
     try:
@@ -143,7 +167,11 @@ def init(
     except ValueError:
         raise click.ClickException(f"Invalid project template '{template}'")
     init_example_project(
-        ctx.obj, dialect=sql_dialect, template=project_template, pipeline=dlt_pipeline
+        ctx.obj,
+        dialect=sql_dialect,
+        template=project_template,
+        pipeline=dlt_pipeline,
+        dlt_path=dlt_path,
     )
 
 
@@ -320,6 +348,13 @@ def diff(ctx: click.Context, environment: t.Optional[str] = None) -> None:
     "--skip-tests",
     is_flag=True,
     help="Skip tests prior to generating the plan if they are defined.",
+    default=None,
+)
+@click.option(
+    "--skip-linter",
+    is_flag=True,
+    help="Skip linting prior to generating the plan if the linter is enabled.",
+    default=None,
 )
 @click.option(
     "--restate-model",
@@ -332,17 +367,20 @@ def diff(ctx: click.Context, environment: t.Optional[str] = None) -> None:
     "--no-gaps",
     is_flag=True,
     help="Ensure that new snapshots have no data gaps when comparing to existing snapshots for matching models in the target environment.",
+    default=None,
 )
 @click.option(
     "--skip-backfill",
     "--dry-run",
     is_flag=True,
     help="Skip the backfill step and only create a virtual update for the plan.",
+    default=None,
 )
 @click.option(
     "--empty-backfill",
     is_flag=True,
     help="Produce empty backfill. Like --skip-backfill no models will be backfilled, unlike --skip-backfill missing intervals will be recorded as if they were backfilled.",
+    default=None,
 )
 @click.option(
     "--forward-only",
@@ -408,6 +446,7 @@ def diff(ctx: click.Context, environment: t.Optional[str] = None) -> None:
     "--run",
     is_flag=True,
     help="Run latest intervals as part of the plan application (prod environment only).",
+    default=None,
 )
 @click.option(
     "--enable-preview",
@@ -415,12 +454,21 @@ def diff(ctx: click.Context, environment: t.Optional[str] = None) -> None:
     help="Enable preview for forward-only models when targeting a development environment.",
     default=None,
 )
+@click.option(
+    "--diff-rendered",
+    is_flag=True,
+    help="Output text differences for the rendered versions of the models and standalone audits",
+    default=None,
+)
 @opt.verbose
 @click.pass_context
 @error_handler
 @cli_analytics
 def plan(
-    ctx: click.Context, verbose: bool, environment: t.Optional[str] = None, **kwargs: t.Any
+    ctx: click.Context,
+    verbose: int,
+    environment: t.Optional[str] = None,
+    **kwargs: t.Any,
 ) -> None:
     """Apply local changes to the target environment."""
     context = ctx.obj
@@ -428,7 +476,8 @@ def plan(
     select_models = kwargs.pop("select_model") or None
     allow_destructive_models = kwargs.pop("allow_destructive_model") or None
     backfill_models = kwargs.pop("backfill_model") or None
-    context.console.verbose = verbose
+    setattr(get_console(), "verbosity", Verbosity(verbose))
+
     context.plan(
         environment,
         restate_models=restate_models,
@@ -472,9 +521,9 @@ def run(ctx: click.Context, environment: t.Optional[str] = None, **kwargs: t.Any
     """Evaluate missing intervals for the target environment."""
     context = ctx.obj
     select_models = kwargs.pop("select_model") or None
-    success = context.run(environment, select_models=select_models, **kwargs)
-    if not success:
-        raise click.ClickException("Run DAG Failed. See output for details.")
+    completion_status = context.run(environment, select_models=select_models, **kwargs)
+    if completion_status.is_failure:
+        raise click.ClickException("Run failed.")
 
 
 @cli.command("invalidate")
@@ -510,6 +559,19 @@ def janitor(ctx: click.Context, ignore_ttl: bool, **kwargs: t.Any) -> None:
     The janitor cleans up old environments and expired snapshots.
     """
     ctx.obj.run_janitor(ignore_ttl, **kwargs)
+
+
+@cli.command("destroy")
+@click.pass_context
+@error_handler
+@cli_analytics
+def destroy(ctx: click.Context, **kwargs: t.Any) -> None:
+    """
+    The destroy command removes all project resources.
+
+    This includes engine-managed objects, state tables, the SQLMesh cache and any build artifacts.
+    """
+    ctx.obj.destroy(**kwargs)
 
 
 @cli.command("dag")
@@ -621,7 +683,7 @@ def create_test(
 def test(
     obj: Context,
     k: t.List[str],
-    verbose: bool,
+    verbose: int,
     preserve_fixtures: bool,
     tests: t.List[str],
 ) -> None:
@@ -629,7 +691,7 @@ def test(
     result = obj.test(
         match_patterns=k,
         tests=tests,
-        verbose=verbose,
+        verbosity=Verbosity(verbose),
         preserve_fixtures=preserve_fixtures,
     )
     if not result.wasSuccessful():
@@ -657,7 +719,44 @@ def audit(
     execution_time: t.Optional[TimeLike] = None,
 ) -> None:
     """Run audits for the target model(s)."""
-    obj.audit(models=models, start=start, end=end, execution_time=execution_time)
+    if not obj.audit(models=models, start=start, end=end, execution_time=execution_time):
+        exit(1)
+
+
+@cli.command("check_intervals")
+@click.option(
+    "--no-signals",
+    is_flag=True,
+    help="Disable signal checks and only show missing intervals.",
+    default=False,
+)
+@click.argument("environment", required=False)
+@click.option(
+    "--select-model",
+    type=str,
+    multiple=True,
+    help="Select specific models to show missing intervals for.",
+)
+@opt.start_time
+@opt.end_time
+@click.pass_context
+@error_handler
+@cli_analytics
+def check_intervals(
+    ctx: click.Context,
+    environment: t.Optional[str],
+    no_signals: bool,
+    select_model: t.List[str],
+    start: TimeLike,
+    end: TimeLike,
+) -> None:
+    """Show missing intervals in an environment, respecting signals."""
+    context = ctx.obj
+    context.console.show_intervals(
+        context.check_intervals(
+            environment, no_signals=no_signals, select_models=select_model, start=start, end=end
+        )
+    )
 
 
 @cli.command("fetchdf")
@@ -681,13 +780,13 @@ def fetchdf(ctx: click.Context, sql: str) -> None:
 @click.pass_obj
 @error_handler
 @cli_analytics
-def info(obj: Context, skip_connection: bool, verbose: bool) -> None:
+def info(obj: Context, skip_connection: bool, verbose: int) -> None:
     """
     Print information about a SQLMesh project.
 
     Includes counts of project models and macros and connection tests for the data warehouse.
     """
-    obj.print_info(skip_connection=skip_connection, verbose=verbose)
+    obj.print_info(skip_connection=skip_connection, verbosity=Verbosity(verbose))
 
 
 @cli.command("ui")
@@ -817,9 +916,21 @@ def create_external_models(obj: Context, **kwargs: t.Any) -> None:
     help="Disable the check for a primary key (grain) that is missing or is not unique.",
 )
 @click.option(
+    "--warn-grain-check",
+    is_flag=True,
+    help="Warn if any selected model is missing a grain, and compute diffs for the remaining models.",
+)
+@click.option(
     "--temp-schema",
     type=str,
     help="Schema used for temporary tables. It can be `CATALOG.SCHEMA` or `SCHEMA`. Default: `sqlmesh_temp`",
+)
+@click.option(
+    "--select-model",
+    "-m",
+    type=str,
+    multiple=True,
+    help="Specify one or more models to data diff. Use wildcards to diff multiple models. Ex: '*' (all models with applied plan diffs), 'demo.model+' (this and downstream models), 'git:feature_branch' (models with direct modifications in this branch only)",
 )
 @click.pass_obj
 @error_handler
@@ -827,12 +938,20 @@ def create_external_models(obj: Context, **kwargs: t.Any) -> None:
 def table_diff(
     obj: Context, source_to_target: str, model: t.Optional[str], **kwargs: t.Any
 ) -> None:
-    """Show the diff between two tables."""
+    """Show the diff between two tables or a selection of models when they are specified."""
     source, target = source_to_target.split(":")
+    select_model = kwargs.pop("select_model", None)
+
+    if model and select_model:
+        raise SQLMeshError(
+            "The --select-model option cannot be used together with a model argument. Please choose one of them."
+        )
+
+    select_models = {model} if model else select_model
     obj.table_diff(
         source=source,
         target=target,
-        model_or_snapshot=model,
+        select_models=select_models,
         **kwargs,
     )
 
@@ -882,7 +1001,11 @@ def rewrite(obj: Context, sql: str, read: str = "", write: str = "") -> None:
 @error_handler
 @cli_analytics
 def prompt(
-    ctx: click.Context, prompt: str, evaluate: bool, temperature: float, verbose: bool
+    ctx: click.Context,
+    prompt: str,
+    evaluate: bool,
+    temperature: float,
+    verbose: int,
 ) -> None:
     """Uses LLM to generate a SQL query from a prompt."""
     from sqlmesh.integrations.llm import LLMIntegration
@@ -893,7 +1016,7 @@ def prompt(
         context.models.values(),
         context.engine_adapter.dialect,
         temperature=temperature,
-        verbose=verbose,
+        verbosity=Verbosity(verbose),
     )
     query = llm_integration.query(prompt)
 
@@ -914,17 +1037,24 @@ def clean(obj: Context) -> None:
 @cli.command("table_name")
 @click.argument("model_name", required=True)
 @click.option(
-    "--dev",
+    "--environment",
+    "--env",
+    help="The environment to source the model version from.",
+)
+@click.option(
+    "--prod",
     is_flag=True,
-    help="Print the name of the snapshot table used for previews in development environments.",
     default=False,
+    help="If set, return the name of the physical table that will be used in production for the model version promoted in the target environment.",
 )
 @click.pass_obj
 @error_handler
 @cli_analytics
-def table_name(obj: Context, model_name: str, dev: bool) -> None:
+def table_name(
+    obj: Context, model_name: str, environment: t.Optional[str] = None, prod: bool = False
+) -> None:
     """Prints the name of the physical table for the given model."""
-    print(obj.table_name(model_name, dev))
+    print(obj.table_name(model_name, environment, prod))
 
 
 @cli.command("dlt_refresh")
@@ -943,6 +1073,11 @@ def table_name(obj: Context, model_name: str, dev: bool) -> None:
     default=False,
     help="If set, existing models are overwritten with the new DLT tables.",
 )
+@click.option(
+    "--dlt-path",
+    type=str,
+    help="The directory where the DLT pipeline resides.",
+)
 @click.pass_context
 @error_handler
 @cli_analytics
@@ -951,13 +1086,122 @@ def dlt_refresh(
     pipeline: str,
     force: bool,
     table: t.List[str] = [],
+    dlt_path: t.Optional[str] = None,
 ) -> None:
     """Attaches to a DLT pipeline with the option to update specific or all missing tables in the SQLMesh project."""
     from sqlmesh.integrations.dlt import generate_dlt_models
 
-    sqlmesh_models = generate_dlt_models(ctx.obj, pipeline, list(table or []), force)
+    sqlmesh_models = generate_dlt_models(ctx.obj, pipeline, list(table or []), force, dlt_path)
     if sqlmesh_models:
         model_names = "\n".join([f"- {model_name}" for model_name in sqlmesh_models])
-        ctx.obj.console.log_success(f"Updatde SQLMesh project with models:\n{model_names}")
+        ctx.obj.console.log_success(f"Updated SQLMesh project with models:\n{model_names}")
     else:
         ctx.obj.console.log_success("All SQLMesh models are up to date.")
+
+
+@cli.command("environments")
+@click.pass_obj
+@error_handler
+@cli_analytics
+def environments(obj: Context) -> None:
+    """Prints the list of SQLMesh environments with its expiry datetime."""
+    obj.print_environment_names()
+
+
+@cli.command("lint")
+@click.option(
+    "--models",
+    "--model",
+    multiple=True,
+    help="A model to lint. Multiple models can be linted. If no models are specified, every model will be linted.",
+)
+@click.pass_obj
+@error_handler
+@cli_analytics
+def lint(
+    obj: Context,
+    models: t.Iterator[str],
+) -> None:
+    """Run the linter for the target model(s)."""
+    obj.lint_models(models)
+
+
+@cli.group(no_args_is_help=True)
+def state() -> None:
+    """Commands for interacting with state"""
+    pass
+
+
+@state.command("export")
+@click.option(
+    "-o",
+    "--output-file",
+    required=True,
+    help="Path to write the state export to",
+    type=click.Path(dir_okay=False, writable=True, path_type=Path),
+)
+@click.option(
+    "--environment",
+    multiple=True,
+    help="Name of environment to export. Specify multiple --environment arguments to export multiple environments",
+)
+@click.option(
+    "--local",
+    is_flag=True,
+    help="Export local state only. Note that the resulting file will not be importable",
+)
+@click.option(
+    "--no-confirm",
+    is_flag=True,
+    help="Do not prompt for confirmation before exporting existing state",
+)
+@click.pass_obj
+@error_handler
+@cli_analytics
+def state_export(
+    obj: Context,
+    output_file: Path,
+    environment: t.Optional[t.Tuple[str]],
+    local: bool,
+    no_confirm: bool,
+) -> None:
+    """Export the state database to a file"""
+    confirm = not no_confirm
+
+    if environment and local:
+        raise click.ClickException("Cannot specify both --environment and --local")
+
+    environment_names = list(environment) if environment else None
+    obj.export_state(
+        output_file=output_file,
+        environment_names=environment_names,
+        local_only=local,
+        confirm=confirm,
+    )
+
+
+@state.command("import")
+@click.option(
+    "-i",
+    "--input-file",
+    help="Path to the state file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),
+)
+@click.option(
+    "--replace",
+    is_flag=True,
+    help="Clear the remote state before loading the file. If omitted, a merge is performed instead",
+)
+@click.option(
+    "--no-confirm",
+    is_flag=True,
+    help="Do not prompt for confirmation before updating existing state",
+)
+@click.pass_obj
+@error_handler
+@cli_analytics
+def state_import(obj: Context, input_file: Path, replace: bool, no_confirm: bool) -> None:
+    """Import a state export file back into the state database"""
+    confirm = not no_confirm
+    obj.import_state(input_file=input_file, clear=replace, confirm=confirm)

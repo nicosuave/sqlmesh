@@ -1,13 +1,15 @@
 # type: ignore
 import typing as t
 
-import pandas as pd
+import pandas as pd  # noqa: TID253
 import pytest
 from pytest_mock.plugin import MockerFixture
+from unittest.mock import PropertyMock
 from sqlglot import expressions as exp
 from sqlglot import parse_one
 
 from sqlmesh.core.engine_adapter import RedshiftEngineAdapter
+from sqlmesh.utils.errors import SQLMeshError
 from tests.core.engine_adapter import to_sql_calls
 
 pytestmark = [pytest.mark.engine, pytest.mark.redshift]
@@ -114,6 +116,46 @@ def test_create_table_from_query_exists_no_if_not_exists(
 
     assert to_sql_calls(adapter) == [
         'CREATE VIEW "__temp_ctas_test_random_id" AS SELECT "a", "b", "x" + 1 AS "c", "d" AS "d", "e" FROM (SELECT * FROM "table") WITH NO SCHEMA BINDING',
+        'DROP VIEW IF EXISTS "__temp_ctas_test_random_id" CASCADE',
+        'CREATE TABLE "test_schema"."test_table" ("a" VARCHAR(MAX), "b" VARCHAR(60), "c" VARCHAR(MAX), "d" VARCHAR(MAX), "e" TIMESTAMP)',
+    ]
+
+    columns_mock.assert_called_once_with(exp.table_("__temp_ctas_test_random_id", quoted=True))
+
+
+def test_create_table_recursive_cte(adapter: t.Callable, mocker: MockerFixture):
+    mocker.patch(
+        "sqlmesh.core.engine_adapter.base.random_id",
+        return_value="test_random_id",
+    )
+
+    mocker.patch(
+        "sqlmesh.core.engine_adapter.redshift.RedshiftEngineAdapter.table_exists",
+        return_value=True,
+    )
+
+    columns_mock = mocker.patch(
+        "sqlmesh.core.engine_adapter.redshift.RedshiftEngineAdapter.columns",
+        return_value={
+            "a": exp.DataType.build("VARCHAR(MAX)", dialect="redshift"),
+            "b": exp.DataType.build("VARCHAR(60)", dialect="redshift"),
+            "c": exp.DataType.build("VARCHAR(MAX)", dialect="redshift"),
+            "d": exp.DataType.build("VARCHAR(MAX)", dialect="redshift"),
+            "e": exp.DataType.build("TIMESTAMP", dialect="redshift"),
+        },
+    )
+
+    adapter.ctas(
+        table_name="test_schema.test_table",
+        query_or_df=parse_one(
+            "WITH RECURSIVE cte AS (SELECT * FROM table WHERE FALSE LIMIT 0) SELECT a, b, x + 1 AS c, d AS d, e FROM cte WHERE d > 0 AND FALSE LIMIT 0",
+            dialect="redshift",
+        ),
+        exists=False,
+    )
+
+    assert to_sql_calls(adapter) == [
+        'CREATE VIEW "__temp_ctas_test_random_id" AS WITH RECURSIVE "cte" AS (SELECT * FROM "table") SELECT "a", "b", "x" + 1 AS "c", "d" AS "d", "e" FROM "cte"',
         'DROP VIEW IF EXISTS "__temp_ctas_test_random_id" CASCADE',
         'CREATE TABLE "test_schema"."test_table" ("a" VARCHAR(MAX), "b" VARCHAR(60), "c" VARCHAR(MAX), "d" VARCHAR(MAX), "e" TIMESTAMP)',
     ]
@@ -313,12 +355,202 @@ def test_alter_table_drop_column_cascade(adapter: t.Callable):
     def table_columns(table_name: str) -> t.Dict[str, exp.DataType]:
         if table_name == current_table_name:
             return {"id": exp.DataType.build("int"), "test_column": exp.DataType.build("int")}
-        else:
-            return {"id": exp.DataType.build("int")}
+        return {"id": exp.DataType.build("int")}
 
     adapter.columns = table_columns
 
     adapter.alter_table(adapter.get_alter_expressions(current_table_name, target_table_name))
     assert to_sql_calls(adapter) == [
         'ALTER TABLE "test_table" DROP COLUMN "test_column" CASCADE',
+    ]
+
+
+def test_alter_table_precision_increase_varchar(adapter: t.Callable):
+    current_table_name = "test_table"
+    target_table_name = "target_table"
+
+    def table_columns(table_name: str) -> t.Dict[str, exp.DataType]:
+        if table_name == current_table_name:
+            return {
+                "id": exp.DataType.build("int"),
+                "test_column": exp.DataType.build("VARCHAR(10)"),
+            }
+        return {
+            "id": exp.DataType.build("int"),
+            "test_column": exp.DataType.build("VARCHAR(20)"),
+        }
+
+    adapter.columns = table_columns
+
+    adapter.alter_table(adapter.get_alter_expressions(current_table_name, target_table_name))
+    assert to_sql_calls(adapter) == [
+        'ALTER TABLE "test_table" ALTER COLUMN "test_column" TYPE VARCHAR(20)',
+    ]
+
+
+def test_alter_table_precision_increase_decimal(adapter: t.Callable):
+    current_table_name = "test_table"
+    target_table_name = "target_table"
+
+    def table_columns(table_name: str) -> t.Dict[str, exp.DataType]:
+        if table_name == current_table_name:
+            return {
+                "id": exp.DataType.build("int"),
+                "test_column": exp.DataType.build("DECIMAL(10, 10)"),
+            }
+        return {
+            "id": exp.DataType.build("int"),
+            "test_column": exp.DataType.build("DECIMAL(25, 10)"),
+        }
+
+    adapter.columns = table_columns
+
+    adapter.alter_table(adapter.get_alter_expressions(current_table_name, target_table_name))
+    assert to_sql_calls(adapter) == [
+        'ALTER TABLE "test_table" DROP COLUMN "test_column" CASCADE',
+        'ALTER TABLE "test_table" ADD COLUMN "test_column" DECIMAL(25, 10)',
+    ]
+
+
+def test_merge(make_mocked_engine_adapter: t.Callable, mocker: MockerFixture):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+    mocker.patch(
+        "sqlmesh.core.engine_adapter.redshift.RedshiftEngineAdapter.enable_merge",
+        new_callable=PropertyMock(return_value=True),
+    )
+
+    adapter.merge(
+        target_table=exp.to_table("target_table_name"),
+        source_table=t.cast(exp.Select, parse_one('SELECT "ID", ts, val FROM source')),
+        columns_to_types={
+            "ID": exp.DataType.build("int"),
+            "ts": exp.DataType.build("timestamp"),
+            "val": exp.DataType.build("int"),
+        },
+        unique_key=[exp.to_identifier("ID", quoted=True)],
+    )
+
+    # Test additional predicates in the merge_filter
+    adapter.merge(
+        target_table=exp.to_table("target_table_name"),
+        source_table=t.cast(exp.Select, parse_one('SELECT "ID", ts, val FROM source')),
+        columns_to_types={
+            "ID": exp.DataType.build("int"),
+            "ts": exp.DataType.build("timestamp"),
+            "val": exp.DataType.build("int"),
+        },
+        unique_key=[exp.to_identifier("ID", quoted=True)],
+        merge_filter=exp.and_(
+            exp.and_(exp.column("ID", "__MERGE_SOURCE__") > 0),
+            exp.column("ts", "__MERGE_TARGET__") < exp.column("ts", "__MERGE_SOURCE__"),
+        ),
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    assert sql_calls == [
+        'MERGE INTO "target_table_name" USING (SELECT "ID", "ts", "val" FROM "source") AS "__MERGE_SOURCE__" ON "target_table_name"."ID" = "__MERGE_SOURCE__"."ID" WHEN MATCHED THEN UPDATE SET "ID" = "__MERGE_SOURCE__"."ID", "ts" = "__MERGE_SOURCE__"."ts", "val" = "__MERGE_SOURCE__"."val" WHEN NOT MATCHED THEN INSERT ("ID", "ts", "val") VALUES ("__MERGE_SOURCE__"."ID", "__MERGE_SOURCE__"."ts", "__MERGE_SOURCE__"."val")',
+        'MERGE INTO "target_table_name" USING (SELECT "ID", "ts", "val" FROM "source") AS "__MERGE_SOURCE__" ON ("__MERGE_SOURCE__"."ID" > 0 AND "target_table_name"."ts" < "__MERGE_SOURCE__"."ts") AND "target_table_name"."ID" = "__MERGE_SOURCE__"."ID" WHEN MATCHED THEN UPDATE SET "ID" = "__MERGE_SOURCE__"."ID", "ts" = "__MERGE_SOURCE__"."ts", "val" = "__MERGE_SOURCE__"."val" WHEN NOT MATCHED THEN INSERT ("ID", "ts", "val") VALUES ("__MERGE_SOURCE__"."ID", "__MERGE_SOURCE__"."ts", "__MERGE_SOURCE__"."val")',
+    ]
+
+
+def test_merge_when_matched_error(make_mocked_engine_adapter: t.Callable, mocker: MockerFixture):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+    mocker.patch(
+        "sqlmesh.core.engine_adapter.redshift.RedshiftEngineAdapter.enable_merge",
+        new_callable=PropertyMock(return_value=True),
+    )
+
+    with pytest.raises(
+        SQLMeshError,
+        match=r".*Redshift only supports a single WHEN MATCHED and WHEN NOT MATCHED clause*",
+    ):
+        adapter.merge(
+            target_table=exp.to_table("target_table_name"),
+            source_table=t.cast(exp.Select, parse_one('SELECT "ID", val FROM source')),
+            columns_to_types={
+                "ID": exp.DataType.build("int"),
+                "val": exp.DataType.build("int"),
+            },
+            unique_key=[exp.to_identifier("ID", quoted=True)],
+            when_matched=exp.Whens(
+                expressions=[
+                    exp.When(
+                        matched=True,
+                        condition=exp.column("ID", "__MERGE_SOURCE__").eq(exp.Literal.number(1)),
+                        then=exp.Update(
+                            expressions=[
+                                exp.column("val", "__MERGE_TARGET__").eq(
+                                    exp.column("val", "__MERGE_SOURCE__")
+                                ),
+                            ],
+                        ),
+                    ),
+                    exp.When(
+                        matched=True,
+                        source=False,
+                        then=exp.Update(
+                            expressions=[
+                                exp.column("val", "__MERGE_TARGET__").eq(
+                                    exp.column("val", "__MERGE_SOURCE__")
+                                ),
+                            ],
+                        ),
+                    ),
+                ]
+            ),
+        )
+
+
+def test_merge_logical_filter_error(make_mocked_engine_adapter: t.Callable, mocker: MockerFixture):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+    mocker.patch(
+        "sqlmesh.core.engine_adapter.redshift.RedshiftEngineAdapter.enable_merge",
+        new_callable=PropertyMock(return_value=False),
+    )
+
+    with pytest.raises(
+        SQLMeshError,
+        match=r".*This engine does not support MERGE expressions and therefore `merge_filter` is not supported.*",
+    ):
+        adapter.merge(
+            target_table=exp.to_table("target_table_name_2"),
+            source_table=t.cast(exp.Select, parse_one('SELECT "ID", ts FROM source')),
+            columns_to_types={
+                "ID": exp.DataType.build("int"),
+                "ts": exp.DataType.build("timestamp"),
+            },
+            unique_key=[exp.to_identifier("ID", quoted=True)],
+            merge_filter=exp.and_(
+                exp.and_(exp.column("ID", "__MERGE_SOURCE__") > 0),
+                exp.column("ts", "__MERGE_TARGET__") < exp.column("ts", "__MERGE_SOURCE__"),
+            ),
+        )
+
+
+def test_merge_logical(
+    make_mocked_engine_adapter: t.Callable, make_temp_table_name: t.Callable, mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+
+    temp_table_mock = mocker.patch("sqlmesh.core.engine_adapter.EngineAdapter._get_temp_table")
+    table_name = "test"
+    temp_table_id = "abcdefgh"
+    temp_table_mock.return_value = make_temp_table_name(table_name, temp_table_id)
+
+    adapter.merge(
+        target_table=exp.to_table("target"),
+        source_table=t.cast(exp.Select, parse_one('SELECT "ID", ts FROM source')),
+        columns_to_types={
+            "ID": exp.DataType.build("int"),
+            "ts": exp.DataType.build("timestamp"),
+        },
+        unique_key=[exp.to_identifier("ID", quoted=True)],
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    assert sql_calls == [
+        'CREATE TABLE "__temp_test_abcdefgh" AS SELECT CAST("ID" AS INTEGER) AS "ID", CAST("ts" AS TIMESTAMP) AS "ts" FROM (SELECT "ID", "ts" FROM "source") AS "_subquery"',
+        'DELETE FROM "target" WHERE "ID" IN (SELECT "ID" FROM "__temp_test_abcdefgh")',
+        'INSERT INTO "target" ("ID", "ts") SELECT "ID", "ts" FROM (SELECT "ID" AS "ID", "ts" AS "ts", ROW_NUMBER() OVER (PARTITION BY "ID" ORDER BY "ID") AS _row_number FROM "__temp_test_abcdefgh") AS _t WHERE _row_number = 1',
+        'DROP TABLE IF EXISTS "__temp_test_abcdefgh"',
     ]

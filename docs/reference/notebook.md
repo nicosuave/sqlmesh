@@ -24,9 +24,9 @@ import sqlmesh
 %context path_to_sqlmesh_project
 ```
 
-### Quick start project
+### Quickstart project
 
-If desired, you can create the [quick start example project](../quick_start.md) with the Python `init_example_project` function. The function requires a default SQL dialect for the project's models; this example uses `snowflake`:
+If desired, you can create the [quickstart example project](../quick_start.md) with the Python `init_example_project` function. The function requires a default SQL dialect for the project's models; this example uses `snowflake`:
 
 ```python
 from sqlmesh.cli.example_project import init_example_project
@@ -86,7 +86,7 @@ positional arguments:
 
 options:
   --template TEMPLATE, -t TEMPLATE
-                        Project template. Supported values: airflow, dbt,
+                        Project template. Supported values: dbt,
                         dlt, default, empty.
   --dlt-pipeline PIPELINE
                         DLT pipeline for which to generate a SQLMesh project.
@@ -103,7 +103,7 @@ options:
             [--no-auto-categorization] [--include-unmodified]
             [--select-model [SELECT_MODEL ...]]
             [--backfill-model [BACKFILL_MODEL ...]] [--no-diff] [--run]
-            [environment]
+            [environment] [--diff-rendered]
 
 Goes through a set of prompts to both establish a plan and apply it
 
@@ -153,6 +153,8 @@ options:
   --no-diff             Hide text differences for changed models.
   --run                 Run latest intervals as part of the plan application
                         (prod environment only).
+  --diff-rendered       Output text differences for the rendered versions of models and standalone audits
+
 ```
 
 #### run_dag
@@ -230,6 +232,13 @@ options:
   --file FILE, -f FILE  An optional file path to write the HTML output to.
 ```
 
+#### destroy
+```
+%destroy
+
+Removes all project resources, including warehouse objects, state tables, the SQLMesh cache and any build artifacts.
+```
+
 #### dlt_refresh
 ```
 %dlt_refresh PIPELINE [--table] TABLE [--force]
@@ -239,6 +248,13 @@ Attaches to a DLT pipeline with the option to update specific or all models of t
 options:
   --table TABLE, -t TABLE  The DLT tables to generate SQLMesh models from. When none specified, all new missing tables will be generated.
   --force, -f              If set it will overwrite existing models with the new generated models from the DLT tables.
+```
+
+#### environments
+```
+%environments
+
+Prints the list of SQLMesh environments with its expiry datetime.
 ```
 
 #### fetchdf
@@ -284,8 +300,8 @@ Create a schema file containing external model schemas.
 %table_diff [--on [ON ...]] [--skip-columns [SKIP_COLUMNS ...]]
                 [--model MODEL] [--where WHERE] [--limit LIMIT]
                 [--show-sample] [--decimals DECIMALS] [--skip-grain-check]
-                [--temp-schema SCHEMA]
-                SOURCE:TARGET
+                [--warn-grain-check] [--temp-schema SCHEMA]
+                [--select-model [SELECT_MODEL ...]] SOURCE:TARGET
 
 Show the diff between two tables.
 
@@ -310,7 +326,11 @@ options:
                         floating point columns. Default: 3
   --skip-grain-check    Disable the check for a primary key (grain) that is
                         missing or is not unique.
+  --warn-grain-check    Warn if any selected model is missing a grain,
+                        and compute diffs for the remaining models.
   --temp-schema SCHEMA  The schema to use for temporary tables.
+  --select-model <[SELECT_MODEL ...]>
+                        Select specific models to diff using a pattern.
 ```
 
 #### model
@@ -429,6 +449,27 @@ options:
                         Execution time.
 ```
 
+#### check_intervals
+```
+%check_intervals [--no-signals] [--select-model [SELECT_MODEL ...]]
+                   [--start START] [--end END]
+                   [environment]
+
+Show missing intervals in an environment, respecting signals.
+
+positional arguments:
+  environment           The environment to check intervals for.
+
+options:
+  --no-signals          Disable signal checks and only show missing intervals.
+  --select-model <[SELECT_MODEL ...]>
+                        Select specific model changes that should be included
+                        in the plan.
+  --start START, -s START
+                        Start date of intervals to check for.
+  --end END, -e END     End date of intervals to check for.
+```
+
 #### rollback
 ```
 %rollback
@@ -485,4 +526,15 @@ options:
                         creating new lines in pretty mode.
   --check               Whether or not to check formatting (but not actually
                         format anything).
+```
+
+
+#### lint
+```
+%lint [--models ...]
+
+Run the linter on the target models(s)
+
+positional arguments:
+  --models                A model to lint. Multiple models can be linted. If no models are specified, every model will be linted.
 ```

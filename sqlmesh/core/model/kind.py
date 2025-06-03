@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import typing as t
 from enum import Enum
+from typing_extensions import Self
 
 from pydantic import Field
 from sqlglot import exp
-from sqlglot.helper import ensure_list
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.optimizer.qualify_columns import quote_identifiers
 from sqlglot.optimizer.simplify import gen
 from sqlglot.time import format_time
 
 from sqlmesh.core import dialect as d
-from sqlmesh.core.model.common import parse_properties, properties_validator
+from sqlmesh.core.model.common import (
+    parse_properties,
+    properties_validator,
+    validate_extra_and_required_fields,
+)
 from sqlmesh.core.model.seed import CsvSettings
 from sqlmesh.utils.errors import ConfigError
 from sqlmesh.utils.pydantic import (
@@ -23,9 +27,10 @@ from sqlmesh.utils.pydantic import (
     SQLGlotListOfFields,
     SQLGlotPositiveInt,
     SQLGlotString,
+    SQLGlotCron,
+    ValidationInfo,
     column_validator,
     field_validator,
-    field_validator_v1_args,
     get_dialect,
     validate_string,
 )
@@ -120,7 +125,7 @@ class ModelKindMixin:
 
     @property
     def is_materialized(self) -> bool:
-        return not (self.is_symbolic or self.is_view)
+        return self.model_kind_name is not None and not (self.is_symbolic or self.is_view)
 
     @property
     def only_execution_time(self) -> bool:
@@ -130,12 +135,14 @@ class ModelKindMixin:
     @property
     def full_history_restatement_only(self) -> bool:
         """Whether or not this model only supports restatement of full history."""
-        return self.model_kind_name in (
-            ModelKindName.INCREMENTAL_UNMANAGED,
-            ModelKindName.INCREMENTAL_BY_UNIQUE_KEY,
-            ModelKindName.INCREMENTAL_BY_PARTITION,
-            ModelKindName.SCD_TYPE_2,
-            ModelKindName.MANAGED,
+        return (
+            self.is_incremental_unmanaged
+            or self.is_incremental_by_unique_key
+            or self.is_incremental_by_partition
+            or self.is_scd_type_2
+            or self.is_managed
+            or self.is_full
+            or self.is_view
         )
 
     @property
@@ -237,44 +244,8 @@ class TimeColumn(PydanticModel):
 
     @classmethod
     def validator(cls) -> classmethod:
-        def _time_column_validator(v: t.Any, values: t.Any) -> TimeColumn:
-            dialect = get_dialect(values)
-
-            if isinstance(v, exp.Tuple):
-                column_expr = v.expressions[0]
-                column = (
-                    exp.column(column_expr)
-                    if isinstance(column_expr, exp.Identifier)
-                    else column_expr
-                )
-                format = v.expressions[1].name if len(v.expressions) > 1 else None
-            elif isinstance(v, exp.Expression):
-                column = exp.column(v) if isinstance(v, exp.Identifier) else v
-                format = None
-            elif isinstance(v, str):
-                column = d.parse_one(v, dialect=dialect)
-                column.meta.pop("sql")
-                format = None
-            elif isinstance(v, dict):
-                column_raw = v["column"]
-                column = (
-                    d.parse_one(column_raw, dialect=dialect)
-                    if isinstance(column_raw, str)
-                    else column_raw
-                )
-                format = v.get("format")
-            elif isinstance(v, TimeColumn):
-                column = v.column
-                format = v.format
-            else:
-                raise ConfigError(f"Invalid time_column: '{v}'.")
-
-            column = quote_identifiers(
-                normalize_identifiers(column, dialect=dialect), dialect=dialect
-            )
-            column.meta["dialect"] = dialect
-
-            return TimeColumn(column=column, format=format)
+        def _time_column_validator(v: t.Any, info: ValidationInfo) -> TimeColumn:
+            return TimeColumn.create(v, get_dialect(info.data))
 
         return field_validator("time_column", mode="before")(_time_column_validator)
 
@@ -312,6 +283,40 @@ class TimeColumn(PydanticModel):
     def to_property(self, dialect: str = "") -> exp.Property:
         return exp.Property(this="time_column", value=self.to_expression(dialect))
 
+    @classmethod
+    def create(cls, v: t.Any, dialect: str) -> Self:
+        if isinstance(v, exp.Tuple):
+            column_expr = v.expressions[0]
+            column = (
+                exp.column(column_expr) if isinstance(column_expr, exp.Identifier) else column_expr
+            )
+            format = v.expressions[1].name if len(v.expressions) > 1 else None
+        elif isinstance(v, exp.Expression):
+            column = exp.column(v) if isinstance(v, exp.Identifier) else v
+            format = None
+        elif isinstance(v, str):
+            column = d.parse_one(v, dialect=dialect)
+            column.meta.pop("sql")
+            format = None
+        elif isinstance(v, dict):
+            column_raw = v["column"]
+            column = (
+                d.parse_one(column_raw, dialect=dialect)
+                if isinstance(column_raw, str)
+                else column_raw
+            )
+            format = v.get("format")
+        elif isinstance(v, TimeColumn):
+            column = v.column
+            format = v.format
+        else:
+            raise ConfigError(f"Invalid time_column: '{v}'.")
+
+        column = quote_identifiers(normalize_identifiers(column, dialect=dialect), dialect=dialect)
+        column.meta["dialect"] = dialect
+
+        return cls(column=column, format=format)
+
 
 def _kind_dialect_validator(cls: t.Type, v: t.Optional[str]) -> str:
     if v is None:
@@ -319,13 +324,12 @@ def _kind_dialect_validator(cls: t.Type, v: t.Optional[str]) -> str:
     return v
 
 
-kind_dialect_validator = field_validator("dialect", mode="before", always=True)(
-    _kind_dialect_validator
-)
+kind_dialect_validator = field_validator("dialect", mode="before")(_kind_dialect_validator)
 
 
 class _Incremental(_ModelKind):
     on_destructive_change: OnDestructiveChange = OnDestructiveChange.ERROR
+    auto_restatement_cron: t.Optional[SQLGlotCron] = None
 
     _on_destructive_change_validator = on_destructive_change_validator
 
@@ -334,6 +338,7 @@ class _Incremental(_ModelKind):
         return [
             *super().metadata_hash_values,
             str(self.on_destructive_change),
+            self.auto_restatement_cron,
         ]
 
     def to_expression(
@@ -342,8 +347,11 @@ class _Incremental(_ModelKind):
         return super().to_expression(
             expressions=[
                 *(expressions or []),
-                _property(
-                    "on_destructive_change", exp.Literal.string(self.on_destructive_change.value)
+                *_properties(
+                    {
+                        "on_destructive_change": self.on_destructive_change.value,
+                        "auto_restatement_cron": self.auto_restatement_cron,
+                    }
                 ),
             ],
         )
@@ -400,6 +408,8 @@ class IncrementalByTimeRangeKind(_IncrementalBy):
         ModelKindName.INCREMENTAL_BY_TIME_RANGE
     )
     time_column: TimeColumn
+    auto_restatement_intervals: t.Optional[SQLGlotPositiveInt] = None
+    partition_by_time_column: SQLGlotBool = True
 
     _time_column_validator = TimeColumn.validator()
 
@@ -410,6 +420,16 @@ class IncrementalByTimeRangeKind(_IncrementalBy):
             expressions=[
                 *(expressions or []),
                 self.time_column.to_property(kwargs.get("dialect") or ""),
+                *_properties(
+                    {
+                        "partition_by_time_column": self.partition_by_time_column,
+                    }
+                ),
+                *(
+                    [_property("auto_restatement_intervals", self.auto_restatement_intervals)]
+                    if self.auto_restatement_intervals is not None
+                    else []
+                ),
             ]
         )
 
@@ -417,54 +437,59 @@ class IncrementalByTimeRangeKind(_IncrementalBy):
     def data_hash_values(self) -> t.List[t.Optional[str]]:
         return [*super().data_hash_values, gen(self.time_column.column), self.time_column.format]
 
+    @property
+    def metadata_hash_values(self) -> t.List[t.Optional[str]]:
+        return [
+            *super().metadata_hash_values,
+            str(self.partition_by_time_column),
+            str(self.auto_restatement_intervals)
+            if self.auto_restatement_intervals is not None
+            else None,
+        ]
+
 
 class IncrementalByUniqueKeyKind(_IncrementalBy):
     name: t.Literal[ModelKindName.INCREMENTAL_BY_UNIQUE_KEY] = (
         ModelKindName.INCREMENTAL_BY_UNIQUE_KEY
     )
     unique_key: SQLGlotListOfFields
-    when_matched: t.Optional[t.List[exp.When]] = None
+    when_matched: t.Optional[exp.Whens] = None
+    merge_filter: t.Optional[exp.Expression] = None
     batch_concurrency: t.Literal[1] = 1
 
     @field_validator("when_matched", mode="before")
-    @field_validator_v1_args
     def _when_matched_validator(
         cls,
-        v: t.Optional[t.Union[exp.When, str, t.List[exp.When], t.List[str]]],
-        values: t.Dict[str, t.Any],
-    ) -> t.Optional[t.List[exp.When]]:
-        def replace_table_references(expression: exp.Expression) -> exp.Expression:
-            from sqlmesh.core.engine_adapter.base import (
-                MERGE_SOURCE_ALIAS,
-                MERGE_TARGET_ALIAS,
-            )
+        v: t.Optional[t.Union[str, list, exp.Whens]],
+        info: ValidationInfo,
+    ) -> t.Optional[exp.Whens]:
+        if v is None:
+            return v
+        if isinstance(v, list):
+            v = " ".join(v)
+        if isinstance(v, str):
+            # Whens wrap the WHEN clauses, but the parentheses aren't parsed by sqlglot
+            v = v.strip()
+            if v.startswith("("):
+                v = v[1:-1]
 
-            if isinstance(expression, exp.Column):
-                if expression.table.lower() == "target":
-                    expression.set(
-                        "table",
-                        exp.to_identifier(MERGE_TARGET_ALIAS),
-                    )
-                elif expression.table.lower() == "source":
-                    expression.set(
-                        "table",
-                        exp.to_identifier(MERGE_SOURCE_ALIAS),
-                    )
-            return expression
+            return t.cast(exp.Whens, d.parse_one(v, into=exp.Whens, dialect=get_dialect(info.data)))
 
-        if not v:
-            return v  # type: ignore
+        return t.cast(exp.Whens, v.transform(d.replace_merge_table_aliases))
 
-        result = []
-        list_v = ensure_list(v)
-        for value in ensure_list(list_v):
-            if isinstance(value, str):
-                result.append(
-                    t.cast(exp.When, d.parse_one(value, into=exp.When, dialect=get_dialect(values)))
-                )
-            else:
-                result.append(t.cast(exp.When, value.transform(replace_table_references)))  # type: ignore
-        return result
+    @field_validator("merge_filter", mode="before")
+    def _merge_filter_validator(
+        cls,
+        v: t.Optional[exp.Expression],
+        info: ValidationInfo,
+    ) -> t.Optional[exp.Expression]:
+        if v is None:
+            return v
+        if isinstance(v, str):
+            v = v.strip()
+            return d.parse_one(v, dialect=get_dialect(info.data))
+
+        return v.transform(d.replace_merge_table_aliases)
 
     @property
     def data_hash_values(self) -> t.List[t.Optional[str]]:
@@ -472,6 +497,7 @@ class IncrementalByUniqueKeyKind(_IncrementalBy):
             *super().data_hash_values,
             *(gen(k) for k in self.unique_key),
             gen(self.when_matched) if self.when_matched is not None else None,
+            gen(self.merge_filter) if self.merge_filter is not None else None,
         ]
 
     def to_expression(
@@ -484,6 +510,7 @@ class IncrementalByUniqueKeyKind(_IncrementalBy):
                     {
                         "unique_key": exp.Tuple(expressions=self.unique_key),
                         "when_matched": self.when_matched,
+                        "merge_filter": self.merge_filter,
                     }
                 ),
             ],
@@ -493,7 +520,7 @@ class IncrementalByUniqueKeyKind(_IncrementalBy):
 class IncrementalByPartitionKind(_Incremental):
     name: t.Literal[ModelKindName.INCREMENTAL_BY_PARTITION] = ModelKindName.INCREMENTAL_BY_PARTITION
     forward_only: t.Literal[True] = True
-    disable_restatement: SQLGlotBool = True
+    disable_restatement: SQLGlotBool = False
 
     @field_validator("forward_only", mode="before")
     def _forward_only_validator(cls, v: t.Union[bool, exp.Expression]) -> t.Literal[True]:
@@ -597,7 +624,7 @@ class SeedKind(_ModelKind):
         if v is None or isinstance(v, CsvSettings):
             return v
         if isinstance(v, exp.Expression):
-            tuple_exp = parse_properties(cls, v, {})
+            tuple_exp = parse_properties(cls, v, None)
             if not tuple_exp:
                 return None
             return CsvSettings(**{e.left.name: e.right for e in tuple_exp.expressions})
@@ -623,14 +650,19 @@ class SeedKind(_ModelKind):
 
     @property
     def data_hash_values(self) -> t.List[t.Optional[str]]:
+        csv_setting_values = (self.csv_settings or CsvSettings()).dict().values()
         return [
             *super().data_hash_values,
-            *(self.csv_settings or CsvSettings()).dict().values(),
+            *(v if isinstance(v, (str, type(None))) else str(v) for v in csv_setting_values),
         ]
 
     @property
     def metadata_hash_values(self) -> t.List[t.Optional[str]]:
         return [*super().metadata_hash_values, str(self.batch_size)]
+
+    @property
+    def supports_python_models(self) -> bool:
+        return False
 
 
 class FullKind(_ModelKind):
@@ -644,19 +676,18 @@ class _SCDType2Kind(_Incremental):
     valid_to_name: SQLGlotColumn = Field(exp.column("valid_to"), validate_default=True)
     invalidate_hard_deletes: SQLGlotBool = False
     time_data_type: exp.DataType = Field(exp.DataType.build("TIMESTAMP"), validate_default=True)
+    batch_size: t.Optional[SQLGlotPositiveInt] = None
 
     forward_only: SQLGlotBool = True
     disable_restatement: SQLGlotBool = True
 
     _dialect_validator = kind_dialect_validator
 
-    # Remove once Pydantic 1 is deprecated
-    _always_validate_column = field_validator(
-        "valid_from_name", "valid_to_name", mode="before", always=True
-    )(column_validator)
+    _always_validate_column = field_validator("valid_from_name", "valid_to_name", mode="before")(
+        column_validator
+    )
 
-    # always=True can be removed once Pydantic 1 is deprecated
-    @field_validator("time_data_type", mode="before", always=True)
+    @field_validator("time_data_type", mode="before")
     @classmethod
     def _time_data_type_validator(
         cls, v: t.Union[str, exp.Expression], values: t.Any
@@ -684,7 +715,8 @@ class _SCDType2Kind(_Incremental):
             gen(self.valid_from_name),
             gen(self.valid_to_name),
             str(self.invalidate_hard_deletes),
-            gen(self.time_data_type),
+            self.time_data_type.sql(self.dialect),
+            gen(self.batch_size) if self.batch_size is not None else None,
         ]
 
     @property
@@ -723,8 +755,7 @@ class SCDType2ByTimeKind(_SCDType2Kind):
     updated_at_name: SQLGlotColumn = Field(exp.column("updated_at"), validate_default=True)
     updated_at_as_valid_from: SQLGlotBool = False
 
-    # Remove once Pydantic 1 is deprecated
-    _always_validate_updated_at = field_validator("updated_at_name", mode="before", always=True)(
+    _always_validate_updated_at = field_validator("updated_at_name", mode="before")(
         column_validator
     )
 
@@ -756,6 +787,7 @@ class SCDType2ByColumnKind(_SCDType2Kind):
     name: t.Literal[ModelKindName.SCD_TYPE_2_BY_COLUMN] = ModelKindName.SCD_TYPE_2_BY_COLUMN
     columns: SQLGlotListOfColumnsOrStar
     execution_time_as_valid_from: SQLGlotBool = False
+    updated_at_name: t.Optional[SQLGlotColumn] = None
 
     @property
     def data_hash_values(self) -> t.List[t.Optional[str]]:
@@ -764,7 +796,12 @@ class SCDType2ByColumnKind(_SCDType2Kind):
             if isinstance(self.columns, list)
             else [gen(self.columns)]
         )
-        return [*super().data_hash_values, *columns_sql, str(self.execution_time_as_valid_from)]
+        return [
+            *super().data_hash_values,
+            *columns_sql,
+            str(self.execution_time_as_valid_from),
+            gen(self.updated_at_name) if self.updated_at_name is not None else None,
+        ]
 
     def to_expression(
         self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
@@ -795,7 +832,6 @@ class ManagedKind(_ModelKind):
 
 class EmbeddedKind(_ModelKind):
     name: t.Literal[ModelKindName.EMBEDDED] = ModelKindName.EMBEDDED
-    disable_restatement: t.Literal[True] = True
 
     @property
     def supports_python_models(self) -> bool:
@@ -804,7 +840,6 @@ class EmbeddedKind(_ModelKind):
 
 class ExternalKind(_ModelKind):
     name: t.Literal[ModelKindName.EXTERNAL] = ModelKindName.EXTERNAL
-    disable_restatement: t.Literal[True] = True
 
 
 class CustomKind(_ModelKind):
@@ -818,18 +853,19 @@ class CustomKind(_ModelKind):
     batch_size: t.Optional[SQLGlotPositiveInt] = None
     batch_concurrency: t.Optional[SQLGlotPositiveInt] = None
     lookback: t.Optional[SQLGlotPositiveInt] = None
+    auto_restatement_cron: t.Optional[SQLGlotCron] = None
+    auto_restatement_intervals: t.Optional[SQLGlotPositiveInt] = None
+
+    # so that CustomKind subclasses know the dialect when validating / normalizing / interpreting values in `materialization_properties`
+    dialect: str = Field(exclude=True)
 
     _properties_validator = properties_validator
 
     @field_validator("materialization", mode="before")
     @classmethod
     def _validate_materialization(cls, v: t.Any) -> str:
-        from sqlmesh.core.snapshot.evaluator import get_custom_materialization_type
-
-        materialization = validate_string(v)
-        # The below call fails if a materialization with the given name doesn't exist.
-        get_custom_materialization_type(materialization)
-        return materialization
+        # note: create_model_kind() validates the custom materialization class
+        return validate_string(v)
 
     @property
     def materialization_properties(self) -> CustomMaterializationProperties:
@@ -855,6 +891,10 @@ class CustomKind(_ModelKind):
             str(self.batch_concurrency) if self.batch_concurrency is not None else None,
             str(self.forward_only),
             str(self.disable_restatement),
+            self.auto_restatement_cron,
+            str(self.auto_restatement_intervals)
+            if self.auto_restatement_intervals is not None
+            else None,
         ]
 
     def to_expression(
@@ -872,6 +912,8 @@ class CustomKind(_ModelKind):
                         "batch_size": self.batch_size,
                         "batch_concurrency": self.batch_concurrency,
                         "lookback": self.lookback,
+                        "auto_restatement_cron": self.auto_restatement_cron,
+                        "auto_restatement_intervals": self.auto_restatement_intervals,
                     }
                 ),
             ],
@@ -953,19 +995,39 @@ def create_model_kind(v: t.Any, dialect: str, defaults: t.Dict[str, t.Any]) -> M
         ):
             props["on_destructive_change"] = defaults.get("on_destructive_change")
 
+        if kind_type == CustomKind:
+            # load the custom materialization class and check if it uses a custom kind type
+            from sqlmesh.core.snapshot.evaluator import get_custom_materialization_type
+
+            if "materialization" not in props:
+                raise ConfigError(
+                    "The 'materialization' property is required for models of the CUSTOM kind"
+                )
+
+            # The below call will print a warning if a materialization with the given name doesn't exist
+            # we dont want to throw an error here because we still want Models with a CustomKind to be able
+            # to be serialized / deserialized in contexts where the custom materialization class may not be available,
+            # such as in HTTP request handlers
+            custom_materialization = get_custom_materialization_type(
+                validate_string(props.get("materialization")), raise_errors=False
+            )
+            if custom_materialization is not None:
+                actual_kind_type, _ = custom_materialization
+                return actual_kind_type(**props)
+
+        validate_extra_and_required_fields(kind_type, set(props), f"model kind '{name}'")
         return kind_type(**props)
 
     name = (v.name if isinstance(v, exp.Expression) else str(v)).upper()
     return model_kind_type_from_name(name)(name=name)  # type: ignore
 
 
-@field_validator_v1_args
-def _model_kind_validator(cls: t.Type, v: t.Any, values: t.Dict[str, t.Any]) -> ModelKind:
-    dialect = get_dialect(values)
+def _model_kind_validator(cls: t.Type, v: t.Any, info: t.Optional[ValidationInfo]) -> ModelKind:
+    dialect = get_dialect(info.data) if info else ""
     return create_model_kind(v, dialect, {})
 
 
-model_kind_validator = field_validator("kind", mode="before")(_model_kind_validator)
+model_kind_validator: t.Callable = field_validator("kind", mode="before")(_model_kind_validator)
 
 
 def _property(name: str, value: t.Any) -> exp.Property:

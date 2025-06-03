@@ -25,14 +25,14 @@ models:
     +materialized: table
     +pre-hook:
       - '{{ log("pre-hook") }}'
-    +post-hook: 
+    +post-hook:
       - '{{ log("post-hook") }}'
 
 seeds:
   sushi:
     +pre-hook:
       - '{{ log("pre-hook") }}'
-    +post-hook: 
+    +post-hook:
       - '{{ log("post-hook") }}'
 
 vars:
@@ -48,3 +48,22 @@ vars:
     some_var: ["foo", "bar"]
     'customers:bla': false
     'customers:customer_id': "customer_id"
+
+  nested_vars:
+    some_nested_var: 2
+
+  list_var:
+    - name: 'item1'
+      value: 1
+    - name: 'item2'
+      value: 2
+
+
+on-run-start:
+  - 'CREATE TABLE IF NOT EXISTS analytic_stats (physical_table VARCHAR, evaluation_time VARCHAR);'
+  - 'CREATE TABLE IF NOT EXISTS to_be_executed_last (col VARCHAR);'
+  - SELECT {{ var("yet_another_var") }} AS var, '{{ source("raw", "items").identifier }}' AS src, '{{ ref("waiters").identifier }}' AS ref;
+  - "{{ log_value('on-run-start') }}"
+on-run-end:
+  - '{{ create_tables(schemas) }}'
+  - 'DROP TABLE to_be_executed_last;'

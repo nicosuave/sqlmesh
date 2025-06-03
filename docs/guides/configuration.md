@@ -334,7 +334,7 @@ With the example configuration above, SQLMesh would evaluate environment names a
 
 SQLMesh compares the current state of project files to an environment when `sqlmesh plan` is run. It detects changes to models, which can be classified as breaking or non-breaking.
 
-SQLMesh can  attempt to automatically [categorize](../concepts/plans.md#change-categories) the changes it detects. The `plan.auto_categorize_changes` option determines whether SQLMesh should attempt automatic change categorization. This option is in the [environments](../reference/configuration.md#environments) section of the configuration reference page.
+SQLMesh can  attempt to automatically [categorize](../concepts/plans.md#change-categories) the changes it detects. The `plan.auto_categorize_changes` option determines whether SQLMesh should attempt automatic change categorization. This option is in the [plan](../reference/configuration.md#plan) section of the configuration reference page.
 
 Supported values:
 
@@ -501,7 +501,7 @@ These pages describe the connection configuration options for each execution eng
 
 Configuration for the state backend connection if different from the data warehouse connection.
 
-The data warehouse connection is used to store SQLMesh state if the `state_connection` key is not specified, unless the configuration uses an Airflow or Google Cloud Composer scheduler. If using one of those schedulers, the scheduler's database is used (not the data warehouse) unless an [Airflow Connection has been configured](../integrations/airflow.md#state-connection).
+The data warehouse connection is used to store SQLMesh state if the `state_connection` key is not specified.
 
 Unlike data transformations, storing state information requires database transactions. Data warehouses aren’t optimized for executing transactions, and storing state information in them can slow down your project or produce corrupted data due to simultaneous writes to the same table. Therefore, production SQLMesh deployments should use a dedicated state connection.
 
@@ -675,7 +675,7 @@ Configuration for a connection used to run unit tests. An in-memory DuckDB datab
 
 ### Scheduler
 
-Identifies which scheduler backend to use. The scheduler backend is used both for storing metadata and for executing [plans](../concepts/plans.md). By default, the scheduler type is set to `builtin`, which uses the existing SQL engine to store metadata. Use the `airflow` type integrate with Airflow.
+Identifies which scheduler backend to use. The scheduler backend is used both for storing metadata and for executing [plans](../concepts/plans.md). By default, the scheduler type is set to `builtin`, which uses the existing SQL engine to store metadata.
 
 These options are in the [scheduler](../reference/configuration.md#scheduler) section of the configuration reference page.
 
@@ -716,89 +716,6 @@ Example configuration:
 
 No additional configuration options are supported by this scheduler type.
 
-#### Airflow
-
-Example configuration:
-
-=== "YAML"
-
-    ```yaml linenums="1"
-    gateways:
-      my_gateway:
-        scheduler:
-          type: airflow
-          airflow_url: <airflow_url>
-          username: <username>
-          password: <password>
-    ```
-
-=== "Python"
-
-    An Airflow scheduler is specified with an `AirflowSchedulerConfig` object.
-
-    ```python linenums="1"
-    from sqlmesh.core.config import (
-        Config,
-        ModelDefaultsConfig,
-        GatewayConfig,
-        AirflowSchedulerConfig,
-    )
-
-    config = Config(
-        model_defaults=ModelDefaultsConfig(dialect=<dialect>),
-        gateways={
-            "my_gateway": GatewayConfig(
-                scheduler=AirflowSchedulerConfig(
-                    airflow_url=<airflow_url>,
-                    username=<username>,
-                    password=<password>,
-                ),
-            ),
-        }
-    )
-    ```
-
-See [Airflow Integration Guide](../integrations/airflow.md) for information about how to integrate Airflow with SQLMesh. See the [configuration reference page](../reference/configuration.md#airflow) for a list of all parameters.
-
-#### Cloud Composer
-
-The Google Cloud Composer scheduler type shares the same configuration options as the `airflow` type, except for `username` and `password`. Cloud Composer relies on `gcloud` authentication, so the `username` and `password` options are not required.
-
-Example configuration:
-
-=== "YAML"
-
-    ```yaml linenums="1"
-    gateways:
-      my_gateway:
-        scheduler:
-          type: cloud_composer
-          airflow_url: <airflow_url>
-    ```
-
-=== "Python"
-
-    An Google Cloud Composer scheduler is specified with an `CloudComposerSchedulerConfig` object.
-
-    ```python linenums="1"
-    from sqlmesh.core.config import (
-        Config,
-        ModelDefaultsConfig,
-        GatewayConfig,
-        CloudComposerSchedulerConfig,
-    )
-
-    config = Config(
-        model_defaults=ModelDefaultsConfig(dialect=<dialect>),
-        gateways={
-            "my_gateway": GatewayConfig(
-                scheduler=CloudComposerSchedulerConfig(
-                    airflow_url=<airflow_url>,
-                ),
-            ),
-        }
-    )
-    ```
 
 ### Gateway/connection defaults
 
@@ -948,6 +865,39 @@ This may be useful in cases where the name casing needs to be preserved, since t
 
 See [here](https://sqlglot.com/sqlglot/dialects/dialect.html#NormalizationStrategy) to learn more about the supported normalization strategies.
 
+##### Gateway-specific model defaults
+
+You can also define gateway specific `model_defaults` in the `gateways` section, which override the global defaults for that gateway.
+
+```yaml linenums="1" hl_lines="6 14"
+gateways:
+  redshift:
+    connection:
+      type: redshift
+    model_defaults:
+      dialect: "snowflake,normalization_strategy=case_insensitive"
+  snowflake:
+    connection:
+      type: snowflake
+
+default_gateway: snowflake
+
+model_defaults:
+  dialect: snowflake
+  start: 2025-02-05
+```
+
+This allows you to tailor the behavior of models for each gateway without affecting the global `model_defaults`.
+
+For example, in some SQL engines identifiers like table and column names are case-sensitive, but they are case-insensitive in other engines. By default, a project that uses both types of engines would need to ensure the models for each engine aligned with the engine's normalization behavior, which makes project maintenance and debugging more challenging.
+
+Gateway-specific `model_defaults` allow you to change how SQLMesh performs identifier normalization *by engine* to align the different engines' behavior.
+
+In the example above, the project's default dialect is `snowflake` (line 14). The `redshift` gateway configuration overrides that global default dialect with `"snowflake,normalization_strategy=case_insensitive"` (line 6).
+
+That value tells SQLMesh that the `redshift` gateway's models will be written in the Snowflake SQL dialect (so need to be transpiled from Snowflake to Redshift), but that the resulting Redshift SQL should treat identifiers as case-insensitive to match Snowflake's behavior.
+
+
 #### Model Kinds
 
 Model kinds are required in each model file's `MODEL` DDL statement. They may optionally be used to specify a default kind in the model defaults configuration key.
@@ -1027,6 +977,83 @@ Example enabling name inference:
     )
     ```
 
+### Before_all and after_all Statements
+
+The `before_all` and `after_all` statements are executed at the start and end, respectively, of the `sqlmesh plan` and `sqlmesh run` commands.
+
+These statements can be defined in the configuration file under the `before_all` and `after_all` keys, either as a list of SQL statements or by using SQLMesh macros:
+
+=== "YAML"
+
+    ```yaml linenums="1"
+    before_all:
+      - CREATE TABLE IF NOT EXISTS analytics (table VARCHAR, eval_time VARCHAR)
+    after_all:
+      - "@grant_select_privileges()"
+      - "@IF(@this_env = 'prod', @grant_schema_usage())"
+    ```
+
+=== "Python"
+
+    ```python linenums="1"
+    from sqlmesh.core.config import Config
+
+    config = Config(
+        before_all = [
+            "CREATE TABLE IF NOT EXISTS analytics (table VARCHAR, eval_time VARCHAR)"
+        ],
+        after_all = [
+            "@grant_select_privileges()",
+            "@IF(@this_env = 'prod', @grant_schema_usage())"
+        ],
+    )
+    ```
+
+#### Examples
+
+These statements allow for actions to be executed before all individual model statements or after all have run, respectively. They can also simplify tasks such as granting privileges.
+
+##### Example: Granting Select Privileges
+
+For example, rather than using an `on_virtual_update` statement in each model to grant privileges on the views of the virtual layer, a single macro can be defined and used at the end of the plan:
+
+```python linenums="1"
+from sqlmesh.core.macros import macro
+
+@macro()
+def grant_select_privileges(evaluator):
+    if evaluator.views:
+        return [
+            f"GRANT SELECT ON VIEW {view_name} /* sqlglot.meta replace=false */ TO ROLE admin_role;"
+            for view_name in evaluator.views
+        ]
+```
+
+By including the comment `/* sqlglot.meta replace=false */`, you further ensure that the evaluator does not replace the view name with the physical table name during rendering.
+
+##### Example: Granting Schema Privileges
+
+Similarly, you can define a macro to grant schema usage privileges and, as demonstrated in the configuration above, using `this_env` macro conditionally execute it only in the production environment.
+
+```python linenums="1"
+from sqlmesh import macro
+
+@macro()
+def grant_schema_usage(evaluator):
+    if evaluator.this_env == "prod" and evaluator.schemas:
+        return [
+            f"GRANT USAGE ON SCHEMA {schema} TO admin_role;"
+            for schema in evaluator.schemas
+        ]
+```
+
+As demonstrated in these examples, the `schemas`  and `views` are available within the macro evaluator for macros invoked within the `before_all` and `after_all` statements. Additionally, the macro `this_env` provides access to the current environment name, which can be helpful for more advanced use cases that require fine-grained control over their behaviour.
+
+### Linting
+
+SQLMesh provides a linter that checks for potential issues in your models' code. Enable it and specify which linting rules to apply in the configuration file's `linter` key.
+
+Learn more about linting configuration in the [linting guide](./linter.md).
 
 ### Debug mode
 
@@ -1058,7 +1085,7 @@ Example enabling debug mode for the CLI command `sqlmesh plan`:
 
 
 ### Python library dependencies
-SQLMesh enables you to write Python models and macros which depend on third-party libraries. To ensure each run / evaluation uses the same version, you can specify versions in a sqlmesh.lock file in the root of your project.
+SQLMesh enables you to write Python models and macros which depend on third-party libraries. To ensure each run / evaluation uses the same version, you can specify versions in a `sqlmesh-requirements.lock` file in the root of your project.
 
 The sqlmesh.lock must be of the format `dep==version`. Only `==` is supported.
 
@@ -1070,3 +1097,12 @@ pandas==2.2.3
 ```
 
 This feature is only available in [Tobiko Cloud](https://tobikodata.com/product.html).
+
+#### Excluding dependencies
+
+You can exclude dependencies by prefixing the dependency with a `^`. For example:
+
+```
+^numpy
+pandas==2.2.3
+```

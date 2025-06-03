@@ -35,15 +35,41 @@ For migrations from SQLMesh (open source) to Tobiko Cloud only:
 
 Technical Requirements:
 
-- Tobiko Cloud requires Python version 3.9 or later
+- Tobiko Cloud requires Python version between 3.9 and 3.12
+
+!!! note
+    If you don't have a supported Python version installed, you can use [uv](https://docs.astral.sh/uv/getting-started/installation/#installation-methods) to install it.
+    At the time of writing, these are the suggested commands to install uv and Python:
+
+    === "macOS and Linux"
+   
+        ```bash
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        ```
+   
+    === "Windows"
+   
+        ```powershell
+        powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+        ```
+    
+    ```bash
+    uv python install 3.12
+    ```
+
 
 ## Log in to Tobiko Cloud
 
 The first step to setting up Tobiko Cloud is logging in to the web interface:
 
-1. Open a browser and navigate to the Tobiko Cloud URL (ex: https://cloud.tobikodata.com/sqlmesh/tobiko/public-demo/observer/)
-2. Leave the username blank and use the temporary password you received from the Solutions Architect in the temporary password link
-3. Once logged in, you should see the home page. Your view should be empty, but the figure below shows a populated example with Tobiko Cloud running in production:
+1. We will authenticate into your Tobiko Cloud instance. If it is your first time going through this flow, your Solutions Architect will    guide you on [how to get SSO configured](https://sqlmesh.readthedocs.io/en/stable/cloud/features/single_sign_on/). Open the url below.
+    ```bash
+    https://cloud.tobikodata.com/auth/login
+    ```
+2. Once logged in, you should see the home page. If you are not redirected, then input your Tobiko Cloud URL in the browser (ex: 
+https://cloud.tobikodata.com/sqlmesh/tobiko/public-demo/observer/)  
+
+    Your view should be empty, but the figure below shows a populated example with Tobiko Cloud running in production:
 
 <br></br>
 ![tcloud home page](./tcloud_getting_started/tcloud_home_page.png)
@@ -54,7 +80,7 @@ Now we need to configure the `tcloud` command line interface tool.
 
 First, open a terminal within your terminal/IDE (ex: VSCode). Then follow the following steps to install the `tcloud` CLI:
 
-1. Create a new project directory and navigate into it:
+1. Create a new project directory, or an existing SQLMesh project, and navigate into it:
 
     ```bash
     mkdir tcloud_project
@@ -64,23 +90,34 @@ First, open a terminal within your terminal/IDE (ex: VSCode). Then follow the fo
 2. Create a new file called `requirements.txt` and add `tcloud` to it:
 
     ```bash
-    echo 'tcloud==1.3.0' > requirements.txt
+    echo 'tcloud' > requirements.txt
     ```
 
     > Pypi source: [tcloud](https://pypi.org/project/tcloud/)
 
-3. Create a Python virtual environment and install `tcloud`:
+    > Note: your Tobiko Solutions Architect will provide you a pinned version of `tcloud`
+
+3. Create a Python virtual environment in the project directory and install `tcloud`. The following demonstrates how to do this using [uv](https://docs.astral.sh/uv/pip/environments/#creating-a-virtual-environment) ([installation instructions](#prerequisites)):
 
     ```bash linenums="1"
-    python -m venv .venv # create a virtual environment
+    uv venv --python 3.12 --seed  # create a virtual environment inside the project directory
     source .venv/bin/activate # activate the virtual environment
-    pip install -r requirements.txt # install the tcloud CLI
+    uv pip install -r requirements.txt # install the tcloud CLI
     which tcloud # verify the tcloud CLI is installed in the venv in the path above
     ```
 
-    Note: you may need to run `python3` or `pip3` instead of `python` or `pip`, depending on your python installation.
+!!! note
+    You may need to run `python3` or `pip3` instead of `python` or `pip`, depending on your python installation.
 
-4. Create an alias to ensure use of `tcloud`:
+    If you do not see `tcloud` in the virtual environment path above, you may need to reactivate the venv:
+
+    ```bash
+    source .venv/bin/activate
+    which tcloud
+    # expected path: /Users/person/Desktop/git_repos/tobiko-cloud-demo/.venv/bin/tcloud
+    ```
+
+- Create an alias to ensure use of `tcloud`:
 
     We recommend using a command line alias to ensure all `sqlmesh` commands run on Tobiko Cloud.
 
@@ -102,60 +139,23 @@ Now we're ready to connect your data warehouse to Tobiko Cloud:
 
     ```yaml
     projects:
-        public-demo: # TODO: update this for the project name in the URL
-            url: https://cloud.tobikodata.com/sqlmesh/tobiko/public-demo/ # TODO: update for your unique URL
-            gateway: tobiko_cloud
-            extras: bigquery,web,github  # TODO: update bigquery for your data warehouse
+      public-demo: # TODO: update this for the project name in the URL
+        url: https://cloud.tobikodata.com/sqlmesh/tobiko/public-demo/ # TODO: update for your unique URL
+        gateway: tobiko_cloud
+        extras: bigquery,web,github  # TODO: update bigquery for your data warehouse
+        pip_executable: uv pip
     default_project: public-demo # TODO: update this for the project name in the URL
     ```
 
-2. Export the token from the Solutions Architect:
+2. If you are going through the SSO flow then, run the following command:
+    ``` bash
+    tcloud auth login
+    ``` 
+    This will fire off the SSO flow and open a link in your browser to authenticate. 
 
-    `tcloud` provides your security token to Tobiko Cloud via the `TCLOUD_TOKEN` environment variable, so we must create and export it.
+    Once authenticated, you will see the following screen. 
 
-    Obtain the token from your Solutions Architect, then pass it to the environment variable with this command (substituting your token value in single quotes):
-
-    ```bash
-    export TCLOUD_TOKEN=<your token> # ex: export TCLOUD_TOKEN='jiaowjifeoawj$22fe'
-    ```
-
-    > Note: always include the single quotes ' ' around your token
-
-    ??? "Storing your token"
-
-        Always follow your organization's procedures for storing secrets and credentials.
-
-        The command above will create the `TCLOUD_TOKEN` environment variable, but the variable will only exist for the duration of the terminal session. We need a mechanism to create and export the variable every time we use Tobiko Cloud.
-
-        If your organization doesn't have specific procedures for storing secrets, we recommend defining the environment variable in either an `.env` file in your root project directory or in your terminal's profile file.
-
-        If using the former, make sure the `.env` file is listed in your `.gitignore` file to prevent it from being tracked by Git and exposed in plain text.
-
-        Example `.env` file:
-
-        ```text
-        # TODO: add any other environment variables such as username, ports, etc. based on your data warehouse
-        DATA_WAREHOUSE_CREDENTIALS=<your data warehouse credentials>
-        TCLOUD_TOKEN=<your tcloud token>
-        ```
-
-        Run these commands to load the environment variables from `.env`:
-
-        ```bash
-        set -a        # Turn on auto-export
-        source .env   # Read the file, all variables are automatically exported
-        set +a        # Turn off auto-export
-        ```
-
-        Or add these lines to your `~/.bashrc` or `~/.zshrc` file to automatically export the environment variables when you open the terminal (instead of running the `set -a` and `source .env` commands every time):
-
-        ```bash
-        # .bashrc or .zshrc
-        export DATA_WAREHOUSE_CREDENTIALS=<your data warehouse credentials>
-        export TCLOUD_TOKEN=<your tcloud token>
-        ```
-
-        Note that the automatically exported environment variables will be accessible to other programs on your computer.
+    ![tcloud_auth_success](./tcloud_getting_started/tcloud_auth_success.png)
 
 3. Initialize a new SQLMesh project:
 
@@ -174,13 +174,8 @@ Now we're ready to connect your data warehouse to Tobiko Cloud:
     ```yaml linenums="1"
     gateways:
       tobiko_cloud: # this will use the config in tcloud.yaml for state_connection
-        connection:
-          type: bigquery
-          method: service-account-json
-          concurrent_tasks: 5
-          register_comments: true
-          keyfile_json: {{ env_var('GOOGLE_SQLMESH_CREDENTIALS') }} # uses the value in the GOOGLE_SQLMESH_CREDENTIALS environment variable
-          project: sqlmesh-public-demo
+        scheduler: # TODO: add the connection in the Tobiko Cloud Connections Page with the credentials for your data warehouse
+          type: cloud
 
     default_gateway: tobiko_cloud
 
@@ -195,16 +190,17 @@ Now we're ready to connect your data warehouse to Tobiko Cloud:
     cicd_bot:
       type: github
       merge_method: squash
+      skip_pr_backfill: false
       enable_deploy_command: true
       auto_categorize_changes:
-      external: full
-      python: full
-      sql: full
-      seed: full
+        external: full
+        python: full
+        sql: full
+        seed: full
 
     # preview data for forward only models
     plan:
-    enable_preview: true
+      enable_preview: true
 
     # list of users that are allowed to approve PRs for synchronized deployments
     users:

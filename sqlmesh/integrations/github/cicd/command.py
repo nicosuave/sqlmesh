@@ -6,13 +6,14 @@ import traceback
 import click
 
 from sqlmesh.core.analytics import cli_analytics
+from sqlmesh.core.console import set_console, MarkdownConsole
 from sqlmesh.integrations.github.cicd.controller import (
     GithubCheckConclusion,
     GithubCheckStatus,
     GithubController,
     TestFailure,
 )
-from sqlmesh.utils.errors import CICDBotError, ConflictingPlanError, PlanError
+from sqlmesh.utils.errors import CICDBotError, ConflictingPlanError, PlanError, LinterError
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 @click.pass_context
 def github(ctx: click.Context, token: str) -> None:
     """Github Action CI/CD Bot. See https://sqlmesh.readthedocs.io/en/stable/integrations/github/ for details"""
+    set_console(MarkdownConsole())
     ctx.obj["github"] = GithubController(
         paths=ctx.obj["paths"],
         token=token,
@@ -53,7 +55,7 @@ def check_required_approvers(ctx: click.Context) -> None:
     """Checks if a required approver has provided approval on the PR."""
     if not _check_required_approvers(ctx.obj["github"]):
         raise CICDBotError(
-            "Required approver has not approved the PR. See check status for more information."
+            "Required approver has not approved the PR. See Pull Requests Checks for more information."
         )
 
 
@@ -78,13 +80,32 @@ def _run_tests(controller: GithubController) -> bool:
         return False
 
 
+def _run_linter(controller: GithubController) -> bool:
+    controller.update_linter_check(status=GithubCheckStatus.IN_PROGRESS)
+    try:
+        controller.run_linter()
+    except LinterError:
+        controller.update_linter_check(
+            status=GithubCheckStatus.COMPLETED,
+            conclusion=GithubCheckConclusion.FAILURE,
+        )
+        return False
+
+    controller.update_linter_check(
+        status=GithubCheckStatus.COMPLETED,
+        conclusion=GithubCheckConclusion.SUCCESS,
+    )
+
+    return True
+
+
 @github.command()
 @click.pass_context
 @cli_analytics
 def run_tests(ctx: click.Context) -> None:
     """Runs the unit tests"""
     if not _run_tests(ctx.obj["github"]):
-        raise CICDBotError("Failed to run tests. See check status for more information.")
+        raise CICDBotError("Failed to run tests. See Pull Requests Checks for more information.")
 
 
 def _update_pr_environment(controller: GithubController) -> bool:
@@ -111,7 +132,7 @@ def update_pr_environment(ctx: click.Context) -> None:
     """Creates or updates the PR environments"""
     if not _update_pr_environment(ctx.obj["github"]):
         raise CICDBotError(
-            "Failed to update PR environment. See check status for more information."
+            "Failed to update PR environment. See Pull Requests Checks for more information."
         )
 
 
@@ -143,7 +164,7 @@ def gen_prod_plan(ctx: click.Context) -> None:
     controller.update_prod_plan_preview_check(status=GithubCheckStatus.IN_PROGRESS)
     if not _gen_prod_plan(controller):
         raise CICDBotError(
-            "Failed to generate production plan. See check status for more information."
+            "Failed to generate production plan. See Pull Requests Checks for more information."
         )
 
 
@@ -182,14 +203,16 @@ def _deploy_production(controller: GithubController) -> bool:
 def deploy_production(ctx: click.Context) -> None:
     """Deploys the production environment"""
     if not _deploy_production(ctx.obj["github"]):
-        raise CICDBotError("Failed to deploy to production. See check status for more information.")
+        raise CICDBotError(
+            "Failed to deploy to production. See Pull Requests Checks for more information."
+        )
 
 
 def _run_all(controller: GithubController) -> None:
     has_required_approval = False
     is_auto_deploying_prod = (
         controller.deploy_command_enabled or controller.do_required_approval_check
-    )
+    ) and controller.pr_targets_prod_branch
     if controller.is_comment_added:
         if not controller.deploy_command_enabled:
             # We aren't using commands so we can just return
@@ -198,15 +221,17 @@ def _run_all(controller: GithubController) -> None:
         if command.is_invalid:
             # Probably a comment unrelated to SQLMesh so we do nothing
             return
-        elif command.is_deploy_prod:
+        if command.is_deploy_prod:
             has_required_approval = True
         else:
             raise CICDBotError(f"Unsupported command: {command}")
+    controller.update_linter_check(status=GithubCheckStatus.QUEUED)
     controller.update_pr_environment_check(status=GithubCheckStatus.QUEUED)
     controller.update_prod_plan_preview_check(status=GithubCheckStatus.QUEUED)
     controller.update_test_check(status=GithubCheckStatus.QUEUED)
     if is_auto_deploying_prod:
         controller.update_prod_environment_check(status=GithubCheckStatus.QUEUED)
+    linter_passed = _run_linter(controller)
     tests_passed = _run_tests(controller)
     if controller.do_required_approval_check:
         if has_required_approval:
@@ -216,23 +241,27 @@ def _run_all(controller: GithubController) -> None:
         else:
             controller.update_required_approval_check(status=GithubCheckStatus.QUEUED)
             has_required_approval = _check_required_approvers(controller)
-    if not tests_passed:
+    if not tests_passed or not linter_passed:
         controller.update_pr_environment_check(
             status=GithubCheckStatus.COMPLETED,
-            exception=TestFailure(),
+            exception=LinterError("") if not linter_passed else TestFailure(),
         )
         controller.update_prod_plan_preview_check(
             status=GithubCheckStatus.COMPLETED,
             conclusion=GithubCheckConclusion.SKIPPED,
-            summary="Unit Test(s) Failed so skipping creating prod plan",
+            summary="Linter or Unit Test(s) failed so skipping creating prod plan",
         )
         if is_auto_deploying_prod:
             controller.update_prod_environment_check(
                 status=GithubCheckStatus.COMPLETED,
                 conclusion=GithubCheckConclusion.SKIPPED,
-                skip_reason="Unit Test(s) Failed so skipping deploying to production",
+                skip_reason="Linter or Unit Test(s) failed so skipping deploying to production",
             )
-        raise CICDBotError("Failed to run tests. See check status for more information.")
+
+        raise CICDBotError(
+            "Linter or Unit Test(s) failed. See Pull Requests Checks for more information."
+        )
+
     pr_environment_updated = _update_pr_environment(controller)
     prod_plan_generated = False
     if pr_environment_updated:
@@ -242,7 +271,7 @@ def _run_all(controller: GithubController) -> None:
             status=GithubCheckStatus.COMPLETED, conclusion=GithubCheckConclusion.SKIPPED
         )
     deployed_to_prod = False
-    if has_required_approval and prod_plan_generated:
+    if has_required_approval and prod_plan_generated and controller.pr_targets_prod_branch:
         deployed_to_prod = _deploy_production(controller)
     elif is_auto_deploying_prod:
         if not has_required_approval:
@@ -267,10 +296,10 @@ def _run_all(controller: GithubController) -> None:
     if (
         not pr_environment_updated
         or not prod_plan_generated
-        or (has_required_approval and not deployed_to_prod)
+        or (has_required_approval and controller.pr_targets_prod_branch and not deployed_to_prod)
     ):
         raise CICDBotError(
-            "A step of the run-all check failed. See check status for more information."
+            "A step of the run-all check failed. See Pull Requests Checks for more information."
         )
 
 

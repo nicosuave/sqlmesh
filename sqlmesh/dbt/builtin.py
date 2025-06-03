@@ -12,8 +12,10 @@ import jinja2
 from dbt import version
 from dbt.adapters.base import BaseRelation, Column
 from ruamel.yaml import YAMLError
+from sqlglot import Dialect
 
 from sqlmesh.core.engine_adapter import EngineAdapter
+from sqlmesh.core.snapshot.definition import DeployabilityIndex
 from sqlmesh.dbt.adapter import BaseAdapter, ParsetimeAdapter, RuntimeAdapter
 from sqlmesh.dbt.relation import Policy
 from sqlmesh.dbt.target import TARGET_TYPE_TO_CONFIG_CLASS
@@ -28,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 class Exceptions:
     def raise_compiler_error(self, msg: str) -> None:
-        if DBT_VERSION >= (1, 4):
+        if DBT_VERSION >= (1, 4, 0):
             from dbt.exceptions import CompilationError
 
             raise CompilationError(msg)
@@ -48,7 +50,9 @@ class Exceptions:
 class Api:
     def __init__(self, dialect: t.Optional[str]) -> None:
         if dialect:
-            config_class = TARGET_TYPE_TO_CONFIG_CLASS[dialect]
+            config_class = TARGET_TYPE_TO_CONFIG_CLASS[
+                Dialect.get_or_raise(dialect).__class__.__name__.lower()
+            ]
             self.Relation = config_class.relation_class
             self.Column = config_class.column_class
             self.quote_policy = config_class.quote_policy
@@ -371,8 +375,20 @@ def create_builtin_globals(
     if variables is not None:
         builtin_globals["var"] = Var(variables)
 
+    deployability_index = (
+        jinja_globals.get("deployability_index") or DeployabilityIndex.all_deployable()
+    )
     snapshot = jinja_globals.pop("snapshot", None)
-    is_incremental = bool(snapshot.intervals) if snapshot else False
+
+    if snapshot and snapshot.is_incremental:
+        intervals = (
+            snapshot.intervals
+            if deployability_index.is_deployable(snapshot)
+            else snapshot.dev_intervals
+        )
+        is_incremental = bool(intervals)
+    else:
+        is_incremental = False
     builtin_globals["is_incremental"] = lambda: is_incremental
 
     builtin_globals["builtins"] = AttributeDict(
@@ -394,7 +410,7 @@ def create_builtin_globals(
             quote_policy=api.quote_policy,
             snapshots=jinja_globals.get("snapshots", {}),
             table_mapping=jinja_globals.get("table_mapping", {}),
-            deployability_index=jinja_globals.get("deployability_index"),
+            deployability_index=deployability_index,
             project_dialect=project_dialect,
         )
     else:

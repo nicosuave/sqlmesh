@@ -4,18 +4,19 @@ import pickle
 import re
 import typing as t
 import zlib
-import logging
 
 from pydantic import Field
+from pydantic.functional_validators import BeforeValidator
 from sqlglot import exp
 from sqlglot.helper import first
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
 from sqlmesh.cicd.config import CICDBotConfig
 from sqlmesh.core import constants as c
+from sqlmesh.core.console import get_console
 from sqlmesh.core.config import EnvironmentSuffixTarget
 from sqlmesh.core.config.base import BaseConfig, UpdateStrategy
-from sqlmesh.core.config.common import variables_validator
+from sqlmesh.core.config.common import variables_validator, compile_regex_mapping
 from sqlmesh.core.config.connection import (
     ConnectionConfig,
     DuckDBConnectionConfig,
@@ -25,9 +26,11 @@ from sqlmesh.core.config.connection import (
 from sqlmesh.core.config.feature_flag import FeatureFlag
 from sqlmesh.core.config.format import FormatConfig
 from sqlmesh.core.config.gateway import GatewayConfig
+from sqlmesh.core.config.janitor import JanitorConfig
 from sqlmesh.core.config.migration import MigrationConfig
 from sqlmesh.core.config.model import ModelDefaultsConfig
 from sqlmesh.core.config.naming import NameInferenceConfig as NameInferenceConfig
+from sqlmesh.core.config.linter import LinterConfig as LinterConfig
 from sqlmesh.core.config.plan import PlanConfig
 from sqlmesh.core.config.run import RunConfig
 from sqlmesh.core.config.scheduler import (
@@ -39,14 +42,43 @@ from sqlmesh.core.config.ui import UIConfig
 from sqlmesh.core.loader import Loader, SqlMeshLoader
 from sqlmesh.core.notification_target import NotificationTarget
 from sqlmesh.core.user import User
+from sqlmesh.utils.date import to_timestamp, now
 from sqlmesh.utils.errors import ConfigError
-from sqlmesh.utils.pydantic import (
-    field_validator,
-    model_validator,
-    model_validator_v1_args,
-)
+from sqlmesh.utils.pydantic import model_validator
 
-logger = logging.getLogger(__name__)
+
+def validate_no_past_ttl(v: str) -> str:
+    current_time = now()
+    if to_timestamp(v, relative_base=current_time) < to_timestamp(current_time):
+        raise ValueError(
+            f"TTL '{v}' is in the past. Please specify a relative time in the future. Ex: `in 1 week` instead of `1 week`."
+        )
+    return v
+
+
+def gateways_ensure_dict(value: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
+    try:
+        if not isinstance(value, GatewayConfig):
+            GatewayConfig.parse_obj(value)
+        return {"": value}
+    except Exception:
+        return value
+
+
+def validate_regex_key_dict(value: t.Dict[str | re.Pattern, t.Any]) -> t.Dict[re.Pattern, t.Any]:
+    return compile_regex_mapping(value)
+
+
+if t.TYPE_CHECKING:
+    from sqlmesh.core._typing import Self
+
+    NoPastTTLString = str
+    GatewayDict = t.Dict[str, GatewayConfig]
+    RegexKeyDict = t.Dict[re.Pattern, str]
+else:
+    NoPastTTLString = t.Annotated[str, BeforeValidator(validate_no_past_ttl)]
+    GatewayDict = t.Annotated[t.Dict[str, GatewayConfig], BeforeValidator(gateways_ensure_dict)]
+    RegexKeyDict = t.Annotated[t.Dict[re.Pattern, str], BeforeValidator(validate_regex_key_dict)]
 
 
 class Config(BaseConfig):
@@ -74,6 +106,8 @@ class Config(BaseConfig):
         model_defaults: Default values for model definitions.
         physical_schema_mapping: A mapping from regular expressions to names of schemas in which physical tables for corresponding models will be placed.
         environment_suffix_target: Indicates whether to append the environment name to the schema or table name.
+        gateway_managed_virtual_layer: Whether the models' views in the virtual layer are created by the model-specific gateway rather than the default gateway.
+        infer_python_dependencies: Whether to statically analyze Python code to automatically infer Python package requirements.
         environment_catalog_mapping: A mapping from regular expressions to catalog names. The catalog name is used to determine the target catalog for a given environment.
         default_target_environment: The name of the environment that will be the default target for the `sqlmesh plan` and `sqlmesh run` commands.
         log_limit: The default number of logs to keep.
@@ -84,10 +118,12 @@ class Config(BaseConfig):
         migration: The migration configuration.
         variables: A dictionary of variables that can be used in models / macros.
         disable_anonymized_analytics: Whether to disable the anonymized analytics collection.
+        before_all: SQL statements or macros to be executed at the start of the `sqlmesh plan` and `sqlmesh run` commands.
+        after_all: SQL statements or macros to be executed at the end of the `sqlmesh plan` and `sqlmesh run` commands.
     """
 
-    gateways: t.Dict[str, GatewayConfig] = {"": GatewayConfig()}
-    default_connection: SerializableConnectionConfig = DuckDBConnectionConfig()
+    gateways: GatewayDict = {"": GatewayConfig()}
+    default_connection: t.Optional[SerializableConnectionConfig] = None
     default_test_connection_: t.Optional[SerializableConnectionConfig] = Field(
         default=None, alias="default_test_connection"
     )
@@ -95,8 +131,8 @@ class Config(BaseConfig):
     default_gateway: str = ""
     notification_targets: t.List[NotificationTarget] = []
     project: str = ""
-    snapshot_ttl: str = c.DEFAULT_SNAPSHOT_TTL
-    environment_ttl: t.Optional[str] = c.DEFAULT_ENVIRONMENT_TTL
+    snapshot_ttl: NoPastTTLString = c.DEFAULT_SNAPSHOT_TTL
+    environment_ttl: t.Optional[NoPastTTLString] = c.DEFAULT_ENVIRONMENT_TTL
     ignore_patterns: t.List[str] = c.IGNORE_PATTERNS
     time_column_format: str = c.DEFAULT_TIME_COLUMN_FORMAT
     users: t.List[User] = []
@@ -106,11 +142,13 @@ class Config(BaseConfig):
     loader_kwargs: t.Dict[str, t.Any] = {}
     env_vars: t.Dict[str, str] = {}
     username: str = ""
-    physical_schema_mapping: t.Dict[re.Pattern, str] = {}
+    physical_schema_mapping: RegexKeyDict = {}
     environment_suffix_target: EnvironmentSuffixTarget = Field(
         default=EnvironmentSuffixTarget.default
     )
-    environment_catalog_mapping: t.Dict[re.Pattern, str] = {}
+    gateway_managed_virtual_layer: bool = False
+    infer_python_dependencies: bool = True
+    environment_catalog_mapping: RegexKeyDict = {}
     default_target_environment: str = c.PROD
     log_limit: int = c.DEFAULT_LOG_LIMIT
     cicd_bot: t.Optional[CICDBotConfig] = None
@@ -123,6 +161,10 @@ class Config(BaseConfig):
     model_naming: NameInferenceConfig = NameInferenceConfig()
     variables: t.Dict[str, t.Any] = {}
     disable_anonymized_analytics: bool = False
+    before_all: t.Optional[t.List[str]] = None
+    after_all: t.Optional[t.List[str]] = None
+    linter: LinterConfig = LinterConfig()
+    janitor: JanitorConfig = JanitorConfig()
 
     _FIELD_UPDATE_STRATEGY: t.ClassVar[t.Dict[str, UpdateStrategy]] = {
         "gateways": UpdateStrategy.NESTED_UPDATE,
@@ -138,80 +180,67 @@ class Config(BaseConfig):
         "ui": UpdateStrategy.NESTED_UPDATE,
         "loader_kwargs": UpdateStrategy.KEY_UPDATE,
         "plan": UpdateStrategy.NESTED_UPDATE,
+        "before_all": UpdateStrategy.EXTEND,
+        "after_all": UpdateStrategy.EXTEND,
+        "linter": UpdateStrategy.NESTED_UPDATE,
     }
 
     _connection_config_validator = connection_config_validator
-    _scheduler_config_validator = scheduler_config_validator
+    _scheduler_config_validator = scheduler_config_validator  # type: ignore
     _variables_validator = variables_validator
 
-    @field_validator("gateways", mode="before", always=True)
-    @classmethod
-    def _gateways_ensure_dict(cls, value: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
-        try:
-            if not isinstance(value, GatewayConfig):
-                GatewayConfig.parse_obj(value)
-            return {"": value}
-        except Exception:
-            return value
-
-    @field_validator("environment_catalog_mapping", "physical_schema_mapping", mode="before")
-    @classmethod
-    def _validate_regex_keys(
-        cls, value: t.Dict[str | re.Pattern, t.Any]
-    ) -> t.Dict[re.Pattern, t.Any]:
-        compiled_regexes = {}
-        for k, v in value.items():
-            try:
-                compiled_regexes[re.compile(k)] = v
-            except re.error:
-                raise ConfigError(f"`{k}` is not a valid regular expression.")
-        return compiled_regexes
-
     @model_validator(mode="before")
-    @model_validator_v1_args
-    def _normalize_and_validate_fields(cls, values: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
-        if "gateways" not in values and "gateway" in values:
-            values["gateways"] = values.pop("gateway")
+    def _normalize_and_validate_fields(cls, data: t.Any) -> t.Any:
+        if not isinstance(data, dict):
+            return data
+
+        if "gateways" not in data and "gateway" in data:
+            data["gateways"] = data.pop("gateway")
 
         for plan_deprecated in ("auto_categorize_changes", "include_unmodified"):
-            if plan_deprecated in values:
+            if plan_deprecated in data:
                 raise ConfigError(
                     f"The `{plan_deprecated}` config is deprecated. Please use the `plan.{plan_deprecated}` config instead."
                 )
 
-        if "physical_schema_override" in values:
-            logger.warning(
-                "`physical_schema_override` is deprecated. Please use `physical_schema_mapping` instead"
+        if "physical_schema_override" in data:
+            get_console().log_warning(
+                "`physical_schema_override` is deprecated. Please use `physical_schema_mapping` instead."
             )
 
-            if "physical_schema_mapping" in values:
+            if "physical_schema_mapping" in data:
                 raise ConfigError(
-                    "Only one of `physical_schema_override` and `physical_schema_mapping` can be specified"
+                    "Only one of `physical_schema_override` and `physical_schema_mapping` can be specified."
                 )
 
-            physical_schema_override: t.Dict[str, str] = values.pop("physical_schema_override")
+            physical_schema_override: t.Dict[str, str] = data.pop("physical_schema_override")
             # translate physical_schema_override to physical_schema_mapping
-            values["physical_schema_mapping"] = {
+            data["physical_schema_mapping"] = {
                 f"^{k}$": v for k, v in physical_schema_override.items()
             }
 
-        return values
+        return data
 
     @model_validator(mode="after")
-    @model_validator_v1_args
-    def _normalize_fields_after(cls, values: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
-        dialect = values["model_defaults"].dialect
+    def _normalize_fields_after(self) -> Self:
+        dialect = self.model_defaults.dialect
 
         def _normalize_identifiers(key: str) -> None:
-            values[key] = {
-                k: normalize_identifiers(v, dialect=dialect).name
-                for k, v in values.get(key, {}).items()
-            }
+            setattr(
+                self,
+                key,
+                {
+                    k: normalize_identifiers(v, dialect=dialect).name
+                    for k, v in getattr(self, key, {}).items()
+                },
+            )
 
-        _normalize_identifiers("environment_catalog_mapping")
-        _normalize_identifiers("physical_schema_mapping")
+        if self.environment_catalog_mapping:
+            _normalize_identifiers("environment_catalog_mapping")
+        if self.physical_schema_mapping:
+            _normalize_identifiers("physical_schema_mapping")
 
-        return values
+        return self
 
     def get_default_test_connection(
         self,
@@ -248,15 +277,16 @@ class Config(BaseConfig):
                 raise ConfigError(f"Missing gateway with name '{name}'.")
 
             return self.gateways[name]
-        else:
-            if name is not None:
-                raise ConfigError(
-                    "Gateway name is not supported when only one gateway is configured."
-                )
-            return self.gateways
+        if name is not None:
+            raise ConfigError("Gateway name is not supported when only one gateway is configured.")
+        return self.gateways
 
     def get_connection(self, gateway_name: t.Optional[str] = None) -> ConnectionConfig:
-        return self.get_gateway(gateway_name).connection or self.default_connection
+        connection = self.get_gateway(gateway_name).connection or self.default_connection
+        if connection is None:
+            msg = f" for gateway '{gateway_name}'" if gateway_name else ""
+            raise ConfigError(f"No connection configured{msg}.")
+        return connection
 
     def get_state_connection(
         self, gateway_name: t.Optional[str] = None

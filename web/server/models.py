@@ -19,12 +19,7 @@ from sqlmesh.core.snapshot.definition import (
     SnapshotId,
 )
 from sqlmesh.utils.date import TimeLike, now_timestamp
-from sqlmesh.utils.pydantic import (
-    PYDANTIC_MAJOR_VERSION,
-    PydanticModel,
-    field_validator,
-    field_validator_v1_args,
-)
+from sqlmesh.utils.pydantic import PydanticModel, ValidationInfo, field_validator
 
 SUPPORTED_EXTENSIONS = {".py", ".sql", ".yaml", ".yml", ".csv"}
 
@@ -118,15 +113,12 @@ class File(PydanticModel):
     path: str
     extension: str = ""
     content: t.Optional[str] = None
+    model_config = pydantic.ConfigDict(validate_default=True)  # type: ignore
 
-    if PYDANTIC_MAJOR_VERSION >= 2:
-        model_config = pydantic.ConfigDict(validate_default=True)  # type: ignore
-
-    @field_validator("extension", always=True, mode="before")
-    @field_validator_v1_args
-    def default_extension(cls, v: str, values: t.Dict[str, t.Any]) -> str:
-        if "name" in values:
-            return pathlib.Path(values["name"]).suffix
+    @field_validator("extension", mode="before")
+    def default_extension(cls, v: str, info: ValidationInfo) -> str:
+        if "name" in info.data:
+            return pathlib.Path(info.data["name"]).suffix
         return v
 
 
@@ -180,6 +172,10 @@ class Model(PydanticModel):
     name: str
     fqn: str
     path: str
+    full_path: str
+    """
+    As opposed to path, which is relative to the project root, full_path is the absolute path to the model file.
+    """
     dialect: str
     type: ModelType
     columns: t.List[Column]
@@ -424,7 +420,7 @@ class TableDiff(PydanticModel):
 
 class TestCase(PydanticModel):
     name: str
-    path: pathlib.Path
+    path: str
 
 
 class TestErrorOrFailure(TestCase):

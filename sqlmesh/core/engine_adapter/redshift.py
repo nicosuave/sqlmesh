@@ -3,17 +3,17 @@ from __future__ import annotations
 import logging
 import typing as t
 
-import pandas as pd
 from sqlglot import exp
 
 from sqlmesh.core.dialect import to_schema
+from sqlmesh.core.engine_adapter.base import MERGE_SOURCE_ALIAS, MERGE_TARGET_ALIAS
 from sqlmesh.core.engine_adapter.base_postgres import BasePostgresEngineAdapter
 from sqlmesh.core.engine_adapter.mixins import (
     GetCurrentCatalogFromFunctionMixin,
-    LogicalMergeMixin,
     NonTransactionalTruncateMixin,
     VarcharSizeWorkaroundMixin,
     RowDiffMixin,
+    logical_merge,
 )
 from sqlmesh.core.engine_adapter.shared import (
     CommentCreationView,
@@ -23,10 +23,13 @@ from sqlmesh.core.engine_adapter.shared import (
     set_catalog,
 )
 from sqlmesh.core.schema_diff import SchemaDiffer
+from sqlmesh.utils.errors import SQLMeshError
 
 if t.TYPE_CHECKING:
+    import pandas as pd
+
     from sqlmesh.core._typing import SchemaName, TableName
-    from sqlmesh.core.engine_adapter.base import QueryOrDF
+    from sqlmesh.core.engine_adapter.base import QueryOrDF, Query
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +37,6 @@ logger = logging.getLogger(__name__)
 @set_catalog()
 class RedshiftEngineAdapter(
     BasePostgresEngineAdapter,
-    LogicalMergeMixin,
     GetCurrentCatalogFromFunctionMixin,
     NonTransactionalTruncateMixin,
     VarcharSizeWorkaroundMixin,
@@ -45,6 +47,7 @@ class RedshiftEngineAdapter(
     # Redshift doesn't support comments for VIEWs WITH NO SCHEMA BINDING (which we always use)
     COMMENT_CREATION_VIEW = CommentCreationView.UNSUPPORTED
     SUPPORTS_REPLACE_TABLE = False
+
     SCHEMA_DIFFER = SchemaDiffer(
         parameterized_type_defaults={
             exp.DataType.build("VARBYTE", dialect=DIALECT).this: [(64000,)],
@@ -58,6 +61,7 @@ class RedshiftEngineAdapter(
             exp.DataType.build("CHAR", dialect=DIALECT).this: 4096,
             exp.DataType.build("VARCHAR", dialect=DIALECT).this: 65535,
         },
+        precision_increase_allowed_types={exp.DataType.build("VARCHAR", dialect=DIALECT).this},
         drop_cascade=True,
     )
     VARIABLE_LENGTH_DATA_TYPES = {
@@ -121,6 +125,12 @@ class RedshiftEngineAdapter(
         }
 
     @property
+    def enable_merge(self) -> bool:
+        # Redshift supports the MERGE operation but we use the logical merge
+        # unless the user has opted in by setting enable_merge in the connection.
+        return bool(self._extra_config.get("enable_merge"))
+
+    @property
     def cursor(self) -> t.Any:
         # Redshift by default uses a `format` paramstyle that has issues when we try to write our snapshot
         # data to snapshot table. There doesn't seem to be a way to disable parameter overriding so we just
@@ -133,6 +143,8 @@ class RedshiftEngineAdapter(
         self, query: t.Union[exp.Expression, str], quote_identifiers: bool = False
     ) -> pd.DataFrame:
         """Fetches a Pandas DataFrame from the cursor"""
+        import pandas as pd
+
         self.execute(query, quote_identifiers=quote_identifiers)
 
         # We manually build the `DataFrame` here because the driver's `fetch_dataframe`
@@ -209,11 +221,13 @@ class RedshiftEngineAdapter(
         underlying table without dropping the view first. This is a problem for us since we want to be able to
         swap tables out from under views. Therefore, we create the view as non-binding.
         """
-
-        if create_kwargs.pop("no_schema_binding", None) is False:
-            logger.warning(
-                "The 'no_schema_binding' attribute is deprecated. Views in Redshift are created as non-binding."
+        no_schema_binding = True
+        if isinstance(query_or_df, exp.Expression):
+            # We can't include NO SCHEMA BINDING if the query has a recursive CTE
+            has_recursive_cte = any(
+                w.args.get("recursive", False) for w in query_or_df.find_all(exp.With)
             )
+            no_schema_binding = not has_recursive_cte
 
         return super().create_view(
             view_name,
@@ -224,7 +238,7 @@ class RedshiftEngineAdapter(
             materialized_properties,
             table_description=table_description,
             column_descriptions=column_descriptions,
-            no_schema_binding=True,
+            no_schema_binding=no_schema_binding,
             view_properties=view_properties,
             **create_kwargs,
         )
@@ -246,6 +260,8 @@ class RedshiftEngineAdapter(
         If it does exist then we need to do the:
             `CREATE TABLE...`, `INSERT INTO...`, `RENAME TABLE...`, `RENAME TABLE...`, DROP TABLE...`  dance.
         """
+        import pandas as pd
+
         if not isinstance(query_or_df, pd.DataFrame) or not self.table_exists(table_name):
             return super().replace_query(
                 table_name,
@@ -328,6 +344,75 @@ class RedshiftEngineAdapter(
             )
             for row in df.itertuples()
         ]
+
+    def merge(
+        self,
+        target_table: TableName,
+        source_table: QueryOrDF,
+        columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
+        unique_key: t.Sequence[exp.Expression],
+        when_matched: t.Optional[exp.Whens] = None,
+        merge_filter: t.Optional[exp.Expression] = None,
+    ) -> None:
+        if self.enable_merge:
+            # By default we use the logical merge unless the user has opted in
+            super().merge(
+                target_table=target_table,
+                source_table=source_table,
+                columns_to_types=columns_to_types,
+                unique_key=unique_key,
+                when_matched=when_matched,
+                merge_filter=merge_filter,
+            )
+        else:
+            logical_merge(
+                self,
+                target_table,
+                source_table,
+                columns_to_types,
+                unique_key,
+                when_matched=when_matched,
+                merge_filter=merge_filter,
+            )
+
+    def _merge(
+        self,
+        target_table: TableName,
+        query: Query,
+        on: exp.Expression,
+        whens: exp.Whens,
+    ) -> None:
+        # Redshift does not support table aliases in the target table of a MERGE statement.
+        # So we must use the actual table name instead of an alias, as we do with the source table.
+        def resolve_target_table(expression: exp.Expression) -> exp.Expression:
+            if (
+                isinstance(expression, exp.Column)
+                and expression.table.upper() == MERGE_TARGET_ALIAS
+            ):
+                expression.set("table", exp.to_table(target_table))
+            return expression
+
+        # Ensure that there is exactly one "WHEN MATCHED" and one "WHEN NOT MATCHED" clause.
+        # Since Redshift does not support multiple "WHEN MATCHED" clauses.
+        if (
+            len(whens.expressions) != 2
+            or whens.expressions[0].args["matched"] == whens.expressions[1].args["matched"]
+        ):
+            raise SQLMeshError(
+                "Redshift only supports a single WHEN MATCHED and WHEN NOT MATCHED clause"
+            )
+
+        using = exp.alias_(
+            exp.Subquery(this=query), alias=MERGE_SOURCE_ALIAS, copy=False, table=True
+        )
+        self.execute(
+            exp.Merge(
+                this=target_table,
+                using=using,
+                on=on.transform(resolve_target_table),
+                whens=whens.transform(resolve_target_table),
+            )
+        )
 
     def _normalize_decimal_value(self, expr: exp.Expression, precision: int) -> exp.Expression:
         # Redshift is finicky. It truncates when the data is already in a table, but rounds when the data is generated as part of a SELECT.

@@ -25,9 +25,9 @@ router = APIRouter()
 
 
 @router.get("", response_model=models.Directory)
-async def get_files(settings: Settings = Depends(get_settings)) -> models.Directory:
+def get_files(settings: Settings = Depends(get_settings)) -> models.Directory:
     """Get all project files."""
-    return await _get_directory(settings.project_path, settings)
+    return _get_directory(settings.project_path, settings)
 
 
 @router.get("/{path:path}", response_model=models.File)
@@ -56,11 +56,11 @@ async def write_file(
     """Create, update, or rename a file."""
     path_or_new_path = path
     if new_path:
-        path_or_new_path = await validate_path(new_path, settings)
+        path_or_new_path = validate_path(new_path, settings)
         replace_file(settings.project_path / path, settings.project_path / path_or_new_path)
     else:
         full_path = settings.project_path / path
-        config = context.config_for_path(Path(path_or_new_path)) if context else None
+        config, _ = context.config_for_path(Path(path_or_new_path)) if context else (None, None)
         if (
             config
             and config.ui.format_on_save
@@ -70,7 +70,7 @@ async def write_file(
             format_file_status = models.FormatFileStatus(
                 status=models.Status.INIT, path=path_or_new_path
             )
-            path_to_model_mapping = await get_path_to_model_mapping(settings=settings)
+            path_to_model_mapping = get_path_to_model_mapping(settings=settings)
             model = path_to_model_mapping.get(Path(full_path))
             default_dialect = config.dialect
             dialect = model.dialect if model and model.is_sql else default_dialect
@@ -118,8 +118,8 @@ async def delete_file(
         )
 
 
-async def _get_directory(path: str | Path, settings: Settings) -> models.Directory:
-    context = await get_context(settings)
+def _get_directory(path: str | Path, settings: Settings) -> models.Directory:
+    context = get_context(settings)
     ignore_patterns = context.config.ignore_patterns if context else c.IGNORE_PATTERNS
 
     def walk_path(
@@ -145,13 +145,13 @@ async def _get_directory(path: str | Path, settings: Settings) -> models.Directo
                     directories.append(
                         models.Directory(
                             name=entry.name,
-                            path=str(relative_path),
+                            path=str(relative_path.as_posix()),
                             directories=_directories,
                             files=_files,
                         )
                     )
                 elif entry.is_file(follow_symlinks=False):
-                    files.append(models.File(name=entry.name, path=str(relative_path)))
+                    files.append(models.File(name=entry.name, path=str(relative_path.as_posix())))
         return sorted(directories, key=lambda x: x.name), sorted(files, key=lambda x: x.name)
 
     directories, files = walk_path(path)
@@ -168,7 +168,7 @@ async def _get_directory(path: str | Path, settings: Settings) -> models.Directo
 def _get_file_with_content(file_path: Path, relative_path: str) -> models.File:
     """Get a file, including its contents."""
     try:
-        content = file_path.read_text()
+        content = file_path.read_text(encoding="utf-8")
     except FileNotFoundError as e:
         raise e
     except Exception:

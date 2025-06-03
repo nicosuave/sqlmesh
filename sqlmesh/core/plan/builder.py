@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import logging
 import re
-import sys
 import typing as t
 from collections import defaultdict
 from functools import cached_property
 
 
-from sqlmesh.core.console import Console, get_console
+from sqlmesh.core.console import PlanBuilderConsole, get_console
 from sqlmesh.core.config import (
     AutoCategorizationMode,
     CategorizerConfig,
@@ -16,8 +15,17 @@ from sqlmesh.core.config import (
 )
 from sqlmesh.core.context_diff import ContextDiff
 from sqlmesh.core.environment import EnvironmentNamingInfo
-from sqlmesh.core.plan.definition import Plan, SnapshotMapping, earliest_interval_start
-from sqlmesh.core.schema_diff import SchemaDiffer, has_drop_alteration, get_dropped_column_names
+from sqlmesh.core.plan.definition import (
+    Plan,
+    SnapshotMapping,
+    UserProvidedFlags,
+    earliest_interval_start,
+)
+from sqlmesh.core.schema_diff import (
+    get_schema_differ,
+    has_drop_alteration,
+    get_dropped_column_names,
+)
 from sqlmesh.core.snapshot import (
     DeployabilityIndex,
     Snapshot,
@@ -27,8 +35,14 @@ from sqlmesh.core.snapshot.categorizer import categorize_change
 from sqlmesh.core.snapshot.definition import Interval, SnapshotId
 from sqlmesh.utils import columns_to_types_all_known, random_id
 from sqlmesh.utils.dag import DAG
-from sqlmesh.utils.date import TimeLike, now, to_datetime, yesterday_ds
-from sqlmesh.utils.errors import NoChangesPlanError, PlanError, SQLMeshError
+from sqlmesh.utils.date import (
+    TimeLike,
+    now,
+    to_datetime,
+    yesterday_ds,
+    to_timestamp,
+)
+from sqlmesh.utils.errors import NoChangesPlanError, PlanError
 
 logger = logging.getLogger(__name__)
 
@@ -68,14 +82,12 @@ class PlanBuilder:
         ensure_finalized_snapshots: Whether to compare against snapshots from the latest finalized
             environment state, or to use whatever snapshots are in the current environment state even if
             the environment is not finalized.
-        engine_schema_differ: Schema differ from the context engine adapter.
         interval_end_per_model: The mapping from model FQNs to target end dates.
     """
 
     def __init__(
         self,
         context_diff: ContextDiff,
-        engine_schema_differ: SchemaDiffer,
         start: t.Optional[TimeLike] = None,
         end: t.Optional[TimeLike] = None,
         execution_time: t.Optional[TimeLike] = None,
@@ -101,7 +113,8 @@ class PlanBuilder:
         end_bounded: bool = False,
         ensure_finalized_snapshots: bool = False,
         interval_end_per_model: t.Optional[t.Dict[str, int]] = None,
-        console: t.Optional[Console] = None,
+        console: t.Optional[PlanBuilderConsole] = None,
+        user_provided_flags: t.Optional[t.Dict[str, UserProvidedFlags]] = None,
     ):
         self._context_diff = context_diff
         self._no_gaps = no_gaps
@@ -126,12 +139,14 @@ class PlanBuilder:
         self._backfill_models = backfill_models
         self._end = end or default_end
         self._apply = apply
-        self._engine_schema_differ = engine_schema_differ
         self._console = console or get_console()
         self._choices: t.Dict[SnapshotId, SnapshotChangeCategory] = {}
+        self._user_provided_flags = user_provided_flags
 
         self._start = start
-        if not self._start and self._forward_only_preview_needed:
+        if not self._start and (
+            self._forward_only_preview_needed or self._auto_restatement_preview_needed
+        ):
             self._start = default_start or yesterday_ds()
 
         self._plan_id: str = random_id()
@@ -144,6 +159,7 @@ class PlanBuilder:
             name=self._context_diff.environment,
             suffix_target=environment_suffix_target,
             normalize_name=self._context_diff.normalize_environment_name,
+            gateway_managed=self._context_diff.gateway_managed_virtual_layer,
         )
 
         self._latest_plan: t.Optional[Plan] = None
@@ -189,16 +205,16 @@ class PlanBuilder:
         if self._forward_only:
             raise PlanError("Choice setting is not supported by a forward-only plan.")
         if not self._is_new_snapshot(snapshot):
-            raise SQLMeshError(
-                f"A choice can't be changed for the existing version of '{snapshot.name}'."
+            raise PlanError(
+                f"A choice can't be changed for the existing version of {snapshot.name}."
             )
         if (
             not self._context_diff.directly_modified(snapshot.name)
             and snapshot.snapshot_id not in self._context_diff.added
         ):
-            raise SQLMeshError(
-                f"Only directly modified models can be categorized ({snapshot.name})."
-            )
+            raise PlanError(f"Only directly modified models can be categorized ({snapshot.name}).")
+        if snapshot.is_model and snapshot.model.forward_only:
+            raise PlanError(f"Forward-only model {snapshot.name} cannot be categorized manually.")
 
         self._choices[snapshot.snapshot_id] = choice
         self._latest_plan = None
@@ -207,7 +223,7 @@ class PlanBuilder:
     def apply(self) -> None:
         """Builds and applies the plan."""
         if not self._apply:
-            raise SQLMeshError("Plan was not initialized with an applier.")
+            raise PlanError("Plan was not initialized with an applier.")
         self._apply(self.build())
 
     def build(self) -> Plan:
@@ -272,6 +288,7 @@ class PlanBuilder:
             execution_time=self._execution_time,
             end_bounded=self._end_bounded,
             ensure_finalized_snapshots=self._ensure_finalized_snapshots,
+            user_provided_flags=self._user_provided_flags,
         )
         self._latest_plan = plan
         return plan
@@ -285,11 +302,6 @@ class PlanBuilder:
     def _build_restatements(
         self, dag: DAG[SnapshotId], earliest_interval_start: TimeLike
     ) -> t.Dict[SnapshotId, Interval]:
-        def is_restateable_snapshot(snapshot: Snapshot) -> bool:
-            if not self._is_dev and snapshot.disable_restatement:
-                return False
-            return not snapshot.is_symbolic and not snapshot.is_seed
-
         restate_models = self._restate_models
         if restate_models == set():
             # This is a warning but we print this as error since the Console is lacking API for warnings.
@@ -320,49 +332,74 @@ class PlanBuilder:
         if not restate_models:
             return {}
 
-        # Add restate snapshots and their downstream snapshots
-        dummy_interval = (sys.maxsize, -sys.maxsize)
-        for model_fqn in restate_models:
-            snapshot = self._model_fqn_to_snapshot.get(model_fqn)
-            if not snapshot:
-                raise PlanError(f"Cannot restate model '{model_fqn}'. Model does not exist.")
-            if not forward_only_preview_needed:
-                if not self._is_dev and snapshot.disable_restatement:
-                    # This is a warning but we print this as error since the Console is lacking API for warnings.
-                    self._console.log_error(
-                        f"Cannot restate model '{model_fqn}'. Restatement is disabled for this model."
-                    )
-                    continue
-                elif snapshot.is_symbolic or snapshot.is_seed:
-                    logger.info("Skipping restatement for model '%s'", model_fqn)
-                    continue
+        start = self._start or earliest_interval_start
+        end = self._end or now()
 
-            restatements[snapshot.snapshot_id] = dummy_interval
-            for downstream_s_id in dag.downstream(snapshot.snapshot_id):
-                if is_restateable_snapshot(self._context_diff.snapshots[downstream_s_id]):
-                    restatements[downstream_s_id] = dummy_interval
-        # Get restatement intervals for all restated snapshots and make sure that if a snapshot expands it's
+        # Add restate snapshots and their downstream snapshots
+        for model_fqn in restate_models:
+            if model_fqn not in self._model_fqn_to_snapshot:
+                raise PlanError(f"Cannot restate model '{model_fqn}'. Model does not exist.")
+
+        # Get restatement intervals for all restated snapshots and make sure that if an incremental snapshot expands it's
         # restatement range that it's downstream dependencies all expand their restatement ranges as well.
         for s_id in dag:
-            if s_id not in restatements:
-                continue
             snapshot = self._context_diff.snapshots[s_id]
-            interval = snapshot.get_removal_interval(
-                self._start or earliest_interval_start,
-                self._end or now(),
-                self._execution_time,
-                strict=False,
-                is_preview=is_preview,
-            )
+
             # Since we are traversing the graph in topological order and the largest interval range is pushed down
             # the graph we just have to check our immediate parents in the graph and not the whole upstream graph.
-            snapshot_dependencies = snapshot.parents
-            possible_intervals = [
-                restatements.get(s, dummy_interval) for s in snapshot_dependencies
-            ] + [interval]
+            restating_parents = [
+                self._context_diff.snapshots[s] for s in snapshot.parents if s in restatements
+            ]
+
+            if not restating_parents and snapshot.name not in restate_models:
+                continue
+
+            if not forward_only_preview_needed:
+                if self._is_dev and not snapshot.is_paused:
+                    self._console.log_warning(
+                        f"Cannot restate model '{snapshot.name}' because the current version is used in production. "
+                        "Run the restatement against the production environment instead to restate this model."
+                    )
+                    continue
+                elif (not self._is_dev or not snapshot.is_paused) and snapshot.disable_restatement:
+                    self._console.log_warning(
+                        f"Cannot restate model '{snapshot.name}'. "
+                        "Restatement is disabled for this model to prevent possible data loss."
+                        "If you want to restate this model, change the model's `disable_restatement` setting to `false`."
+                    )
+                    continue
+                elif snapshot.is_seed:
+                    logger.info("Skipping restatement for model '%s'", snapshot.name)
+                    continue
+
+            possible_intervals = {
+                restatements[p.snapshot_id] for p in restating_parents if p.is_incremental
+            }
+            possible_intervals.add(
+                snapshot.get_removal_interval(
+                    start,
+                    end,
+                    self._execution_time,
+                    strict=False,
+                    is_preview=is_preview,
+                )
+            )
             snapshot_start = min(i[0] for i in possible_intervals)
             snapshot_end = max(i[1] for i in possible_intervals)
+
+            # We may be tasked with restating a time range smaller than the target snapshot interval unit
+            # For example, restating an hour of Hourly Model A, which has a downstream dependency of Daily Model B
+            # we need to ensure the whole affected day in Model B is restated
+            floored_snapshot_start = snapshot.node.interval_unit.cron_floor(snapshot_start)
+            floored_snapshot_end = snapshot.node.interval_unit.cron_floor(snapshot_end)
+            if to_timestamp(floored_snapshot_end) < snapshot_end:
+                snapshot_start = to_timestamp(floored_snapshot_start)
+                snapshot_end = to_timestamp(
+                    snapshot.node.interval_unit.cron_next(floored_snapshot_end)
+                )
+
             restatements[s_id] = (snapshot_start, snapshot_end)
+
         return restatements
 
     def _build_directly_and_indirectly_modified(
@@ -457,28 +494,27 @@ class PlanBuilder:
             if columns_to_types_all_known(old_columns_to_types) and columns_to_types_all_known(
                 new_columns_to_types
             ):
-                schema_diff = self._engine_schema_differ.compare_columns(
+                schema_diff = get_schema_differ(snapshot.model.dialect).compare_columns(
                     new.name,
                     old_columns_to_types,
                     new_columns_to_types,
                 )
 
                 if has_drop_alteration(schema_diff):
+                    snapshot_name = snapshot.name
                     dropped_column_names = get_dropped_column_names(schema_diff)
-                    dropped_column_str = (
-                        "', '".join(dropped_column_names) if dropped_column_names else None
+                    model_dialect = snapshot.model.dialect
+
+                    self._console.log_destructive_change(
+                        snapshot_name,
+                        dropped_column_names,
+                        schema_diff,
+                        model_dialect,
+                        error=not snapshot.model.on_destructive_change.is_warn,
                     )
-                    dropped_column_msg = (
-                        f" that drops column{'s' if dropped_column_names and len(dropped_column_names) > 1 else ''} '{dropped_column_str}'"
-                        if dropped_column_str
-                        else ""
-                    )
-                    warning_msg = f"Plan results in a destructive change to forward-only model '{snapshot.name}'s schema{dropped_column_msg}."
-                    if snapshot.model.on_destructive_change.is_warn:
-                        logger.warning(warning_msg)
-                    else:
+                    if snapshot.model.on_destructive_change.is_error:
                         raise PlanError(
-                            f"{warning_msg} To allow this, change the model's `on_destructive_change` setting to `warn` or `allow` or include it in the plan's `--allow-destructive-model` option."
+                            "Plan requires a destructive change to a forward-only model."
                         )
 
     def _categorize_snapshots(
@@ -552,27 +588,109 @@ class PlanBuilder:
                     if mode == AutoCategorizationMode.FULL:
                         snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
         elif self._context_diff.indirectly_modified(snapshot.name):
-            categories = []
+            all_upstream_categories = set()
+            direct_parent_categories = set()
 
             for p_id in dag.upstream(s_id):
                 parent = self._context_diff.snapshots.get(p_id)
 
                 if parent and self._is_new_snapshot(parent):
-                    categories.append(parent.change_category)
+                    all_upstream_categories.add(parent.change_category)
+                    if p_id in snapshot.parents:
+                        direct_parent_categories.add(parent.change_category)
 
-            if not categories or any(
-                category.is_breaking or category.is_indirect_breaking
-                for category in categories
-                if category
+            if snapshot.is_model and snapshot.model.forward_only:
+                snapshot.categorize_as(SnapshotChangeCategory.FORWARD_ONLY)
+            elif direct_parent_categories.intersection(
+                {SnapshotChangeCategory.BREAKING, SnapshotChangeCategory.INDIRECT_BREAKING}
             ):
                 snapshot.categorize_as(SnapshotChangeCategory.INDIRECT_BREAKING)
-            elif any(category.is_forward_only for category in categories if category):
+            elif not direct_parent_categories:
+                snapshot.categorize_as(self._get_orphaned_indirect_change_category(snapshot))
+            elif SnapshotChangeCategory.FORWARD_ONLY in all_upstream_categories:
+                # FORWARD_ONLY must take precedence over INDIRECT_NON_BREAKING
                 snapshot.categorize_as(SnapshotChangeCategory.FORWARD_ONLY)
+            elif all_upstream_categories == {SnapshotChangeCategory.METADATA}:
+                snapshot.categorize_as(SnapshotChangeCategory.METADATA)
             else:
                 snapshot.categorize_as(SnapshotChangeCategory.INDIRECT_NON_BREAKING)
         else:
             # Metadata updated.
             snapshot.categorize_as(SnapshotChangeCategory.METADATA)
+
+    def _get_orphaned_indirect_change_category(
+        self, indirect_snapshot: Snapshot
+    ) -> SnapshotChangeCategory:
+        """Sometimes an indirectly changed downstream snapshot ends up with no directly changed parents introduced in the same plan.
+        This may happen when 2 or more parent models were changed independently in different plans and then the changes were
+        merged together and applied in a single plan. As a result, a combination of 2 or more previously changed parents produces
+        a new downstream snapshot not previously seen.
+
+        This function is used to infer the correct change category for such downstream snapshots based on change categories of their parents.
+        """
+        previous_snapshot = self._context_diff.modified_snapshots[indirect_snapshot.name][1]
+        previous_parent_snapshot_ids = {p.name: p for p in previous_snapshot.parents}
+
+        current_parent_snapshots = [
+            self._context_diff.snapshots[p_id]
+            for p_id in indirect_snapshot.parents
+            if p_id in self._context_diff.snapshots
+        ]
+
+        indirect_category: t.Optional[SnapshotChangeCategory] = None
+        for current_parent_snapshot in current_parent_snapshots:
+            if current_parent_snapshot.name not in previous_parent_snapshot_ids:
+                # This is a new parent so falling back to INDIRECT_BREAKING
+                return SnapshotChangeCategory.INDIRECT_BREAKING
+            pevious_parent_snapshot_id = previous_parent_snapshot_ids[current_parent_snapshot.name]
+
+            if current_parent_snapshot.snapshot_id == pevious_parent_snapshot_id:
+                # There were no new versions of this parent since the previous version of this snapshot,
+                # so we can skip it
+                continue
+
+            # Find the previous snapshot ID of the same parent in the historical chain
+            previous_parent_found = False
+            previous_parent_categories = set()
+            for pv in reversed(current_parent_snapshot.all_versions):
+                pv_snapshot_id = pv.snapshot_id(current_parent_snapshot.name)
+                if pv_snapshot_id == pevious_parent_snapshot_id:
+                    previous_parent_found = True
+                    break
+                previous_parent_categories.add(pv.change_category)
+
+            if not previous_parent_found:
+                # The previous parent is not in the historical chain so falling back to INDIRECT_BREAKING
+                return SnapshotChangeCategory.INDIRECT_BREAKING
+
+            if previous_parent_categories.intersection(
+                {SnapshotChangeCategory.BREAKING, SnapshotChangeCategory.INDIRECT_BREAKING}
+            ):
+                # One of the new parents in the chain was breaking so this indirect snapshot is breaking
+                return SnapshotChangeCategory.INDIRECT_BREAKING
+
+            if SnapshotChangeCategory.FORWARD_ONLY in previous_parent_categories:
+                # One of the new parents in the chain was forward-only so this indirect snapshot is forward-only
+                indirect_category = SnapshotChangeCategory.FORWARD_ONLY
+            elif (
+                previous_parent_categories.intersection(
+                    {
+                        SnapshotChangeCategory.NON_BREAKING,
+                        SnapshotChangeCategory.INDIRECT_NON_BREAKING,
+                    }
+                )
+                and indirect_category != SnapshotChangeCategory.FORWARD_ONLY
+            ):
+                # All changes in the chain were non-breaking so this indirect snapshot can be non-breaking too
+                indirect_category = SnapshotChangeCategory.INDIRECT_NON_BREAKING
+            elif (
+                previous_parent_categories == {SnapshotChangeCategory.METADATA}
+                and indirect_category is None
+            ):
+                # All changes in the chain were metadata so this indirect snapshot can be metadata too
+                indirect_category = SnapshotChangeCategory.METADATA
+
+        return indirect_category or SnapshotChangeCategory.INDIRECT_BREAKING
 
     def _apply_effective_from(self) -> None:
         if self._effective_from:
@@ -585,11 +703,15 @@ class PlanBuilder:
             if (
                 snapshot.evaluatable
                 and not snapshot.disable_restatement
-                and not snapshot.full_history_restatement_only
+                and (not snapshot.full_history_restatement_only or not snapshot.is_incremental)
             ):
                 snapshot.effective_from = self._effective_from
 
     def _is_forward_only_change(self, s_id: SnapshotId) -> bool:
+        if not self._context_diff.directly_modified(
+            s_id.name
+        ) and not self._context_diff.indirectly_modified(s_id.name):
+            return False
         snapshot = self._context_diff.snapshots[s_id]
         if snapshot.name in self._context_diff.modified_snapshots:
             _, old = self._context_diff.modified_snapshots[snapshot.name]
@@ -623,6 +745,8 @@ class PlanBuilder:
         for name, (candidate, promoted) in self._context_diff.modified_snapshots.items():
             if (
                 candidate.snapshot_id not in self._context_diff.new_snapshots
+                and candidate.is_model
+                and not candidate.model.forward_only
                 and promoted.is_forward_only
                 and not promoted.is_paused
                 and not candidate.reuses_previous_version
@@ -673,8 +797,25 @@ class PlanBuilder:
                 self._enable_preview
                 and any(
                     snapshot.model.forward_only
-                    for snapshot, _ in self._context_diff.modified_snapshots.values()
+                    for snapshot in self._modified_and_added_snapshots
                     if snapshot.is_model
                 )
             )
         )
+
+    @cached_property
+    def _auto_restatement_preview_needed(self) -> bool:
+        return self._is_dev and any(
+            snapshot.model.auto_restatement_cron is not None
+            for snapshot in self._modified_and_added_snapshots
+            if snapshot.is_model
+        )
+
+    @cached_property
+    def _modified_and_added_snapshots(self) -> t.List[Snapshot]:
+        return [
+            snapshot
+            for snapshot in self._context_diff.snapshots.values()
+            if snapshot.name in self._context_diff.modified_snapshots
+            or snapshot.snapshot_id in self._context_diff.added
+        ]

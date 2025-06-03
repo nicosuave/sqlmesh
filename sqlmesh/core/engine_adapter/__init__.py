@@ -18,6 +18,7 @@ from sqlmesh.core.engine_adapter.snowflake import SnowflakeEngineAdapter
 from sqlmesh.core.engine_adapter.spark import SparkEngineAdapter
 from sqlmesh.core.engine_adapter.trino import TrinoEngineAdapter
 from sqlmesh.core.engine_adapter.athena import AthenaEngineAdapter
+from sqlmesh.core.engine_adapter.risingwave import RisingwaveEngineAdapter
 from sqlmesh.core.engine_adapter.singlestore import SingleStoreEngineAdapter
 
 DIALECT_TO_ENGINE_ADAPTER = {
@@ -34,6 +35,7 @@ DIALECT_TO_ENGINE_ADAPTER = {
     "mssql": MSSQLEngineAdapter,
     "trino": TrinoEngineAdapter,
     "athena": AthenaEngineAdapter,
+    "risingwave": RisingwaveEngineAdapter,
     "singlestore": SingleStoreEngineAdapter,
 }
 

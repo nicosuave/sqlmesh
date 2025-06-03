@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import sys
 import typing as t
 from collections import defaultdict
 from datetime import datetime, timedelta
 from enum import IntEnum
+import logging
 from functools import cached_property, lru_cache
 from pathlib import Path
 
@@ -23,10 +25,11 @@ from sqlmesh.utils.date import (
     TimeLike,
     is_date,
     make_inclusive,
-    make_inclusive_end,
     make_exclusive,
+    make_inclusive_end,
     now,
     now_timestamp,
+    time_like_to_str,
     to_date,
     to_datetime,
     to_ds,
@@ -35,20 +38,28 @@ from sqlmesh.utils.date import (
     validate_date_range,
     yesterday,
 )
-from sqlmesh.utils.errors import SQLMeshError
-from sqlmesh.utils.metaprogramming import prepare_env, print_exception
+from sqlmesh.utils.errors import SQLMeshError, SignalEvalError
+from sqlmesh.utils.metaprogramming import (
+    prepare_env,
+    print_exception,
+    format_evaluated_code_exception,
+    Executable,
+)
 from sqlmesh.utils.hashing import hash_data
 from sqlmesh.utils.pydantic import PydanticModel, field_validator
 
 if t.TYPE_CHECKING:
     from sqlglot.dialects.dialect import DialectType
     from sqlmesh.core.environment import EnvironmentNamingInfo
-    from sqlmesh.core.config import Config
+    from sqlmesh.core.context import ExecutionContext
 
 Interval = t.Tuple[int, int]
 Intervals = t.List[Interval]
 
-Node = t.Annotated[t.Union[Model, StandaloneAudit], Field(descriminator="source_type")]
+Node = t.Annotated[t.Union[Model, StandaloneAudit], Field(discriminator="source_type")]
+
+
+logger = logging.getLogger(__name__)
 
 
 class SnapshotChangeCategory(IntEnum):
@@ -157,31 +168,73 @@ class SnapshotNameVersion(PydanticModel, frozen=True):
         return self
 
 
-class SnapshotIntervals(PydanticModel, frozen=True):
+class SnapshotIntervals(PydanticModel):
     name: str
-    identifier: str
+    identifier: t.Optional[str]
     version: str
-    intervals: Intervals
-    dev_intervals: Intervals
+    dev_version: t.Optional[str]
+    intervals: Intervals = []
+    dev_intervals: Intervals = []
+    pending_restatement_intervals: Intervals = []
 
     @property
-    def snapshot_id(self) -> SnapshotId:
+    def snapshot_id(self) -> t.Optional[SnapshotId]:
+        if not self.identifier:
+            return None
         return SnapshotId(name=self.name, identifier=self.identifier)
 
     @property
     def name_version(self) -> SnapshotNameVersion:
         return SnapshotNameVersion(name=self.name, version=self.version)
 
+    def add_interval(self, start: int, end: int) -> None:
+        self._add_interval(start, end, "intervals")
+
+    def add_dev_interval(self, start: int, end: int) -> None:
+        self._add_interval(start, end, "dev_intervals")
+
+    def add_pending_restatement_interval(self, start: int, end: int) -> None:
+        self._add_interval(start, end, "pending_restatement_intervals")
+
+    def remove_interval(self, start: int, end: int) -> None:
+        self._remove_interval(start, end, "intervals")
+
+    def remove_dev_interval(self, start: int, end: int) -> None:
+        self._remove_interval(start, end, "dev_intervals")
+
+    def remove_pending_restatement_interval(self, start: int, end: int) -> None:
+        self._remove_interval(start, end, "pending_restatement_intervals")
+
+    def is_empty(self) -> bool:
+        return (
+            not self.intervals and not self.dev_intervals and not self.pending_restatement_intervals
+        )
+
+    def _add_interval(self, start: int, end: int, interval_attr: str) -> None:
+        target_intervals = getattr(self, interval_attr)
+        target_intervals = merge_intervals([*target_intervals, (start, end)])
+        setattr(self, interval_attr, target_intervals)
+
+    def _remove_interval(self, start: int, end: int, interval_attr: str) -> None:
+        target_intervals = getattr(self, interval_attr)
+        target_intervals = remove_interval(target_intervals, start, end)
+        setattr(self, interval_attr, target_intervals)
+
 
 class SnapshotDataVersion(PydanticModel, frozen=True):
     fingerprint: SnapshotFingerprint
     version: str
-    temp_version: t.Optional[str] = None
+    dev_version_: t.Optional[str] = Field(default=None, alias="dev_version")
     change_category: t.Optional[SnapshotChangeCategory] = None
     physical_schema_: t.Optional[str] = Field(default=None, alias="physical_schema")
+    dev_table_suffix: str
 
     def snapshot_id(self, name: str) -> SnapshotId:
         return SnapshotId(name=name, identifier=self.fingerprint.to_identifier())
+
+    @property
+    def dev_version(self) -> str:
+        return self.dev_version_ or self.fingerprint.to_version()
 
     @property
     def physical_schema(self) -> str:
@@ -215,13 +268,20 @@ class QualifiedViewName(PydanticModel, frozen=True):
         return exp.table_(
             self.table_name_for_environment(environment_naming_info, dialect=dialect),
             db=self.schema_for_environment(environment_naming_info, dialect=dialect),
-            catalog=self.catalog_for_environment(environment_naming_info),
+            catalog=self.catalog_for_environment(environment_naming_info, dialect=dialect),
         )
 
     def catalog_for_environment(
-        self, environment_naming_info: EnvironmentNamingInfo
+        self, environment_naming_info: EnvironmentNamingInfo, dialect: DialectType = None
     ) -> t.Optional[str]:
-        return environment_naming_info.catalog_name_override or self.catalog
+        if environment_naming_info.catalog_name_override:
+            catalog_name = environment_naming_info.catalog_name_override
+            return (
+                normalize_identifiers(catalog_name, dialect=dialect).name
+                if environment_naming_info.normalize_name
+                else catalog_name
+            )
+        return self.catalog
 
     def schema_for_environment(
         self, environment_naming_info: EnvironmentNamingInfo, dialect: DialectType = None
@@ -266,19 +326,20 @@ class QualifiedViewName(PydanticModel, frozen=True):
 
 class SnapshotInfoMixin(ModelKindMixin):
     name: str
-    temp_version: t.Optional[str]
+    dev_version_: t.Optional[str]
     change_category: t.Optional[SnapshotChangeCategory]
     fingerprint: SnapshotFingerprint
     previous_versions: t.Tuple[SnapshotDataVersion, ...]
     # Added to support Migration # 34 (default catalog)
     # This can be removed from this model once Pydantic 1 support is dropped (must remain in `Snapshot` though)
     base_table_name_override: t.Optional[str]
+    dev_table_suffix: str
 
-    @property
+    @cached_property
     def identifier(self) -> str:
         return self.fingerprint.to_identifier()
 
-    @property
+    @cached_property
     def snapshot_id(self) -> SnapshotId:
         return SnapshotId(name=self.name, identifier=self.identifier)
 
@@ -297,6 +358,10 @@ class SnapshotInfoMixin(ModelKindMixin):
         if self.previous_versions:
             return self.previous_versions[-1]
         return None
+
+    @property
+    def dev_version(self) -> str:
+        return self.dev_version_ or self.fingerprint.to_version()
 
     @property
     def physical_schema(self) -> str:
@@ -355,10 +420,6 @@ class SnapshotInfoMixin(ModelKindMixin):
     def data_hash_matches(self, other: t.Optional[SnapshotInfoMixin | SnapshotDataVersion]) -> bool:
         return other is not None and self.fingerprint.data_hash == other.fingerprint.data_hash
 
-    def temp_version_get_or_generate(self) -> str:
-        """Helper method to get the temp version or generate it from the fingerprint."""
-        return self.temp_version or self.fingerprint.to_version()
-
     def _table_name(self, version: str, is_deployable: bool) -> str:
         """Full table name pointing to the materialized location of the snapshot.
 
@@ -371,7 +432,7 @@ class SnapshotInfoMixin(ModelKindMixin):
 
         is_dev_table = not is_deployable
         if is_dev_table:
-            version = self.temp_version_get_or_generate()
+            version = self.dev_version
 
         if self.fully_qualified_table is None:
             raise SQLMeshError(
@@ -389,8 +450,8 @@ class SnapshotInfoMixin(ModelKindMixin):
             self.physical_schema,
             base_table_name,
             version,
-            is_dev_table=is_dev_table,
             catalog=self.fully_qualified_table.catalog,
+            suffix=self.dev_table_suffix if is_dev_table else None,
         )
 
     @property
@@ -410,7 +471,7 @@ class SnapshotTableInfo(PydanticModel, SnapshotInfoMixin, frozen=True):
     name: str
     fingerprint: SnapshotFingerprint
     version: str
-    temp_version: t.Optional[str] = None
+    dev_version_: t.Optional[str] = Field(default=None, alias="dev_version")
     physical_schema_: str = Field(alias="physical_schema")
     parents: t.Tuple[SnapshotId, ...]
     previous_versions: t.Tuple[SnapshotDataVersion, ...] = ()
@@ -420,11 +481,18 @@ class SnapshotTableInfo(PydanticModel, SnapshotInfoMixin, frozen=True):
     # Added to support Migration # 34 (default catalog)
     # This can be removed from this model once Pydantic 1 support is dropped (must remain in `Snapshot` though)
     base_table_name_override: t.Optional[str] = None
-
     custom_materialization: t.Optional[str] = None
+    dev_table_suffix: str
+    model_gateway: t.Optional[str] = None
 
     def __lt__(self, other: SnapshotTableInfo) -> bool:
         return self.name < other.name
+
+    def __eq__(self, other: t.Any) -> bool:
+        return isinstance(other, SnapshotTableInfo) and self.fingerprint == other.fingerprint
+
+    def __hash__(self) -> int:
+        return hash((self.__class__, self.name, self.fingerprint))
 
     def table_name(self, is_deployable: bool = True) -> str:
         """Full table name pointing to the materialized location of the snapshot.
@@ -452,9 +520,10 @@ class SnapshotTableInfo(PydanticModel, SnapshotInfoMixin, frozen=True):
         return SnapshotDataVersion(
             fingerprint=self.fingerprint,
             version=self.version,
-            temp_version=self.temp_version,
+            dev_version=self.dev_version,
             change_category=self.change_category,
             physical_schema=self.physical_schema,
+            dev_table_suffix=self.dev_table_suffix,
         )
 
     @property
@@ -511,6 +580,7 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             Applicable for forward-only snapshots only.
         migrated: Whether or not this snapshot has been created as a result of migration.
         unrestorable: Whether or not this snapshot can be used to revert its model to a previous version.
+        next_auto_restatement_ts: The timestamp which indicates when is the next time this snapshot should be restated.
     """
 
     name: str
@@ -520,12 +590,13 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
     parents: t.Tuple[SnapshotId, ...]
     intervals: Intervals = []
     dev_intervals: Intervals = []
+    pending_restatement_intervals: Intervals = []
     created_ts: int
     updated_ts: int
     ttl: str
     previous_versions: t.Tuple[SnapshotDataVersion, ...] = ()
     version: t.Optional[str] = None
-    temp_version: t.Optional[str] = None
+    dev_version_: t.Optional[str] = Field(default=None, alias="dev_version")
     change_category: t.Optional[SnapshotChangeCategory] = None
     unpaused_ts: t.Optional[int] = None
     effective_from: t.Optional[TimeLike] = None
@@ -533,6 +604,8 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
     unrestorable: bool = False
     # Added to support Migration # 34 (default catalog)
     base_table_name_override: t.Optional[str] = None
+    next_auto_restatement_ts: t.Optional[int] = None
+    dev_table_suffix: str = "dev"
 
     @field_validator("ttl")
     @classmethod
@@ -548,7 +621,6 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
     def hydrate_with_intervals_by_version(
         snapshots: t.Iterable[Snapshot],
         intervals: t.Iterable[SnapshotIntervals],
-        is_dev: bool = False,
     ) -> t.List[Snapshot]:
         """Hydrates target snapshots with given intervals.
 
@@ -557,7 +629,6 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
         Args:
             snapshots: Target snapshots.
             intervals: Target snapshot intervals.
-            is_dev: If in development mode ignores same version intervals for paused forward-only snapshots.
 
         Returns:
             List of target snapshots with hydrated intervals.
@@ -577,32 +648,6 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
 
         return result
 
-    @staticmethod
-    def hydrate_with_intervals_by_identifier(
-        snapshots: t.Iterable[Snapshot],
-        intervals: t.Iterable[SnapshotIntervals],
-    ) -> t.List[Snapshot]:
-        """Hydrates target snapshots with given intervals.
-
-        This will match snapshots with intervals by name and identifier rather than versions.
-
-        Args:
-            snapshots: Target snapshots.
-            intervals: Target snapshot intervals.
-
-        Returns:
-            List of target snapshots with hydrated intervals.
-        """
-        intervals_by_snapshot_id = {i.snapshot_id: i for i in intervals}
-
-        result = []
-        for snapshot in snapshots:
-            if snapshot.snapshot_id in intervals_by_snapshot_id:
-                snapshot.merge_intervals(intervals_by_snapshot_id[snapshot.snapshot_id])
-            result.append(snapshot)
-
-        return result
-
     @classmethod
     def from_node(
         cls,
@@ -612,7 +657,6 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
         ttl: str = c.DEFAULT_SNAPSHOT_TTL,
         version: t.Optional[str] = None,
         cache: t.Optional[t.Dict[str, SnapshotFingerprint]] = None,
-        config: t.Optional[Config] = None,
     ) -> Snapshot:
         """Creates a new snapshot for a node.
 
@@ -682,7 +726,8 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
                 f"Attempted to add an Invalid interval ({start}, {end}) to snapshot {self.snapshot_id}"
             )
 
-        start_ts, end_ts = self.inclusive_exclusive(start, end, strict=False)
+        start_ts, end_ts = self.inclusive_exclusive(start, end, strict=False, expand=False)
+
         if start_ts >= end_ts:
             # Skipping partial interval.
             return
@@ -728,17 +773,40 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
                 When previewing, we are not actually restating a model, but removing an interval to trigger
                 a run.
         """
-        end = execution_time or now() if self.depends_on_past else end
+        end = execution_time or now_timestamp() if self.depends_on_past else end
+        removal_interval = self.inclusive_exclusive(start, end, strict)
+
         if not is_preview and self.full_history_restatement_only and self.intervals:
-            start = self.intervals[0][0]
-        return self.inclusive_exclusive(start, end, strict)
+            expanded_removal_interval = self.inclusive_exclusive(self.intervals[0][0], end, strict)
+            requested_start, requested_end = removal_interval
+            expanded_start, expanded_end = expanded_removal_interval
+
+            # only warn if the requested removal interval was a subset of the actual model intervals and was automatically expanded
+            # if the requested interval was the same or wider than the actual model intervals, no need to warn
+            if requested_start > expanded_start or requested_end < expanded_end:
+                from sqlmesh.core.console import get_console
+
+                get_console().log_warning(
+                    f"Model '{self.model.name}' is '{self.model_kind_name}' which does not support partial restatement.\n"
+                    f"Expanding the requested restatement intervals from [{to_ts(requested_start)} - {to_ts(requested_end)}] "
+                    f"to [{to_ts(expanded_start)} - {to_ts(expanded_end)}] in order to fully restate the model."
+                )
+
+            removal_interval = expanded_removal_interval
+
+        return removal_interval
+
+    @property
+    def allow_partials(self) -> bool:
+        return self.is_model and self.model.allow_partials
 
     def inclusive_exclusive(
         self,
         start: TimeLike,
         end: TimeLike,
         strict: bool = True,
-        allow_partial: bool = False,
+        allow_partial: t.Optional[bool] = None,
+        expand: bool = True,
     ) -> Interval:
         """Transform the inclusive start and end into a [start, end) pair.
 
@@ -747,6 +815,7 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             end: The end date/time of the interval (inclusive)
             strict: Whether to fail when the inclusive start is the same as the exclusive end.
             allow_partial: Whether the interval can be partial or not.
+            expand: Whether or not partial intervals are expanded outwards.
 
         Returns:
             A [start, end) pair.
@@ -755,9 +824,9 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             start,
             end,
             self.node.interval_unit,
-            model_allow_partials=self.is_model and self.model.allow_partials,
             strict=strict,
-            allow_partial=allow_partial,
+            allow_partial=self.allow_partials if allow_partial is None else allow_partial,
+            expand=expand,
         )
 
     def merge_intervals(self, other: t.Union[Snapshot, SnapshotIntervals]) -> None:
@@ -777,15 +846,15 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             if not apply_effective_from or end <= effective_from_ts:
                 self.add_interval(start, end)
 
-        previous_ids = {s.snapshot_id(self.name) for s in self.previous_versions}
-        if self.identifier == other.identifier or (
-            # Indirect Non-Breaking snapshots share the dev table with its previous version.
-            # The same applies to migrated snapshots.
-            (self.is_indirect_non_breaking or self.is_metadata or self.migrated)
-            and other.snapshot_id in previous_ids
-        ):
+        if self.dev_version == other.dev_version:
+            # Merge dev intervals if the dev versions match which would mean
+            # that this and the other snapshot are pointing to the same dev table.
             for start, end in other.dev_intervals:
                 self.add_interval(start, end, is_dev=True)
+
+        self.pending_restatement_intervals = merge_intervals(
+            [*self.pending_restatement_intervals, *other.pending_restatement_intervals]
+        )
 
     @property
     def evaluatable(self) -> bool:
@@ -830,9 +899,10 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
         # If the amount of time being checked is less than the size of a single interval then we
         # know that there can't being missing intervals within that range and return
         validate_date_range(start, end)
+
         if (
             not is_date(end)
-            and not (self.is_model and self.model.allow_partials)
+            and not self.allow_partials
             and to_timestamp(end) - to_timestamp(start) < self.node.interval_unit.milliseconds
         ):
             return []
@@ -845,32 +915,21 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
         if not self.evaluatable or (self.is_seed and intervals):
             return []
 
-        allow_partials = not end_bounded and self.is_model and self.model.allow_partials
-        start_ts, end_ts = (
-            to_timestamp(ts)
-            for ts in self.inclusive_exclusive(
-                start,
-                end,
-                strict=False,
-                allow_partial=allow_partials,
-            )
-        )
+        start_ts, end_ts = (to_timestamp(ts) for ts in self.inclusive_exclusive(start, end))
 
         interval_unit = self.node.interval_unit
-        upper_bound_ts = to_timestamp(execution_time or now())
+        execution_time_ts = to_timestamp(execution_time) if execution_time else now_timestamp()
+        upper_bound_ts = (
+            execution_time_ts
+            if ignore_cron
+            else to_timestamp(self.node.cron_floor(execution_time_ts))
+        )
+        if end_bounded:
+            upper_bound_ts = min(upper_bound_ts, end_ts)
+        if not self.allow_partials:
+            upper_bound_ts = to_timestamp(interval_unit.cron_floor(upper_bound_ts))
 
-        if allow_partials:
-            end_ts = min(end_ts, upper_bound_ts)
-        else:
-            if not ignore_cron:
-                upper_bound_ts = to_timestamp(self.node.cron_floor(upper_bound_ts))
-            if end_bounded:
-                upper_bound_ts = min(upper_bound_ts, end_ts)
-
-            end_ts = min(
-                end_ts,
-                to_timestamp(interval_unit.cron_floor(upper_bound_ts)),
-            )
+        end_ts = min(end_ts, upper_bound_ts)
 
         lookback = 0
         model_end_ts: t.Optional[int] = None
@@ -888,13 +947,13 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             model_end_ts,
         )
 
-    def check_ready_intervals(self, intervals: Intervals) -> Intervals:
+    def check_ready_intervals(self, intervals: Intervals, context: ExecutionContext) -> Intervals:
         """Returns a list of intervals that are considered ready by the provided signal.
 
         Note that this will handle gaps in the provided intervals. The returned intervals
         may introduce new gaps.
         """
-        signals = self.is_model and self.model.signals
+        signals = self.is_model and self.model.render_signal_calls()
 
         if not signals:
             return intervals
@@ -902,11 +961,13 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
         python_env = self.model.python_env
         env = prepare_env(python_env)
 
-        for signal_name, kwargs in signals:
+        for signal_name, kwargs in signals.items():
             try:
                 intervals = _check_ready_intervals(
                     env[signal_name],
                     intervals,
+                    context,
+                    python_env=python_env,
                     dialect=self.model.dialect,
                     path=self.model._path,
                     kwargs=kwargs,
@@ -925,7 +986,7 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
         Args:
             category: The change category to assign to this snapshot.
         """
-        self.temp_version = None
+        self.dev_version_ = self.fingerprint.to_version()
         reuse_previous_version = category in (
             SnapshotChangeCategory.FORWARD_ONLY,
             SnapshotChangeCategory.INDIRECT_NON_BREAKING,
@@ -938,12 +999,13 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             previous_version = self.previous_version
             self.version = previous_version.data_version.version
             self.physical_schema_ = previous_version.physical_schema
-            if category.is_indirect_non_breaking or category.is_metadata:
+            if self.is_materialized and (category.is_indirect_non_breaking or category.is_metadata):
                 # Reuse the dev table for indirect non-breaking changes.
-                self.temp_version = (
-                    previous_version.data_version.temp_version
+                self.dev_version_ = (
+                    previous_version.data_version.dev_version
                     or previous_version.fingerprint.to_version()
                 )
+                self.dev_table_suffix = previous_version.data_version.dev_table_suffix
         elif self.is_model and self.model.forward_only and not self.previous_version:
             # If this is a new model then use a deterministic version, independent of the fingerprint.
             self.version = hash_data([self.name, *self.model.kind.data_hash_values])
@@ -952,15 +1014,10 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
 
         self.change_category = category
 
-    def set_unpaused_ts(self, unpaused_dt: t.Optional[TimeLike]) -> None:
-        """Sets the timestamp for when this snapshot was unpaused.
-
-        Args:
-            unpaused_dt: The datetime object of when this snapshot was unpaused.
-        """
-        self.unpaused_ts = (
-            to_timestamp(self.node.interval_unit.cron_floor(unpaused_dt)) if unpaused_dt else None
-        )
+    @property
+    def categorized(self) -> bool:
+        """Whether the snapshot has been categorized."""
+        return self.change_category is not None and self.version is not None
 
     def table_name(self, is_deployable: bool = True) -> str:
         """Full table name pointing to the materialized location of the snapshot.
@@ -1033,6 +1090,77 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             and self.name not in allow_destructive_snapshots
         )
 
+    def get_next_auto_restatement_interval(self, execution_time: TimeLike) -> t.Optional[Interval]:
+        """Returns the next auto restatement interval for the snapshot.
+
+        Args:
+            execution_time: The execution time to use for the restatement.
+
+        Returns:
+            The interval that needs to be restated or None if no restatement is needed.
+        """
+        if (
+            not self.is_model
+            or not self.intervals
+            or not self.model.auto_restatement_cron
+            or self.model.disable_restatement
+        ):
+            return None
+
+        execution_time_ts = to_timestamp(execution_time)
+        next_auto_restatement_ts = self.next_auto_restatement_ts or to_timestamp(
+            self.model.auto_restatement_croniter(self.created_ts).get_next(estimate=False)
+        )
+        if execution_time_ts < next_auto_restatement_ts:
+            return None
+
+        num_intervals_to_restate = self.model.auto_restatement_intervals
+        if num_intervals_to_restate is None:
+            return (self.intervals[0][0], self.intervals[-1][1])
+
+        auto_restatement_end_ts = to_timestamp(
+            self.node.interval_unit.cron_floor(execution_time_ts)
+        )
+        auto_restatement_start_ts = (
+            auto_restatement_end_ts
+            - num_intervals_to_restate * self.node.interval_unit.milliseconds
+        )
+        return (auto_restatement_start_ts, auto_restatement_end_ts)
+
+    def update_next_auto_restatement_ts(self, execution_time: TimeLike) -> t.Optional[int]:
+        """Updates the next auto restatement timestamp.
+
+        Args:
+            execution_time: The execution time to use for the restatement.
+
+        Returns:
+            The next auto restatement timestamp or None if not applicable.
+        """
+        if (
+            not self.is_model
+            or not self.model.auto_restatement_cron
+            or self.model.disable_restatement
+        ):
+            self.next_auto_restatement_ts = None
+        else:
+            self.next_auto_restatement_ts = to_timestamp(
+                self.model.auto_restatement_croniter(execution_time).get_next(estimate=False)
+            )
+        return self.next_auto_restatement_ts
+
+    def apply_pending_restatement_intervals(self) -> None:
+        """Applies the pending restatement intervals to the snapshot's intervals."""
+        if not self.is_model or self.model.disable_restatement:
+            return
+        for pending_restatement_interval in self.pending_restatement_intervals:
+            logger.info(
+                "Applying the auto restated interval (%s, %s) to snapshot %s",
+                time_like_to_str(pending_restatement_interval[0]),
+                time_like_to_str(pending_restatement_interval[1]),
+                self.snapshot_id,
+            )
+            self.intervals = remove_interval(self.intervals, *pending_restatement_interval)
+
     @property
     def physical_schema(self) -> str:
         if self.physical_schema_ is not None:
@@ -1055,13 +1183,15 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             name=self.name,
             fingerprint=self.fingerprint,
             version=self.version,
-            temp_version=self.temp_version,
+            dev_version=self.dev_version,
             parents=self.parents,
             previous_versions=self.previous_versions,
             change_category=self.change_category,
             kind_name=self.model_kind_name,
             node_type=self.node_type,
             custom_materialization=custom_materialization,
+            dev_table_suffix=self.dev_table_suffix,
+            model_gateway=self.model_gateway,
         )
 
     @property
@@ -1070,9 +1200,10 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
         return SnapshotDataVersion(
             fingerprint=self.fingerprint,
             version=self.version,
-            temp_version=self.temp_version,
+            dev_version=self.dev_version,
             change_category=self.change_category,
             physical_schema=self.physical_schema,
+            dev_table_suffix=self.dev_table_suffix,
         )
 
     @property
@@ -1082,8 +1213,10 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             name=self.name,
             identifier=self.identifier,
             version=self.version,
+            dev_version=self.dev_version,
             intervals=self.intervals.copy(),
             dev_intervals=self.dev_intervals.copy(),
+            pending_restatement_intervals=self.pending_restatement_intervals.copy(),
         )
 
     @property
@@ -1123,7 +1256,7 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
     def node_type(self) -> NodeType:
         if self.node.is_model:
             return NodeType.MODEL
-        elif self.node.is_audit:
+        if self.node.is_audit:
             return NodeType.AUDIT
         raise SQLMeshError(f"Snapshot {self.snapshot_id} has an unknown node type.")
 
@@ -1269,8 +1402,10 @@ class DeployabilityIndex(PydanticModel, frozen=True):
         )
 
     def is_representative(self, snapshot: SnapshotIdLike) -> bool:
-        """Returns true if the output produced by the given snapshot in a development environment can be reused
-        in (deployed to) production, or if this snapshot already represents what is currently in production.
+        """Returns true if the deployable (non-dev) table of the given snapshot should be used for reading, table mapping, and
+        computing missing intervals.
+
+        Note, that deployable snapshots are also representative, but the reverse is not always true.
 
         Unlike `is_deployable`, this variant also captures FORWARD_ONLY and INDIRECT_NON_BREAKING snapshots that
         are not deployable by their nature but are currently promoted in production. Therefore, it's safe to consider
@@ -1324,28 +1459,30 @@ class DeployabilityIndex(PydanticModel, frozen=True):
     ) -> DeployabilityIndex:
         if not isinstance(snapshots, dict):
             snapshots = {s.snapshot_id: s for s in snapshots}
-        dag = snapshots_to_dag(snapshots.values())
-        reversed_dag = dag.reversed.graph
 
         deployability_mapping: t.Dict[SnapshotId, bool] = {}
+        children_deployability_mapping: t.Dict[SnapshotId, bool] = {}
         representative_shared_version_ids: t.Set[SnapshotId] = set()
 
         start_date_cache: t.Optional[t.Dict[str, datetime]] = {}
 
-        def _visit(node: SnapshotId, deployable: bool = True) -> None:
-            if deployability_mapping.get(node) in (False, deployable) and (
-                deployable or node not in representative_shared_version_ids
-            ):
-                return
-
-            if deployable and node in snapshots:
+        dag = snapshots_to_dag(snapshots.values())
+        for node in dag:
+            if node not in snapshots:
+                continue
+            # Make sure that the node is deployable according to all its parents
+            this_deployable = all(
+                children_deployability_mapping[p_id]
+                for p_id in snapshots[node].parents
+                if p_id in children_deployability_mapping
+            )
+            if this_deployable:
                 snapshot = snapshots[node]
-                # Capture uncategorized snapshot which represents a forward-only model.
-                is_uncategorized_forward_only_model = (
-                    snapshot.change_category is None
-                    and snapshot.previous_versions
-                    and snapshot.is_model
-                    and snapshot.model.forward_only
+                is_forward_only_model = (
+                    snapshot.is_model and snapshot.model.forward_only and not snapshot.is_metadata
+                )
+                has_auto_restatement = (
+                    snapshot.is_model and snapshot.model.auto_restatement_cron is not None
                 )
 
                 is_valid_start = (
@@ -1359,7 +1496,8 @@ class DeployabilityIndex(PydanticModel, frozen=True):
                 if (
                     snapshot.is_forward_only
                     or snapshot.is_indirect_non_breaking
-                    or is_uncategorized_forward_only_model
+                    or is_forward_only_model
+                    or has_auto_restatement
                     or not is_valid_start
                 ):
                     # FORWARD_ONLY and INDIRECT_NON_BREAKING snapshots are not deployable by nature.
@@ -1369,22 +1507,22 @@ class DeployabilityIndex(PydanticModel, frozen=True):
                     if not snapshot.is_paused or snapshot.is_indirect_non_breaking:
                         # This snapshot represents what's currently deployed in prod.
                         representative_shared_version_ids.add(node)
-                else:
-                    this_deployable = True
-                children_deployable = is_valid_start and not (
-                    snapshot.is_paused
-                    and (snapshot.is_forward_only or is_uncategorized_forward_only_model)
+
+                # A child can still be deployable even if its parent is not
+                children_deployable = (
+                    is_valid_start
+                    and not (
+                        snapshot.is_paused and (snapshot.is_forward_only or is_forward_only_model)
+                    )
+                    and not has_auto_restatement
                 )
             else:
-                this_deployable, children_deployable = False, False
-                representative_shared_version_ids.discard(node)
+                children_deployable = False
+                if not snapshots[node].is_paused:
+                    representative_shared_version_ids.add(node)
 
-            deployability_mapping[node] = deployability_mapping.get(node, True) and this_deployable
-            for child in reversed_dag[node]:
-                _visit(child, children_deployable)
-
-        for node in dag.roots:
-            _visit(node)
+            deployability_mapping[node] = this_deployable
+            children_deployability_mapping[node] = children_deployable
 
         deployable_ids = {
             snapshot_id for snapshot_id, deployable in deployability_mapping.items() if deployable
@@ -1412,19 +1550,19 @@ def table_name(
     physical_schema: str,
     name: str,
     version: str,
-    is_dev_table: bool = False,
     catalog: t.Optional[str] = None,
+    suffix: t.Optional[str] = None,
 ) -> str:
     table = exp.to_table(name)
 
     # bigquery projects usually have "-" in them which is illegal in the table name, so we aggressively prune
     name = "__".join(sanitize_name(part.name) for part in table.parts)
-    temp_suffix = "__temp" if is_dev_table else ""
+    suffix = f"__{suffix}" if suffix else ""
 
-    table.set("this", exp.to_identifier(f"{name}__{version}{temp_suffix}"))
+    table.set("this", exp.to_identifier(f"{name}__{version}{suffix}"))
     table.set("db", exp.to_identifier(physical_schema))
     if not table.catalog and catalog:
-        table.set("catalog", exp.parse_identifier(catalog))
+        table.set("catalog", exp.to_identifier(catalog))
     return exp.table_name(table)
 
 
@@ -1438,6 +1576,15 @@ def display_name(
     Returns the model name as a qualified view name.
     This is just used for presenting information back to the user and `qualified_view_name` should be used
     when wanting a view name in all other cases.
+
+    Args:
+        snapshot_info_like: The snapshot info object to get the display name for
+        environment_naming_info: Environment naming info to use for display name formatting
+        default_catalog: Optional default catalog name to use. If None, the default catalog will always be included in the display name.
+        dialect: Optional dialect type to use for name formatting
+
+    Returns:
+        The formatted display name as a string
     """
     if snapshot_info_like.is_audit:
         return snapshot_info_like.name
@@ -1598,6 +1745,21 @@ def to_table_mapping(
     }
 
 
+def to_view_mapping(
+    snapshots: t.Iterable[Snapshot],
+    environment_naming_info: EnvironmentNamingInfo,
+    default_catalog: t.Optional[str] = None,
+    dialect: t.Optional[str] = None,
+) -> t.Dict[str, str]:
+    return {
+        snapshot.name: snapshot.display_name(
+            environment_naming_info, default_catalog=default_catalog, dialect=dialect
+        )
+        for snapshot in snapshots
+        if snapshot.is_model
+    }
+
+
 def has_paused_forward_only(
     targets: t.Iterable[SnapshotIdLike],
     snapshots: t.Union[t.List[Snapshot], t.Dict[SnapshotId, Snapshot]],
@@ -1612,7 +1774,7 @@ def has_paused_forward_only(
 
 
 def missing_intervals(
-    snapshots: t.Collection[Snapshot],
+    snapshots: t.Union[t.Collection[Snapshot], t.Dict[SnapshotId, Snapshot]],
     start: t.Optional[TimeLike] = None,
     end: t.Optional[TimeLike] = None,
     execution_time: t.Optional[TimeLike] = None,
@@ -1623,9 +1785,12 @@ def missing_intervals(
     end_bounded: bool = False,
 ) -> t.Dict[Snapshot, Intervals]:
     """Returns all missing intervals given a collection of snapshots."""
+    if not isinstance(snapshots, dict):
+        # Make sure that the mapping is only constructed once
+        snapshots = {snapshot.snapshot_id: snapshot for snapshot in snapshots}
     missing = {}
     cache: t.Dict[str, datetime] = {}
-    end_date = end or now()
+    end_date = end or now_timestamp()
     start_dt = (
         to_datetime(start)
         if start
@@ -1635,22 +1800,26 @@ def missing_intervals(
     interval_end_per_model = interval_end_per_model or {}
     deployability_index = deployability_index or DeployabilityIndex.all_deployable()
 
-    for snapshot in snapshots:
+    for snapshot in snapshots.values():
         if not snapshot.evaluatable:
             continue
         snapshot_start_date = start_dt
         snapshot_end_date: TimeLike = end_date
 
-        existing_interval_end = interval_end_per_model.get(snapshot.name)
-        if existing_interval_end and existing_interval_end > to_timestamp(snapshot_start_date):
-            snapshot_end_date = existing_interval_end
-
-        interval = restatements.get(snapshot.snapshot_id)
-        if interval:
-            snapshot_start_date, snapshot_end_date = (to_datetime(i) for i in interval)
+        restated_interval = restatements.get(snapshot.snapshot_id)
+        if restated_interval:
+            snapshot_start_date, snapshot_end_date = (to_datetime(i) for i in restated_interval)
             snapshot = snapshot.copy()
             snapshot.intervals = snapshot.intervals.copy()
-            snapshot.remove_interval(interval)
+            snapshot.remove_interval(restated_interval)
+
+        existing_interval_end = interval_end_per_model.get(snapshot.name)
+        if existing_interval_end:
+            if to_timestamp(snapshot_start_date) >= existing_interval_end:
+                # The start exceeds the provided interval end, so we can skip this snapshot
+                # since it doesn't have missing intervals by definition
+                continue
+            snapshot_end_date = existing_interval_end
 
         missing_interval_end_date = snapshot_end_date
         node_end_date = snapshot.node.end
@@ -1683,9 +1852,7 @@ def expand_range(start_ts: int, end_ts: int, interval_unit: IntervalUnit) -> t.L
         ts = to_timestamp(croniter.get_next(estimate=True))
 
         if ts > end_ts:
-            if len(timestamps) > 1:
-                timestamps[-1] = end_ts
-            else:
+            if timestamps and timestamps[-1] != end_ts:
                 timestamps.append(end_ts)
             break
 
@@ -1760,9 +1927,9 @@ def inclusive_exclusive(
     start: TimeLike,
     end: TimeLike,
     interval_unit: IntervalUnit,
-    model_allow_partials: bool,
     strict: bool = True,
     allow_partial: bool = False,
+    expand: bool = True,
 ) -> Interval:
     """Transform the inclusive start and end into a [start, end) pair.
 
@@ -1770,26 +1937,34 @@ def inclusive_exclusive(
         start: The start date/time of the interval (inclusive)
         end: The end date/time of the interval (inclusive)
         interval_unit: The interval unit.
-        model_allow_partials: Whether or not the model allows partials.
         strict: Whether to fail when the inclusive start is the same as the exclusive end.
         allow_partial: Whether the interval can be partial or not.
+        expand: Whether or not partial intervals are expanded outwards.
 
     Returns:
         A [start, end) pair.
     """
-    start_ts = to_timestamp(interval_unit.cron_floor(start))
-    if start_ts < to_timestamp(start) and not model_allow_partials:
-        start_ts = to_timestamp(interval_unit.cron_next(start_ts))
+    start_dt = interval_unit.cron_floor(start)
+
+    if not expand and not allow_partial and start_dt < to_datetime(start):
+        start_dt = interval_unit.cron_next(start_dt)
+
+    start_ts = to_timestamp(start_dt)
 
     if is_date(end):
         end = to_datetime(end) + timedelta(days=1)
-    end_ts = to_timestamp(interval_unit.cron_floor(end) if not allow_partial else end)
-    if end_ts < start_ts and to_timestamp(end) > to_timestamp(start) and not strict:
-        # This can happen when the interval unit is coarser than the size of the input interval.
-        # For example, if the interval unit is monthly, but the input interval is only 1 hour long.
-        return (start_ts, end_ts)
 
-    if (strict and start_ts >= end_ts) or (start_ts > end_ts):
+    if allow_partial:
+        end_dt = end
+    else:
+        end_dt = interval_unit.cron_floor(end)
+
+        if expand and end_dt != to_datetime(end):
+            end_dt = interval_unit.cron_next(end_dt)
+
+    end_ts = to_timestamp(end_dt)
+
+    if strict and start_ts >= end_ts:
         raise ValueError(
             f"`end` ({to_datetime(end_ts)}) must be greater than `start` ({to_datetime(start_ts)})"
         )
@@ -1798,7 +1973,7 @@ def inclusive_exclusive(
 
 
 def earliest_start_date(
-    snapshots: t.Collection[Snapshot],
+    snapshots: t.Union[t.Collection[Snapshot], t.Dict[SnapshotId, Snapshot]],
     cache: t.Optional[t.Dict[str, datetime]] = None,
     relative_to: t.Optional[TimeLike] = None,
 ) -> datetime:
@@ -1813,9 +1988,12 @@ def earliest_start_date(
     """
     cache = {} if cache is None else cache
     if snapshots:
+        if not isinstance(snapshots, dict):
+            # Make sure that the mapping is only constructed once
+            snapshots = {snapshot.snapshot_id: snapshot for snapshot in snapshots}
         return min(
             start_date(snapshot, snapshots, cache=cache, relative_to=relative_to)
-            for snapshot in snapshots
+            for snapshot in snapshots.values()
         )
     return yesterday()
 
@@ -1872,6 +2050,101 @@ def snapshots_to_dag(snapshots: t.Collection[Snapshot]) -> DAG[SnapshotId]:
     return dag
 
 
+def apply_auto_restatements(
+    snapshots: t.Dict[SnapshotId, Snapshot], execution_time: TimeLike
+) -> t.List[SnapshotIntervals]:
+    """Applies auto restatements to the snapshots.
+
+    This operation results in the removal of intervals for snapshots that are ready to be restated based
+    on the provided execution time and configured auto restatement settings. For each affected snapshot,
+    it also updates the next auto restatement timestamp.
+
+    Args:
+        snapshots: A dictionary of snapshots to apply auto restatements to.
+        execution_time: The execution time.
+
+    Returns:
+        A list of SnapshotIntervals with **new** intervals that need to be restated.
+    """
+    dag = snapshots_to_dag(snapshots.values())
+    auto_restated_intervals_per_snapshot: t.Dict[SnapshotId, Interval] = {}
+    for s_id in dag:
+        if s_id not in snapshots:
+            continue
+        snapshot = snapshots[s_id]
+        if not snapshot.is_model or snapshot.model.disable_restatement:
+            continue
+
+        next_auto_restated_interval = snapshot.get_next_auto_restatement_interval(execution_time)
+        auto_restated_intervals = [
+            auto_restated_intervals_per_snapshot[parent_s_id]
+            for parent_s_id in snapshot.parents
+            if parent_s_id in auto_restated_intervals_per_snapshot
+        ]
+        if next_auto_restated_interval:
+            logger.info(
+                "Calculated the next auto restated interval (%s, %s) for snapshot %s",
+                time_like_to_str(next_auto_restated_interval[0]),
+                time_like_to_str(next_auto_restated_interval[1]),
+                snapshot.snapshot_id,
+            )
+            auto_restated_intervals.append(next_auto_restated_interval)
+
+        if auto_restated_intervals:
+            auto_restated_interval_start = sys.maxsize
+            auto_restated_interval_end = -sys.maxsize
+            for interval in auto_restated_intervals:
+                auto_restated_interval_start = min(auto_restated_interval_start, interval[0])
+                auto_restated_interval_end = max(auto_restated_interval_end, interval[1])
+
+            interval_to_remove_start = snapshot.node.interval_unit.cron_floor(
+                auto_restated_interval_start
+            )
+            interval_to_remove_end = snapshot.node.interval_unit.cron_floor(
+                auto_restated_interval_end
+            )
+            if auto_restated_interval_end > to_timestamp(interval_to_remove_end):
+                interval_to_remove_end = snapshot.node.interval_unit.cron_next(
+                    interval_to_remove_end
+                )
+
+            removal_interval = snapshot.get_removal_interval(
+                interval_to_remove_start, interval_to_remove_end, execution_time=execution_time
+            )
+
+            auto_restated_intervals_per_snapshot[s_id] = removal_interval
+            snapshot.pending_restatement_intervals = merge_intervals(
+                [*snapshot.pending_restatement_intervals, removal_interval]
+            )
+
+        snapshot.apply_pending_restatement_intervals()
+        snapshot.update_next_auto_restatement_ts(execution_time)
+
+    return [
+        SnapshotIntervals(
+            name=snapshots[s_id].name,
+            identifier=None,
+            version=snapshots[s_id].version,
+            dev_version=None,
+            intervals=[],
+            dev_intervals=[],
+            pending_restatement_intervals=[interval],
+        )
+        for s_id, interval in auto_restated_intervals_per_snapshot.items()
+        if s_id in snapshots
+    ]
+
+
+def parent_snapshots_by_name(
+    snapshot: Snapshot, snapshots: t.Dict[SnapshotId, Snapshot]
+) -> t.Dict[str, Snapshot]:
+    parent_snapshots_by_name = {
+        snapshots[p_sid].name: snapshots[p_sid] for p_sid in snapshot.parents
+    }
+    parent_snapshots_by_name[snapshot.name] = snapshot
+    return parent_snapshots_by_name
+
+
 def _contiguous_intervals(intervals: Intervals) -> t.List[Intervals]:
     """Given a list of intervals with gaps, returns a list of sequences of contiguous intervals."""
     contiguous_intervals = []
@@ -1892,6 +2165,8 @@ def _contiguous_intervals(intervals: Intervals) -> t.List[Intervals]:
 def _check_ready_intervals(
     check: t.Callable,
     intervals: Intervals,
+    context: ExecutionContext,
+    python_env: t.Dict[str, Executable],
     dialect: DialectType = None,
     path: Path = Path(),
     kwargs: t.Optional[t.Dict] = None,
@@ -1902,9 +2177,16 @@ def _check_ready_intervals(
         batch = [(to_datetime(start), to_datetime(end)) for start, end in interval_batch]
 
         try:
-            ready_intervals = call_macro(check, dialect, path, batch, **(kwargs or {}))
-        except Exception:
-            raise SQLMeshError("Error evaluating signal")
+            ready_intervals = call_macro(
+                check,
+                dialect,
+                path,
+                provided_args=(batch,),
+                provided_kwargs=(kwargs or {}),
+                context=context,
+            )
+        except Exception as ex:
+            raise SignalEvalError(format_evaluated_code_exception(ex, python_env))
 
         if isinstance(ready_intervals, bool):
             if not ready_intervals:
@@ -1912,11 +2194,23 @@ def _check_ready_intervals(
         elif isinstance(ready_intervals, list):
             for i in ready_intervals:
                 if i not in batch:
-                    raise SQLMeshError(f"Unknown interval {i} for signal")
-                batch = ready_intervals
+                    raise SignalEvalError(f"Unknown interval {i} for signal")
+            batch = ready_intervals
         else:
-            raise SQLMeshError(f"Expected bool | list, got {type(ready_intervals)} for signal")
+            raise SignalEvalError(f"Expected bool | list, got {type(ready_intervals)} for signal")
 
         checked_intervals.extend((to_timestamp(start), to_timestamp(end)) for start, end in batch)
 
     return checked_intervals
+
+
+def get_next_model_interval_start(snapshots: t.Iterable[Snapshot]) -> t.Optional[datetime]:
+    now_dt = now()
+
+    starts = [
+        snap.node.cron_next(now_dt)
+        for snap in snapshots
+        if snap.is_model and not snap.is_symbolic and not snap.is_seed
+    ]
+
+    return min(starts) if starts else None

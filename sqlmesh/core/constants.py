@@ -60,6 +60,7 @@ DEFAULT_LOG_FILE_DIR = "logs"
 AUDITS = "audits"
 CACHE = ".cache"
 EXTERNAL_MODELS = "external_models"
+LINTER = "linter"
 MACROS = "macros"
 MATERIALIZATIONS = "materializations"
 METRICS = "metrics"
@@ -75,7 +76,10 @@ REQUIREMENTS = "sqlmesh-requirements.lock"
 DEFAULT_SCHEMA = "default"
 
 SQLMESH_VARS = "__sqlmesh__vars__"
+SQLMESH_BLUEPRINT_VARS = "__sqlmesh__blueprint__vars__"
+
 VAR = "var"
+BLUEPRINT_VAR = "blueprint_var"
 GATEWAY = "gateway"
 
 SQLMESH_MACRO = "__sqlmesh__macro__"
@@ -84,7 +88,8 @@ SQLMESH_METADATA = "__sqlmesh__metadata__"
 
 
 BUILTIN = "builtin"
-AIRFLOW = "airflow"
 DBT = "dbt"
 NATIVE = "native"
 HYBRID = "hybrid"
+
+DISABLE_SQLMESH_STATE_MIGRATION = "SQLMESH__AIRFLOW__DISABLE_STATE_MIGRATION"

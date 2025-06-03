@@ -3,13 +3,16 @@ import typing as t
 from datetime import date
 from unittest import mock
 
-import pandas as pd
+import pandas as pd  # noqa: TID253
 import pytest
 from pytest_mock.plugin import MockerFixture
 from sqlglot import expressions as exp
 from sqlglot import parse_one
 
 from sqlmesh.core.engine_adapter.mssql import MSSQLEngineAdapter
+from sqlmesh.core.snapshot import SnapshotEvaluator, SnapshotChangeCategory
+from sqlmesh.core.model import load_sql_based_model
+from sqlmesh.core import dialect as d
 from sqlmesh.core.engine_adapter.shared import (
     DataObject,
     DataObjectType,
@@ -21,9 +24,12 @@ from tests.core.engine_adapter import to_sql_calls
 pytestmark = [pytest.mark.engine, pytest.mark.mssql]
 
 
-def test_columns(make_mocked_engine_adapter: t.Callable):
-    adapter = make_mocked_engine_adapter(MSSQLEngineAdapter)
+@pytest.fixture
+def adapter(make_mocked_engine_adapter: t.Callable) -> MSSQLEngineAdapter:
+    return make_mocked_engine_adapter(MSSQLEngineAdapter)
 
+
+def test_columns(adapter: MSSQLEngineAdapter):
     adapter.cursor.fetchall.return_value = [
         ("decimal_ps", "decimal", None, 5, 4),
         ("decimal", "decimal", None, 18, 0),
@@ -150,6 +156,113 @@ def test_table_exists(make_mocked_engine_adapter: t.Callable):
     adapter.cursor.fetchone.return_value = None
     resp = adapter.table_exists("db.table")
     assert not resp
+
+
+@pytest.mark.parametrize(
+    "select_expr, input_time, expected_sql",
+    [
+        # Respect the user's precision for datetimeoffset, time, datetime2
+        (
+            "SELECT ds::datetime2",
+            pd.Timestamp("2022-01-01 00:00:00.1234567"),
+            "CAST('2022-01-01 00:00:00.123456700' AS DATETIME2)",
+        ),
+        (
+            "SELECT ds::datetimeoffset(4)",
+            pd.Timestamp("2022-01-01 00:00:00.1234567"),
+            "CAST('2022-01-01 00:00:00.123456700+00:00' AS DATETIMEOFFSET(4))",
+        ),
+        (
+            "SELECT ds::time",
+            pd.Timestamp("2022-01-01 00:00:00.1234567"),
+            "CAST('2022-01-01 00:00:00.123456700' AS TIME)",
+        ),
+        # Respecting precision in datetimeoffset with time zone offsets
+        (
+            "SELECT ds::time(7)",
+            pd.Timestamp("2022-01-01 00:00:00.1234567+00:00"),
+            "CAST('2022-01-01 00:00:00.123456700' AS TIME(7))",
+        ),
+        (
+            "SELECT ds::datetimeoffset(6)",
+            pd.Timestamp("2022-01-01 00:00:00.1234567+02:00"),
+            "CAST('2021-12-31 22:00:00.123456700+00:00' AS DATETIMEOFFSET(6))",
+        ),
+        # For date types without nano-second precision, truncate as usual
+        (
+            "SELECT ds::datetime",
+            "2022-01-01 00:00:00.1234567+01:00",
+            "CAST('2021-12-31 23:00:00.123456' AS DATETIME)",
+        ),
+        (
+            "SELECT ds::smalldatetime",
+            "2022-01-01 00:00:00.1234567+00:00",
+            "CAST('2022-01-01 00:00:00.123456' AS SMALLDATETIME)",
+        ),
+        ("SELECT ds::date", "2022-01-01 00:00:00.001", "CAST('2022-01-01' AS DATE)"),
+    ],
+)
+def test_to_time_column(select_expr, input_time, expected_sql):
+    expressions = d.parse(
+        f"""
+        MODEL (
+            name db.table,
+            kind INCREMENTAL_BY_TIME_RANGE(
+                time_column (ds)
+            ),
+            dialect tsql
+        );
+
+        {select_expr}
+        """
+    )
+    model = load_sql_based_model(expressions)
+    assert model.convert_to_time_column(input_time).sql("tsql") == expected_sql
+
+
+def test_incremental_by_time_datetimeoffset_precision(
+    make_mocked_engine_adapter: t.Callable, mocker: MockerFixture, make_snapshot
+):
+    adapter = make_mocked_engine_adapter(MSSQLEngineAdapter)
+    adapter.get_current_catalog = mocker.MagicMock(return_value="other_catalog")
+
+    evaluator = SnapshotEvaluator(adapter)
+    parsed = d.parse(  # type: ignore
+        """
+            MODEL (
+                name test_schema.test_model,
+                kind INCREMENTAL_BY_TIME_RANGE (time_column ds),
+            );
+
+            SELECT a::int, ds::datetimeoffset FROM tbl as t WHERE t.ds BETWEEN @start_dt and @end_dt;
+            """,
+    )
+
+    model = load_sql_based_model(parsed, dialect="tsql")
+
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    evaluator.evaluate(
+        snapshot,
+        start="2020-01-01",
+        end="2020-01-02",
+        execution_time="2020-01-02",
+        snapshots={},
+    )
+
+    assert adapter.cursor.execute.call_args_list[0][0][0] == (
+        f"MERGE INTO [sqlmesh__test_schema].[test_schema__test_model__{snapshot.version}] AS [__MERGE_TARGET__] USING "
+        "(SELECT [a] AS [a], [ds] AS [ds] FROM (SELECT CAST([a] AS INTEGER) AS [a], "
+        "CAST([ds] AS DATETIMEOFFSET) AS [ds] FROM [tbl] AS [t] WHERE [t].[ds] BETWEEN "
+        "CAST('2020-01-01 00:00:00+00:00' AS DATETIMEOFFSET) AT TIME ZONE 'UTC' AND "
+        "CAST('2020-01-02 23:59:59.999999999+00:00' AS DATETIMEOFFSET) AT TIME ZONE 'UTC') AS [_subquery] "
+        "WHERE [ds] BETWEEN CAST('2020-01-01 00:00:00+00:00' AS DATETIMEOFFSET) AND "
+        "CAST('2020-01-02 23:59:59.999999999+00:00' AS DATETIMEOFFSET)) AS [__MERGE_SOURCE__] ON (1 = 0) WHEN NOT "
+        "MATCHED BY SOURCE AND [ds] BETWEEN CAST('2020-01-01 00:00:00+00:00' AS DATETIMEOFFSET) AND "
+        "CAST('2020-01-02 23:59:59.999999999+00:00' AS DATETIMEOFFSET) THEN DELETE WHEN NOT MATCHED THEN INSERT "
+        "([a], [ds]) VALUES ([a], [ds]);"
+    )
 
 
 def test_insert_overwrite_by_time_partition_supports_insert_overwrite_pandas_not_exists(
@@ -394,7 +507,8 @@ def test_replace_query(make_mocked_engine_adapter: t.Callable):
 
     assert to_sql_calls(adapter) == [
         """SELECT 1 FROM [information_schema].[tables] WHERE [table_name] = 'test_table';""",
-        "MERGE INTO [test_table] AS [__MERGE_TARGET__] USING (SELECT [a] AS [a] FROM [tbl]) AS [__MERGE_SOURCE__] ON (1 = 0) WHEN NOT MATCHED BY SOURCE THEN DELETE WHEN NOT MATCHED THEN INSERT ([a]) VALUES ([a]);",
+        "TRUNCATE TABLE [test_table];",
+        "INSERT INTO [test_table] ([a]) SELECT [a] FROM [tbl];",
     ]
 
 
@@ -441,7 +555,8 @@ def test_replace_query_pandas(
 
     assert to_sql_calls(adapter) == [
         f"""IF NOT EXISTS (SELECT * FROM information_schema.tables WHERE table_name = '{temp_table_name}') EXEC('CREATE TABLE [{temp_table_name}] ([a] INTEGER, [b] INTEGER)');""",
-        "MERGE INTO [test_table] AS [__MERGE_TARGET__] USING (SELECT CAST([a] AS INTEGER) AS [a], CAST([b] AS INTEGER) AS [b] FROM [__temp_test_table_abcdefgh]) AS [__MERGE_SOURCE__] ON (1 = 0) WHEN NOT MATCHED BY SOURCE THEN DELETE WHEN NOT MATCHED THEN INSERT ([a], [b]) VALUES ([a], [b]);",
+        "TRUNCATE TABLE [test_table];",
+        f"INSERT INTO [test_table] ([a], [b]) SELECT CAST([a] AS INTEGER) AS [a], CAST([b] AS INTEGER) AS [b] FROM [{temp_table_name}];",
         f"DROP TABLE IF EXISTS [{temp_table_name}];",
     ]
 
@@ -620,7 +735,6 @@ def test_create_table_from_query(make_mocked_engine_adapter: t.Callable, mocker:
         ),
         exists=False,
     )
-
     assert to_sql_calls(adapter) == [
         "CREATE VIEW [__temp_ctas_test_random_id] AS SELECT [a], [b], [x] + 1 AS [c], [d] AS [d], [e] FROM (SELECT * FROM [table]);",
         "DROP VIEW IF EXISTS [__temp_ctas_test_random_id];",
@@ -628,3 +742,82 @@ def test_create_table_from_query(make_mocked_engine_adapter: t.Callable, mocker:
     ]
 
     columns_mock.assert_called_once_with(exp.table_("__temp_ctas_test_random_id", quoted=True))
+
+    # We don't want to drop anything other than LIMIT 0
+    # See https://github.com/TobikoData/sqlmesh/issues/4048
+    adapter.ctas(
+        table_name="test_schema.test_table",
+        query_or_df=parse_one(
+            "SELECT * FROM (SELECT * FROM t WHERE FALSE LIMIT 1) WHERE FALSE LIMIT 0"
+        ),
+        exists=False,
+    )
+    assert (
+        "CREATE VIEW [__temp_ctas_test_random_id] AS SELECT * FROM (SELECT TOP 1 * FROM [t]);"
+        in to_sql_calls(adapter)
+    )
+
+
+def test_replace_query_strategy(adapter: MSSQLEngineAdapter, mocker: MockerFixture):
+    # ref issue 4472: https://github.com/TobikoData/sqlmesh/issues/4472
+    # The FULL strategy calls EngineAdapter.replace_query() which calls _insert_overwrite_by_condition() should use DELETE+INSERT and not MERGE
+    expressions = d.parse(
+        f"""
+        MODEL (
+            name db.table,
+            kind FULL,
+            dialect tsql
+        );
+
+        select a, b from db.upstream_table;
+        """
+    )
+    model = load_sql_based_model(expressions)
+
+    exists_mock = mocker.patch(
+        "sqlmesh.core.engine_adapter.mssql.MSSQLEngineAdapter.table_exists",
+        return_value=False,
+    )
+
+    assert not adapter.table_exists("test_table")
+
+    # initial - table doesnt exist
+    adapter.replace_query(
+        "test_table",
+        model.render_query_or_raise(),
+        table_format=model.table_format,
+        storage_format=model.storage_format,
+        partitioned_by=model.partitioned_by,
+        partition_interval_unit=model.partition_interval_unit,
+        clustered_by=model.clustered_by,
+        table_properties=model.physical_properties,
+        table_description=model.description,
+        column_descriptions=model.column_descriptions,
+        columns_to_types=model.columns_to_types_or_raise,
+    )
+
+    # subsequent - table exists
+    exists_mock.return_value = True
+    assert adapter.table_exists("test_table")
+
+    adapter.replace_query(
+        "test_table",
+        model.render_query_or_raise(),
+        table_format=model.table_format,
+        storage_format=model.storage_format,
+        partitioned_by=model.partitioned_by,
+        partition_interval_unit=model.partition_interval_unit,
+        clustered_by=model.clustered_by,
+        table_properties=model.physical_properties,
+        table_description=model.description,
+        column_descriptions=model.column_descriptions,
+        columns_to_types=model.columns_to_types_or_raise,
+    )
+
+    assert to_sql_calls(adapter) == [
+        # initial - create table if not exists
+        "IF NOT EXISTS (SELECT * FROM information_schema.tables WHERE table_name = 'test_table') EXEC('SELECT * INTO [test_table] FROM (SELECT [a] AS [a], [b] AS [b] FROM [db].[upstream_table] AS [upstream_table]) AS temp');",
+        # subsequent - truncate + insert
+        "TRUNCATE TABLE [test_table];",
+        "INSERT INTO [test_table] ([a], [b]) SELECT [a] AS [a], [b] AS [b] FROM [db].[upstream_table] AS [upstream_table];",
+    ]

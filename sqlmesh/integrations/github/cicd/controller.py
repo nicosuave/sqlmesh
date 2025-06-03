@@ -14,11 +14,10 @@ from typing import List
 
 import requests
 from hyperscript import Element, h
-from rich.console import Console
 from sqlglot.helper import seq_get
 
 from sqlmesh.core import constants as c
-from sqlmesh.core.console import SNAPSHOT_CHANGE_CATEGORY_STR, MarkdownConsole
+from sqlmesh.core.console import SNAPSHOT_CHANGE_CATEGORY_STR, get_console, MarkdownConsole
 from sqlmesh.core.context import Context
 from sqlmesh.core.environment import Environment
 from sqlmesh.core.plan import Plan, PlanBuilder
@@ -30,8 +29,9 @@ from sqlmesh.core.snapshot.definition import (
     format_intervals,
 )
 from sqlmesh.core.user import User
+from sqlmesh.core.config import Config
 from sqlmesh.integrations.github.cicd.config import GithubCICDBotConfig
-from sqlmesh.utils import word_characters_only
+from sqlmesh.utils import word_characters_only, Verbosity
 from sqlmesh.utils.concurrency import NodeExecutionFailedError
 from sqlmesh.utils.date import now
 from sqlmesh.utils.errors import (
@@ -39,6 +39,7 @@ from sqlmesh.utils.errors import (
     NoChangesPlanError,
     PlanError,
     UncategorizedPlanError,
+    LinterError,
 )
 from sqlmesh.utils.pydantic import PydanticModel
 
@@ -50,8 +51,6 @@ if t.TYPE_CHECKING:
     from github.PullRequest import PullRequest
     from github.PullRequestReview import PullRequestReview
     from github.Repository import Repository
-
-    from sqlmesh.core.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +76,7 @@ class PullRequestInfo(PydanticModel):
         return cls(
             owner=owner,
             repo=repo,
-            pr_number=pr_number,
+            pr_number=int(pr_number),
         )
 
 
@@ -303,7 +302,11 @@ class GithubController:
         self._prod_plan_builder: t.Optional[PlanBuilder] = None
         self._prod_plan_with_gaps_builder: t.Optional[PlanBuilder] = None
         self._check_run_mapping: t.Dict[str, CheckRun] = {}
-        self._console = MarkdownConsole(console=Console(no_color=True))
+
+        if not isinstance(get_console(), MarkdownConsole):
+            raise CICDBotError("Console must be a markdown console.")
+        self._console = t.cast(MarkdownConsole, get_console())
+
         self._client: Github = client or Github(
             base_url=os.environ["GITHUB_API_URL"],
             login_or_token=self._token,
@@ -323,11 +326,7 @@ class GithubController:
             if review.state.lower() == "approved"
         }
         logger.debug(f"Approvers: {', '.join(self._approvers)}")
-        self._context: Context = Context(
-            paths=self._paths,
-            config=self.config,
-            console=self._console,
-        )
+        self._context: Context = Context(paths=self._paths, config=self.config)
 
     @property
     def deploy_command_enabled(self) -> bool:
@@ -392,6 +391,7 @@ class GithubController:
             self._pr_plan_builder = self._context.plan_builder(
                 environment=self.pr_environment_name,
                 skip_tests=True,
+                skip_linter=True,
                 categorizer_config=self.bot_config.auto_categorize_changes,
                 start=self.bot_config.default_pr_start,
                 skip_backfill=self.bot_config.skip_pr_backfill,
@@ -407,6 +407,7 @@ class GithubController:
                 c.PROD,
                 no_gaps=True,
                 skip_tests=True,
+                skip_linter=True,
                 categorizer_config=self.bot_config.auto_categorize_changes,
                 run=self.bot_config.run_on_deploy_to_prod,
             )
@@ -421,6 +422,7 @@ class GithubController:
                 no_gaps=False,
                 no_auto_categorization=True,
                 skip_tests=True,
+                skip_linter=True,
                 run=self.bot_config.run_on_deploy_to_prod,
             )
         assert self._prod_plan_with_gaps_builder
@@ -442,6 +444,10 @@ class GithubController:
     def removed_snapshots(self) -> t.Set[SnapshotId]:
         return set(self.prod_plan_with_gaps.context_diff.removed_snapshots)
 
+    @property
+    def pr_targets_prod_branch(self) -> bool:
+        return self._pull_request.base.ref in self.bot_config.prod_branch_names
+
     @classmethod
     def _append_output(cls, key: str, value: str) -> None:
         """
@@ -455,12 +461,20 @@ class GithubController:
         try:
             # Clear out any output that might exist from prior steps
             self._console.clear_captured_outputs()
-            self._console.show_model_difference_summary(
-                context_diff=plan.context_diff,
-                environment_naming_info=plan.environment_naming_info,
-                default_catalog=self._context.default_catalog,
-                no_diff=False,
-            )
+            if plan.restatements:
+                self._console._print("\n**Restating models**\n")
+            else:
+                self._console.show_environment_difference_summary(
+                    context_diff=plan.context_diff,
+                    no_diff=False,
+                )
+            if plan.context_diff.has_changes:
+                self._console.show_model_difference_summary(
+                    context_diff=plan.context_diff,
+                    environment_naming_info=plan.environment_naming_info,
+                    default_catalog=self._context.default_catalog,
+                    no_diff=False,
+                )
             difference_summary = self._console.consume_captured_output()
             self._console._show_missing_dates(plan, self._context.default_catalog)
             missing_dates = self._console.consume_captured_output()
@@ -474,7 +488,14 @@ class GithubController:
         """
         Run tests for the PR
         """
-        return self._context._run_tests(verbose=True)
+        return self._context._run_tests(verbosity=Verbosity.VERBOSE)
+
+    def run_linter(self) -> None:
+        """
+        Run linter for the PR
+        """
+        self._console.clear_captured_outputs()
+        self._context.lint_models()
 
     def _get_or_create_comment(self, header: str = BOT_HEADER_MSG) -> IssueComment:
         comment = seq_get(
@@ -652,6 +673,37 @@ class GithubController:
             full_summary=summary,
         )
 
+    def update_linter_check(
+        self,
+        status: GithubCheckStatus,
+        conclusion: t.Optional[GithubCheckConclusion] = None,
+    ) -> None:
+        if not self._context.config.linter.enabled:
+            return
+
+        def conclusion_handler(
+            conclusion: GithubCheckConclusion,
+        ) -> t.Tuple[GithubCheckConclusion, str, t.Optional[str]]:
+            linter_summary = self._console.consume_captured_output() or "Linter Success"
+
+            title = "Linter results"
+
+            return conclusion, title, linter_summary
+
+        self._update_check_handler(
+            check_name="SQLMesh - Linter",
+            status=status,
+            conclusion=conclusion,
+            status_handler=lambda status: (
+                {
+                    GithubCheckStatus.IN_PROGRESS: "Running linter",
+                    GithubCheckStatus.QUEUED: "Waiting to Run linter",
+                }[status],
+                None,
+            ),
+            conclusion_handler=conclusion_handler,
+        )
+
     def update_test_check(
         self,
         status: GithubCheckStatus,
@@ -674,7 +726,7 @@ class GithubController:
                 self._console.log_test_results(
                     result,
                     output,
-                    self._context._test_connection_config._engine_adapter.DIALECT,
+                    self._context.test_connection_config._engine_adapter.DIALECT,
                 )
                 test_summary = self._console.consume_captured_output()
                 test_title = "Tests Passed" if result.wasSuccessful() else "Tests Failed"
@@ -749,7 +801,7 @@ class GithubController:
         Updates the status of the merge commit for the PR environment.
         """
         conclusion: t.Optional[GithubCheckConclusion] = None
-        if isinstance(exception, (NoChangesPlanError, TestFailure)):
+        if isinstance(exception, (NoChangesPlanError, TestFailure, LinterError)):
             conclusion = GithubCheckConclusion.SKIPPED
         elif isinstance(exception, UncategorizedPlanError):
             conclusion = GithubCheckConclusion.ACTION_REQUIRED

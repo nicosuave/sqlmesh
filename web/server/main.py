@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator:
 
     app.state.dispatch_task.cancel()
     app.state.watch_task.cancel()
-    context = await get_context_or_raise(settings=get_settings())
+    context = get_context_or_raise(settings=get_settings())
     context.close()
 
 
@@ -75,7 +75,11 @@ def create_app() -> FastAPI:
         StaticFiles(directory=WEB_DIRECTORY / "client/dist/assets", check_dir=False),
         name="assets",
     )
-
+    app.mount(
+        "/css",
+        StaticFiles(directory=WEB_DIRECTORY / "client/dist/css", check_dir=False),
+        name="css",
+    )
     app.mount(
         "/favicons",
         StaticFiles(directory=WEB_DIRECTORY / "client/dist/favicons", check_dir=False),

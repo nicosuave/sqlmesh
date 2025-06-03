@@ -29,9 +29,11 @@ from sqlmesh.core.snapshot import Snapshot as Snapshot
 from sqlmesh.core.snapshot.evaluator import (
     CustomMaterialization as CustomMaterialization,
 )
+from sqlmesh.core.model.kind import CustomKind as CustomKind
 from sqlmesh.utils import (
     debug_mode_enabled as debug_mode_enabled,
     enable_debug_mode as enable_debug_mode,
+    str_to_bool,
 )
 from sqlmesh.utils.date import DatetimeRanges as DatetimeRanges
 
@@ -53,6 +55,7 @@ class RuntimeEnv(str, Enum):
     GOOGLE_COLAB = "google_colab"  # Not currently officially supported
     JUPYTER = "jupyter"
     DEBUGGER = "debugger"
+    CI = "ci"  # CI or other envs that shouldn't use emojis
 
     @classmethod
     def get(cls) -> RuntimeEnv:
@@ -61,6 +64,16 @@ class RuntimeEnv(str, Enum):
 
         Unlike the rich implementation we try to split out by notebook type instead of treating it all as Jupyter.
         """
+        runtime_env_var = os.getenv("SQLMESH_RUNTIME_ENVIRONMENT")
+        if runtime_env_var:
+            try:
+                return RuntimeEnv(runtime_env_var)
+            except ValueError:
+                valid_values = [f'"{member.value}"' for member in RuntimeEnv]
+                raise ValueError(
+                    f"Invalid SQLMESH_RUNTIME_ENVIRONMENT value: {runtime_env_var}. Must be one of {', '.join(valid_values)}."
+                )
+
         try:
             shell = get_ipython()  # type: ignore
             if os.getenv("DATABRICKS_RUNTIME_VERSION"):
@@ -74,6 +87,10 @@ class RuntimeEnv(str, Enum):
 
         if debug_mode_enabled():
             return RuntimeEnv.DEBUGGER
+
+        if is_cicd_environment() or not is_interactive_environment():
+            return RuntimeEnv.CI
+
         return RuntimeEnv.TERMINAL
 
     @property
@@ -93,8 +110,23 @@ class RuntimeEnv(str, Enum):
         return self == RuntimeEnv.GOOGLE_COLAB
 
     @property
+    def is_ci(self) -> bool:
+        return self == RuntimeEnv.CI
+
+    @property
     def is_notebook(self) -> bool:
-        return not self.is_terminal
+        return not self.is_terminal and not self.is_ci
+
+
+def is_cicd_environment() -> bool:
+    for key in ("CI", "GITHUB_ACTIONS", "TRAVIS", "CIRCLECI", "GITLAB_CI", "BUILDKITE"):
+        if str_to_bool(os.environ.get(key, "false")):
+            return True
+    return False
+
+
+def is_interactive_environment() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
 
 
 if RuntimeEnv.get().is_notebook:
@@ -134,14 +166,30 @@ class CustomFormatter(logging.Formatter):
         return formatter.format(record)
 
 
+def remove_excess_logs(
+    log_file_dir: t.Optional[t.Union[str, Path]] = None,
+    log_limit: int = c.DEFAULT_LOG_LIMIT,
+) -> None:
+    if log_limit <= 0:
+        return
+
+    log_file_dir = log_file_dir or c.DEFAULT_LOG_FILE_DIR
+    log_path_prefix = Path(log_file_dir) / LOG_FILENAME_PREFIX
+
+    for path in list(sorted(glob.glob(f"{log_path_prefix}*.log"), reverse=True))[log_limit:]:
+        os.remove(path)
+
+
 def configure_logging(
     force_debug: bool = False,
-    ignore_warnings: bool = False,
     write_to_stdout: bool = False,
     write_to_file: bool = True,
-    log_limit: int = c.DEFAULT_LOG_LIMIT,
     log_file_dir: t.Optional[t.Union[str, Path]] = None,
+    ignore_warnings: bool = False,
 ) -> None:
+    # Remove noisy grpc logs that are not useful for users
+    os.environ["GRPC_VERBOSITY"] = os.environ.get("GRPC_VERBOSITY", "NONE")
+
     logger = logging.getLogger()
     debug = force_debug or debug_mode_enabled()
 
@@ -149,37 +197,36 @@ def configure_logging(
     level = logging.DEBUG if debug else logging.INFO
     logger.setLevel(level)
 
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setFormatter(CustomFormatter())
-    stdout_handler.setLevel(
-        level if write_to_stdout else (logging.ERROR if ignore_warnings else logging.WARNING)
-    )
-    logger.addHandler(stdout_handler)
+    if write_to_stdout:
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        stdout_handler.setFormatter(CustomFormatter())
+        stdout_handler.setLevel(logging.ERROR if ignore_warnings else level)
+        logger.addHandler(stdout_handler)
 
     log_file_dir = log_file_dir or c.DEFAULT_LOG_FILE_DIR
     log_path_prefix = Path(log_file_dir) / LOG_FILENAME_PREFIX
+
     if write_to_file:
         os.makedirs(str(log_file_dir), exist_ok=True)
         filename = f"{log_path_prefix}{datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}.log"
         file_handler = logging.FileHandler(filename, mode="w", encoding="utf-8")
+
         # the log files should always log at least info so that users will always have
         # minimal info for debugging even if they specify "ignore_warnings"
         file_handler.setLevel(level)
         file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
         logger.addHandler(file_handler)
 
-    if log_limit > 0:
-        for path in list(sorted(glob.glob(f"{log_path_prefix}*.log"), reverse=True))[log_limit:]:
-            os.remove(path)
-
     if debug:
-        from signal import SIGUSR1
         import faulthandler
 
         enable_debug_mode()
 
         # Enable threadumps.
         faulthandler.enable()
+
         # Windows doesn't support register so we check for it here
         if hasattr(faulthandler, "register"):
+            from signal import SIGUSR1
+
             faulthandler.register(SIGUSR1.value)

@@ -9,10 +9,23 @@ from sqlmesh.utils.date import yesterday_ds
 
 
 def generate_dlt_models_and_settings(
-    pipeline_name: str, dialect: str, tables: t.Optional[t.List[str]] = None
-) -> t.Tuple[t.Set[t.Tuple[str, str]], str, str]:
-    """This function attaches to a DLT pipeline and retrieves the connection configs and
+    pipeline_name: str,
+    dialect: str,
+    tables: t.Optional[t.List[str]] = None,
+    dlt_path: t.Optional[str] = None,
+) -> t.Tuple[t.Set[t.Tuple[str, str]], t.Optional[str], str]:
+    """
+    This function attaches to a DLT pipeline and retrieves the connection configs and
     SQLMesh models based on the tables present in the pipeline's default schema.
+
+    Args:
+        pipeline_name: The name of the DLT pipeline to attach to.
+        dialect: The SQL dialect to use for generating SQLMesh models.
+        tables: A list of table names to include.
+        dlt_path: The path to the directory containing the DLT pipelines.
+
+    Returns:
+        A tuple containing a set of the SQLMesh model definitions, the connection config and the start date.
     """
 
     import dlt
@@ -20,25 +33,36 @@ def generate_dlt_models_and_settings(
     from dlt.pipeline.exceptions import CannotRestorePipelineException
 
     try:
-        pipeline = dlt.attach(pipeline_name=pipeline_name)
+        pipeline = dlt.attach(pipeline_name=pipeline_name, pipelines_dir=dlt_path or "")
     except CannotRestorePipelineException:
         raise click.ClickException(f"Could not attach to pipeline {pipeline_name}")
 
     schema = pipeline.default_schema
     dataset = pipeline.dataset_name
 
-    client = pipeline._sql_job_client(schema)
-    config = client.config
-    credentials = config.credentials
-    db_type = pipeline.destination.to_name(pipeline.destination)
+    # Get the start date from the load_ids
     storage_ids = list(pipeline._get_load_storage().list_loaded_packages())
-    configs = {
-        key: value
-        for key in dir(credentials)
-        if not key.startswith("_")
-        and not callable(value := getattr(credentials, key))
-        and value is not None
-    }
+    start_date = get_start_date(storage_ids)
+
+    # Get the connection credentials
+    db_type = pipeline.destination.to_name(pipeline.destination)
+    if db_type == "filesystem":
+        connection_config = None
+    else:
+        if dlt.__version__ >= "1.10.0":
+            client = pipeline.destination_client()
+        else:
+            client = pipeline._sql_job_client(schema)  # type: ignore
+        config = client.config
+        credentials = config.credentials
+        configs = {
+            key: value
+            for key in dir(credentials)
+            if not key.startswith("_")
+            and not callable(value := getattr(credentials, key))
+            and value is not None
+        }
+        connection_config = format_config(configs, db_type)
 
     dlt_tables = {
         name: table
@@ -61,8 +85,29 @@ def generate_dlt_models_and_settings(
             if col.get("primary_key"):
                 primary_key.append(str(col["name"]))
 
+        load_id = next(
+            (col for col in ["_dlt_load_id", "load_id"] if col in dlt_columns),
+            None,
+        )
+        load_key = "c." + load_id if load_id else ""
+        parent_table = None
+
+        # Handling for nested tables: https://dlthub.com/docs/general-usage/destination-tables#nested-tables
+        if not load_id:
+            if (
+                "_dlt_parent_id" in dlt_columns
+                and (parent_table := table["parent"])
+                and parent_table in dlt_tables
+            ):
+                load_key = "p._dlt_load_id"
+                parent_table = dataset + "." + parent_table
+            else:
+                break
+
         column_types = [
-            exp.cast(column, data_type, dialect=dialect).as_(column).sql(dialect=dialect)
+            exp.cast(exp.column(column, table="c"), data_type, dialect=dialect)
+            .as_(column)
+            .sql(dialect=dialect)
             for column, data_type in dlt_columns.items()
             if isinstance(column, str)
         ]
@@ -72,22 +117,26 @@ def generate_dlt_models_and_settings(
 
         grain = f"\n  grain ({', '.join(primary_key)})," if primary_key else ""
         incremental_model_name = f"{dataset}_sqlmesh.incremental_{table_name}"
-
         incremental_model_sql = generate_incremental_model(
             incremental_model_name,
             select_columns,
             grain,
             dataset + "." + table_name,
             dialect,
+            load_key,
+            parent_table,
         )
-
         sqlmesh_models.add((incremental_model_name, incremental_model_sql))
 
-    return sqlmesh_models, format_config(configs, db_type), get_start_date(storage_ids)
+    return sqlmesh_models, connection_config, start_date
 
 
 def generate_dlt_models(
-    context: Context, pipeline_name: str, tables: t.List[str], force: bool
+    context: Context,
+    pipeline_name: str,
+    tables: t.List[str],
+    force: bool,
+    dlt_path: t.Optional[str] = None,
 ) -> t.List[str]:
     from sqlmesh.cli.example_project import _create_models
 
@@ -95,6 +144,7 @@ def generate_dlt_models(
         pipeline_name=pipeline_name,
         dialect=context.config.dialect or "",
         tables=tables if tables else None,
+        dlt_path=dlt_path,
     )
 
     if not tables and not force:
@@ -113,11 +163,19 @@ def generate_incremental_model(
     grain: str,
     from_table: str,
     dialect: str,
+    load_id: str,
+    parent_table: t.Optional[str] = None,
 ) -> str:
     """Generate the SQL definition for an incremental model."""
 
-    load_id = "load_id" if from_table.endswith("_dlt_loads") else "_dlt_load_id"
     time_column = parse_one(f"to_timestamp(CAST({load_id} AS DOUBLE))").sql(dialect=dialect)
+
+    from_clause = f"{from_table} as c"
+    if parent_table:
+        from_clause += f"""\nJOIN
+  {parent_table} as p
+ON
+  c._dlt_parent_id = p._dlt_id"""
 
     return f"""MODEL (
   name {model_name},
@@ -130,7 +188,7 @@ SELECT
 {select_columns},
   {time_column} as _dlt_load_time
 FROM
-  {from_table}
+  {from_clause}
 WHERE
   {time_column} BETWEEN @start_ds AND @end_ds
 """
@@ -170,5 +228,4 @@ def get_start_date(load_ids: t.List[str]) -> str:
     if timestamps:
         start_timestamp = min(timestamps) - timedelta(days=1)
         return start_timestamp.strftime("%Y-%m-%d")
-    else:
-        return yesterday_ds()
+    return yesterday_ds()

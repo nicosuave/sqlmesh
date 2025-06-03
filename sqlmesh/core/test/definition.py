@@ -1,19 +1,17 @@
 from __future__ import annotations
 
 import datetime
+import threading
 import typing as t
 import unittest
 from collections import Counter
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import nullcontext, contextmanager, AbstractContextManager
 from itertools import chain
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-import pandas as pd
 from io import StringIO
-from freezegun import freeze_time
-from pandas.api.types import is_object_dtype
 from sqlglot import Dialect, exp
 from sqlglot.optimizer.annotate_types import annotate_types
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
@@ -24,14 +22,17 @@ from sqlmesh.core.engine_adapter import EngineAdapter
 from sqlmesh.core.macros import RuntimeStage
 from sqlmesh.core.model import Model, PythonModel, SqlModel
 from sqlmesh.utils import UniqueKeyDict, random_id, type_is_known, yaml
-from sqlmesh.utils.date import date_dict, pandas_timestamp_to_pydatetime
+from sqlmesh.utils.date import date_dict, pandas_timestamp_to_pydatetime, to_datetime
 from sqlmesh.utils.errors import ConfigError, TestError
 from sqlmesh.utils.yaml import load as yaml_load
 
 if t.TYPE_CHECKING:
+    import pandas as pd
+
     from sqlglot.dialects.dialect import DialectType
 
     Row = t.Dict[str, t.Any]
+
 
 TIME_KWARG_KEYS = {
     "start",
@@ -46,6 +47,8 @@ TIME_KWARG_KEYS = {
 class ModelTest(unittest.TestCase):
     __test__ = False
 
+    CONCURRENT_RENDER_LOCK = threading.Lock()
+
     def __init__(
         self,
         body: t.Dict[str, t.Any],
@@ -57,6 +60,7 @@ class ModelTest(unittest.TestCase):
         path: Path | None = None,
         preserve_fixtures: bool = False,
         default_catalog: str | None = None,
+        concurrency: bool = False,
     ) -> None:
         """ModelTest encapsulates a unit test for a model.
 
@@ -79,6 +83,7 @@ class ModelTest(unittest.TestCase):
         self.preserve_fixtures = preserve_fixtures
         self.default_catalog = default_catalog
         self.dialect = dialect
+        self.concurrency = concurrency
 
         self._fixture_table_cache: t.Dict[str, exp.Table] = {}
         self._normalized_column_name_cache: t.Dict[str, str] = {}
@@ -105,15 +110,27 @@ class ModelTest(unittest.TestCase):
         self._transforms = self._test_adapter_dialect.generator_class.TRANSFORMS
         self._execution_time = str(self.body.get("vars", {}).get("execution_time") or "")
 
+        if self._execution_time:
+            # Normalizes the execution time by converting it into UTC timezone
+            self._execution_time = str(to_datetime(self._execution_time))
+
         # When execution_time is set, we mock the CURRENT_* SQL expressions so they always return it
         if self._execution_time:
             exec_time = exp.Literal.string(self._execution_time)
             self._transforms = {
                 **self._transforms,
-                exp.CurrentDate: lambda self, _: self.sql(exp.cast(exec_time, "date")),
-                exp.CurrentDatetime: lambda self, _: self.sql(exp.cast(exec_time, "datetime")),
-                exp.CurrentTime: lambda self, _: self.sql(exp.cast(exec_time, "time")),
-                exp.CurrentTimestamp: lambda self, _: self.sql(exp.cast(exec_time, "timestamp")),
+                exp.CurrentDate: lambda self, _: self.sql(
+                    exp.cast(exec_time, "date", dialect=dialect)
+                ),
+                exp.CurrentDatetime: lambda self, _: self.sql(
+                    exp.cast(exec_time, "datetime", dialect=dialect)
+                ),
+                exp.CurrentTime: lambda self, _: self.sql(
+                    exp.cast(exec_time, "time", dialect=dialect)
+                ),
+                exp.CurrentTimestamp: lambda self, _: self.sql(
+                    exp.cast(exec_time, "timestamp", dialect=dialect)
+                ),
             }
 
         super().__init__()
@@ -190,6 +207,9 @@ class ModelTest(unittest.TestCase):
         partial: t.Optional[bool] = False,
     ) -> None:
         """Compare two DataFrames"""
+        import pandas as pd
+        from pandas.api.types import is_object_dtype
+
         if partial:
             intersection = actual[actual.columns.intersection(expected.columns)]
             if len(intersection.columns) > 0:
@@ -219,13 +239,21 @@ class ModelTest(unittest.TestCase):
             if is_object_dtype(actual_types[col]) and len(actual[col]) != 0
         }
         for col, value in object_sentinel_values.items():
-            # can't use `isinstance()` here - https://stackoverflow.com/a/68743663/1707525
-            if type(value) is datetime.date:
-                expected[col] = pd.to_datetime(expected[col], errors="ignore").dt.date  # type: ignore
-            elif type(value) is datetime.time:
-                expected[col] = pd.to_datetime(expected[col], errors="ignore").dt.time  # type: ignore
-            elif type(value) is datetime.datetime:
-                expected[col] = pd.to_datetime(expected[col], errors="ignore").dt.to_pydatetime()  # type: ignore
+            try:
+                # can't use `isinstance()` here - https://stackoverflow.com/a/68743663/1707525
+                if type(value) is datetime.date:
+                    expected[col] = pd.to_datetime(expected[col]).dt.date
+                elif type(value) is datetime.time:
+                    expected[col] = pd.to_datetime(expected[col]).dt.time
+                elif type(value) is datetime.datetime:
+                    expected[col] = pd.to_datetime(expected[col]).dt.to_pydatetime()
+            except Exception as e:
+                from sqlmesh.core.console import get_console
+
+                get_console().log_warning(
+                    f"Failed to convert expected value for {col} into `datetime` "
+                    f"for unit test '{str(self)}'. {str(e)}."
+                )
 
         actual = actual.replace({np.nan: None})
         expected = expected.replace({np.nan: None})
@@ -290,7 +318,8 @@ class ModelTest(unittest.TestCase):
         path: Path | None,
         preserve_fixtures: bool = False,
         default_catalog: str | None = None,
-    ) -> ModelTest:
+        concurrency: bool = False,
+    ) -> t.Optional[ModelTest]:
         """Create a SqlModelTest or a PythonModelTest.
 
         Args:
@@ -309,7 +338,12 @@ class ModelTest(unittest.TestCase):
         name = normalize_model_name(name, default_catalog=default_catalog, dialect=dialect)
         model = models.get(name)
         if not model:
-            _raise_error(f"Model '{name}' was not found", path)
+            from sqlmesh.core.console import get_console
+
+            get_console().log_warning(
+                f"Model '{name}' was not found{' at ' + str(path) if path else ''}"
+            )
+            return None
 
         if isinstance(model, SqlModel):
             test_type: t.Type[ModelTest] = SqlModelTest
@@ -318,17 +352,21 @@ class ModelTest(unittest.TestCase):
         else:
             _raise_error(f"Model '{name}' is an unsupported model type for testing", path)
 
-        return test_type(
-            body,
-            test_name,
-            t.cast(Model, model),
-            models,
-            engine_adapter,
-            dialect,
-            path,
-            preserve_fixtures,
-            default_catalog,
-        )
+        try:
+            return test_type(
+                body,
+                test_name,
+                t.cast(Model, model),
+                models,
+                engine_adapter,
+                dialect,
+                path,
+                preserve_fixtures,
+                default_catalog,
+                concurrency,
+            )
+        except Exception as e:
+            raise TestError(f"Failed to create test {test_name} ({path})\n{str(e)}")
 
     def __str__(self) -> str:
         return f"{self.test_name} ({self.path})"
@@ -350,6 +388,8 @@ class ModelTest(unittest.TestCase):
             partial: bool = False,
             dialect: DialectType = None,
         ) -> t.Dict:
+            import pandas as pd
+
             if not isinstance(values, dict):
                 values = {"rows": values}
 
@@ -487,10 +527,34 @@ class ModelTest(unittest.TestCase):
 
         return normalized_name
 
-    def _execute(self, query: exp.Query) -> pd.DataFrame:
+    @contextmanager
+    def _concurrent_render_context(self) -> t.Iterator[None]:
+        """
+        Context manager that ensures that the tests are executed safely in a concurrent environment.
+        This is needed in case `execution_time` is set, as we'd then have to:
+        - Freeze time through `time_machine` (not thread safe)
+        - Globally patch the SQLGlot dialect so that any date/time nodes are evaluated at the `execution_time` during generation
+        """
+        import time_machine
+
+        lock_ctx: AbstractContextManager = (
+            self.CONCURRENT_RENDER_LOCK if self.concurrency else nullcontext()
+        )
+        time_ctx: AbstractContextManager = nullcontext()
+        dialect_patch_ctx: AbstractContextManager = nullcontext()
+
+        if self._execution_time:
+            time_ctx = time_machine.travel(self._execution_time, tick=False)
+            dialect_patch_ctx = patch.dict(
+                self._test_adapter_dialect.generator_class.TRANSFORMS, self._transforms
+            )
+
+        with lock_ctx, time_ctx, dialect_patch_ctx:
+            yield
+
+    def _execute(self, query: exp.Query | str) -> pd.DataFrame:
         """Executes the given query using the testing engine adapter and returns a DataFrame."""
-        with patch.dict(self._test_adapter_dialect.generator_class.TRANSFORMS, self._transforms):
-            return self.engine_adapter.fetchdf(query)
+        return self.engine_adapter.fetchdf(query)
 
     def _create_df(
         self,
@@ -498,9 +562,14 @@ class ModelTest(unittest.TestCase):
         columns: t.Optional[t.Collection] = None,
         partial: t.Optional[bool] = False,
     ) -> pd.DataFrame:
+        import pandas as pd
+
         query = values.get("query")
         if query:
-            return self._execute(self._add_missing_columns(query, columns))
+            if not partial:
+                query = self._add_missing_columns(query, columns)
+
+            return self._execute(query)
 
         rows = values["rows"]
         if columns:
@@ -545,13 +614,25 @@ class SqlModelTest(ModelTest):
                 for alias, cte in ctes.items():
                     cte_query = cte_query.with_(alias, cte.this, recursive=recursive)
 
-                actual = self._execute(cte_query)
+                with self._concurrent_render_context():
+                    # Similar to the model's query, we render the CTE query under the locked context
+                    # so that the execution (fetchdf) can continue concurrently between the threads
+                    sql = cte_query.sql(
+                        self._test_adapter_dialect, pretty=self.engine_adapter._pretty_sql
+                    )
+
+                actual = self._execute(sql)
                 expected = self._create_df(values, columns=cte_query.named_selects, partial=partial)
 
                 self.assert_equal(expected, actual, sort=sort, partial=partial)
 
     def runTest(self) -> None:
-        query = self._render_model_query()
+        with self._concurrent_render_context():
+            # Render the model's query and generate the SQL under the locked context so that
+            # execution (fetchdf) can continue concurrently between the threads
+            query = self._render_model_query()
+            sql = query.sql(self._test_adapter_dialect, pretty=self.engine_adapter._pretty_sql)
+
         with_clause = query.args.get("with")
 
         if with_clause:
@@ -568,7 +649,7 @@ class SqlModelTest(ModelTest):
             partial = values.get("partial")
             sort = query.args.get("order") is None
 
-            actual = self._execute(query)
+            actual = self._execute(sql)
             expected = self._create_df(values, columns=self.model.columns_to_types, partial=partial)
 
             self.assert_equal(expected, actual, sort=sort, partial=partial)
@@ -601,6 +682,7 @@ class PythonModelTest(ModelTest):
         path: Path | None = None,
         preserve_fixtures: bool = False,
         default_catalog: str | None = None,
+        concurrency: bool = False,
     ) -> None:
         """PythonModelTest encapsulates a unit test for a Python model.
 
@@ -626,6 +708,7 @@ class PythonModelTest(ModelTest):
             path,
             preserve_fixtures,
             default_catalog,
+            concurrency,
         )
 
         self.context = TestExecutionContext(
@@ -649,16 +732,15 @@ class PythonModelTest(ModelTest):
 
     def _execute_model(self) -> pd.DataFrame:
         """Executes the python model and returns a DataFrame."""
-        time_ctx = freeze_time(self._execution_time) if self._execution_time else nullcontext()
-        with patch.dict(self._test_adapter_dialect.generator_class.TRANSFORMS, self._transforms):
-            with t.cast(AbstractContextManager, time_ctx):
-                variables = self.body.get("vars", {}).copy()
-                time_kwargs = {
-                    key: variables.pop(key) for key in TIME_KWARG_KEYS if key in variables
-                }
-                df = next(self.model.render(context=self.context, **time_kwargs, **variables))
-                assert not isinstance(df, exp.Expression)
-                return df if isinstance(df, pd.DataFrame) else df.toPandas()
+        import pandas as pd
+
+        with self._concurrent_render_context():
+            variables = self.body.get("vars", {}).copy()
+            time_kwargs = {key: variables.pop(key) for key in TIME_KWARG_KEYS if key in variables}
+            df = next(self.model.render(context=self.context, **time_kwargs, **variables))
+
+        assert not isinstance(df, exp.Expression)
+        return df if isinstance(df, pd.DataFrame) else df.toPandas()
 
 
 def generate_test(
@@ -733,6 +815,8 @@ def generate_test(
         path=fixture_path,
         default_catalog=model.default_catalog,
     )
+    if not test:
+        return
 
     test.setUp()
 
@@ -818,6 +902,8 @@ def _raise_if_unexpected_columns(
 
 def _row_difference(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
     """Returns all rows in `left` that don't appear in `right`."""
+    import pandas as pd
+
     rows_missing_from_right = []
 
     # `None` replaces `np.nan` because `np.nan != np.nan` and this would affect the mapping lookup
@@ -836,8 +922,8 @@ def _row_difference(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
 
 def _raise_error(msg: str, path: Path | None = None) -> None:
     if path:
-        raise TestError(f"{msg} at {path}")
-    raise TestError(msg)
+        raise TestError(f"Failed to run test at {path}:\n{msg}")
+    raise TestError(f"Failed to run test:\n{msg}")
 
 
 def _normalize_df_value(value: t.Any) -> t.Any:

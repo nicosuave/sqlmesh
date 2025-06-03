@@ -9,12 +9,16 @@ from unittest.mock import patch
 import pytest
 from dbt.adapters.base import BaseRelation
 from dbt.exceptions import CompilationError
-from freezegun import freeze_time
+import time_machine
 from pytest_mock.plugin import MockerFixture
-from sqlglot import exp
+from sqlglot import exp, parse_one
 from sqlmesh.core import dialect as d
+from sqlmesh.core.environment import EnvironmentNamingInfo
+from sqlmesh.core.macros import RuntimeStage
+from sqlmesh.core.renderer import render_statements
 from sqlmesh.core.audit import StandaloneAudit
 from sqlmesh.core.context import Context
+from sqlmesh.core.console import get_console
 from sqlmesh.core.model import (
     EmbeddedKind,
     FullKind,
@@ -26,7 +30,7 @@ from sqlmesh.core.model import (
     ViewKind,
 )
 from sqlmesh.core.model.kind import SCDType2ByColumnKind, SCDType2ByTimeKind
-from sqlmesh.core.state_sync.engine_adapter import _snapshot_to_json
+from sqlmesh.core.state_sync.db.snapshot import _snapshot_to_json
 from sqlmesh.dbt.builtin import _relation_info_to_relation
 from sqlmesh.dbt.column import (
     ColumnConfig,
@@ -73,8 +77,7 @@ def test_materialization():
     context.project_name = "Test"
     context.target = DuckDbConfig(name="target", schema="foo")
 
-    logger = logging.getLogger("sqlmesh.dbt.model")
-    with patch.object(logger, "warning") as mock_logger:
+    with patch.object(get_console(), "log_warning") as mock_logger:
         model_config = ModelConfig(
             name="model", alias="model", schema="schema", materialized="materialized_view"
         )
@@ -170,6 +173,24 @@ def test_model_kind():
         unique_key=["bar"], dialect="duckdb", forward_only=True, disable_restatement=False
     )
 
+    dbt_incremental_predicate = "DBT_INTERNAL_DEST.session_start > dateadd(day, -7, current_date)"
+    expected_sqlmesh_predicate = parse_one(
+        "__MERGE_TARGET__.session_start > DATEADD(day, -7, CURRENT_DATE)"
+    )
+    ModelConfig(
+        materialized=Materialization.INCREMENTAL,
+        unique_key=["bar"],
+        incremental_strategy="merge",
+        dialect="postgres",
+        merge_filter=[dbt_incremental_predicate],
+    ).model_kind(context) == IncrementalByUniqueKeyKind(
+        unique_key=["bar"],
+        dialect="postgres",
+        forward_only=True,
+        disable_restatement=False,
+        merge_filter=expected_sqlmesh_predicate,
+    )
+
     assert ModelConfig(materialized=Materialization.INCREMENTAL, unique_key=["bar"]).model_kind(
         context
     ) == IncrementalByUniqueKeyKind(
@@ -208,8 +229,13 @@ def test_model_kind():
         unique_key=["bar"],
         disable_restatement=True,
         full_refresh=False,
+        auto_restatement_cron="0 0 * * *",
     ).model_kind(context) == IncrementalByUniqueKeyKind(
-        unique_key=["bar"], dialect="duckdb", forward_only=True, disable_restatement=True
+        unique_key=["bar"],
+        dialect="duckdb",
+        forward_only=True,
+        disable_restatement=True,
+        auto_restatement_cron="0 0 * * *",
     )
 
     assert ModelConfig(
@@ -237,6 +263,22 @@ def test_model_kind():
 
     assert ModelConfig(
         materialized=Materialization.INCREMENTAL,
+        time_column="foo",
+        incremental_strategy="insert_overwrite",
+        partition_by={"field": "bar"},
+        forward_only=False,
+        auto_restatement_cron="0 0 * * *",
+        auto_restatement_intervals=3,
+    ).model_kind(context) == IncrementalByTimeRangeKind(
+        time_column="foo",
+        dialect="duckdb",
+        forward_only=False,
+        auto_restatement_cron="0 0 * * *",
+        auto_restatement_intervals=3,
+    )
+
+    assert ModelConfig(
+        materialized=Materialization.INCREMENTAL,
         incremental_strategy="insert_overwrite",
         partition_by={"field": "bar"},
     ).model_kind(context) == IncrementalUnmanagedKind(
@@ -246,6 +288,12 @@ def test_model_kind():
     assert ModelConfig(materialized=Materialization.INCREMENTAL).model_kind(
         context
     ) == IncrementalUnmanagedKind(insert_overwrite=True, disable_restatement=False)
+
+    assert ModelConfig(materialized=Materialization.INCREMENTAL, forward_only=False).model_kind(
+        context
+    ) == IncrementalUnmanagedKind(
+        insert_overwrite=True, disable_restatement=False, forward_only=False
+    )
 
     assert ModelConfig(
         materialized=Materialization.INCREMENTAL, incremental_strategy="append"
@@ -289,6 +337,14 @@ def test_model_kind():
         disable_restatement=True,
     ).model_kind(context) == IncrementalUnmanagedKind(
         insert_overwrite=True, disable_restatement=True
+    )
+
+    assert ModelConfig(
+        materialized=Materialization.INCREMENTAL,
+        incremental_strategy="insert_overwrite",
+        auto_restatement_cron="0 0 * * *",
+    ).model_kind(context) == IncrementalUnmanagedKind(
+        insert_overwrite=True, auto_restatement_cron="0 0 * * *", disable_restatement=False
     )
 
     assert (
@@ -828,9 +884,7 @@ def test_modules(sushi_test_project: Project):
     assert context.render("{{ modules.re.search('(?<=abc)def', 'abcdef').group(0) }}") == "def"
 
     # itertools
-    itertools_jinja = (
-        "{% for num in modules.itertools.accumulate([5]) %}" "{{ num }}" "{% endfor %}"
-    )
+    itertools_jinja = "{% for num in modules.itertools.accumulate([5]) %}{{ num }}{% endfor %}"
     assert context.render(itertools_jinja) == "5"
 
 
@@ -867,7 +921,7 @@ def test_column(sushi_test_project: Project):
     assert context.render("{{ api.Column }}") == "<class 'dbt.adapters.base.column.Column'>"
 
     jinja = (
-        "{% set col = api.Column('foo', 'integer') %}" "{{ col.is_integer() }} {{ col.is_string()}}"
+        "{% set col = api.Column('foo', 'integer') %}{{ col.is_integer() }} {{ col.is_string()}}"
     )
 
     assert context.render(jinja) == "True False"
@@ -948,6 +1002,45 @@ def test_dbt_version(sushi_test_project: Project):
     context = sushi_test_project.context
 
     assert context.render("{{ dbt_version }}").startswith("1.")
+
+
+@pytest.mark.xdist_group("dbt_manifest")
+def test_dbt_on_run_start_end(sushi_test_project: Project):
+    # Validate perservation of dbt's order of execution
+    assert sushi_test_project.packages["sushi"].on_run_start["sushi-on-run-start-0"].index == 0
+    assert sushi_test_project.packages["sushi"].on_run_start["sushi-on-run-start-1"].index == 1
+    assert sushi_test_project.packages["sushi"].on_run_end["sushi-on-run-end-0"].index == 0
+    assert sushi_test_project.packages["sushi"].on_run_end["sushi-on-run-end-1"].index == 1
+    assert (
+        sushi_test_project.packages["customers"].on_run_start["customers-on-run-start-0"].index == 0
+    )
+    assert (
+        sushi_test_project.packages["customers"].on_run_start["customers-on-run-start-1"].index == 1
+    )
+    assert sushi_test_project.packages["customers"].on_run_end["customers-on-run-end-0"].index == 0
+    assert sushi_test_project.packages["customers"].on_run_end["customers-on-run-end-1"].index == 1
+
+    assert (
+        sushi_test_project.packages["customers"].on_run_start["customers-on-run-start-0"].sql
+        == "CREATE TABLE IF NOT EXISTS to_be_executed_first (col VARCHAR);"
+    )
+    assert (
+        sushi_test_project.packages["customers"].on_run_start["customers-on-run-start-1"].sql
+        == "CREATE TABLE IF NOT EXISTS analytic_stats_packaged_project (physical_table VARCHAR, evaluation_time VARCHAR);"
+    )
+    assert (
+        sushi_test_project.packages["customers"].on_run_end["customers-on-run-end-1"].sql
+        == "{{ packaged_tables(schemas) }}"
+    )
+
+    assert (
+        sushi_test_project.packages["sushi"].on_run_start["sushi-on-run-start-0"].sql
+        == "CREATE TABLE IF NOT EXISTS analytic_stats (physical_table VARCHAR, evaluation_time VARCHAR);"
+    )
+    assert (
+        sushi_test_project.packages["sushi"].on_run_end["sushi-on-run-end-0"].sql
+        == "{{ create_tables(schemas) }}"
+    )
 
 
 @pytest.mark.xdist_group("dbt_manifest")
@@ -1078,10 +1171,37 @@ def test_is_incremental(sushi_test_project: Project, assert_exp_eq, mocker):
 
     snapshot = mocker.Mock()
     snapshot.intervals = [1]
+    snapshot.is_incremental = True
 
     assert_exp_eq(
         model_config.to_sqlmesh(context).render_query_or_raise(snapshot=snapshot).sql(),
         'SELECT 1 AS "one" FROM "tbl_a" AS "tbl_a" WHERE "ds" > (SELECT MAX("ds") FROM "model" AS "model")',
+    )
+
+
+@pytest.mark.xdist_group("dbt_manifest")
+def test_is_incremental_non_incremental_model(sushi_test_project: Project, assert_exp_eq, mocker):
+    model_config = ModelConfig(
+        name="model",
+        package_name="package",
+        schema="sushi",
+        alias="some_table",
+        sql="""
+        SELECT 1 AS one FROM tbl_a
+        {% if is_incremental() %}
+        WHERE ds > (SELECT MAX(ds) FROM model)
+        {% endif %}
+        """,
+    )
+    context = sushi_test_project.context
+
+    snapshot = mocker.Mock()
+    snapshot.intervals = [1]
+    snapshot.is_incremental = False
+
+    assert_exp_eq(
+        model_config.to_sqlmesh(context).render_query_or_raise(snapshot=snapshot).sql(),
+        'SELECT 1 AS "one" FROM "tbl_a" AS "tbl_a"',
     )
 
 
@@ -1186,8 +1306,7 @@ def test_clickhouse_properties(mocker: MockerFixture):
         sql="""SELECT 1 AS one, ds FROM foo""",
     )
 
-    logger = logging.getLogger("sqlmesh.dbt.model")
-    with patch.object(logger, "warning") as mock_logger:
+    with patch.object(get_console(), "log_warning") as mock_logger:
         model_to_sqlmesh = model_config.to_sqlmesh(context)
 
     assert [call[0][0] for call in mock_logger.call_args_list] == [
@@ -1195,7 +1314,7 @@ def test_clickhouse_properties(mocker: MockerFixture):
         "SQLMesh does not support 'incremental_predicates' - they will not be applied.",
         "SQLMesh does not support the 'query_settings' model configuration parameter. Specify the query settings directly in the model query.",
         "SQLMesh does not support the 'sharding_key' model configuration parameter or distributed materializations.",
-        "Using unmanaged incremental materialization for model '%s'. Some features might not be available. Consider adding either a time_column (%s) or a unique_key (%s) configuration to mitigate this",
+        "Using unmanaged incremental materialization for model '`test`.`model`'. Some features might not be available. Consider adding either a time_column ('delete+insert', 'insert_overwrite') or a unique_key ('merge', 'none') configuration to mitigate this.",
     ]
 
     assert [e.sql("clickhouse") for e in model_to_sqlmesh.partitioned_by] == [
@@ -1233,7 +1352,7 @@ def test_snapshot_json_payload():
 
 
 @pytest.mark.xdist_group("dbt_manifest")
-@freeze_time("2023-01-08 00:00:00")
+@time_machine.travel("2023-01-08 00:00:00 UTC")
 def test_dbt_package_macros(sushi_test_project: Project):
     context = sushi_test_project.context
 
@@ -1376,3 +1495,171 @@ def test_refs_in_jinja_globals(sushi_test_project: Project, mocker: MockerFixtur
         "waiter_revenue_by_day",
         "sushi.waiter_revenue_by_day",
     }
+
+
+def test_allow_partials_by_default():
+    context = DbtContext()
+    context._target = SnowflakeConfig(
+        name="target",
+        schema="test",
+        database="test",
+        account="account",
+        user="user",
+        password="password",
+    )
+
+    model = ModelConfig(
+        name="model",
+        alias="model",
+        package_name="package",
+        target_schema="test",
+        sql="SELECT * FROM baz",
+        materialized=Materialization.TABLE.value,
+    )
+    assert model.allow_partials is None
+    assert model.to_sqlmesh(context).allow_partials
+
+    model.materialized = Materialization.INCREMENTAL.value
+    assert model.allow_partials is None
+    assert model.to_sqlmesh(context).allow_partials
+
+    model.allow_partials = True
+    assert model.to_sqlmesh(context).allow_partials
+
+    model.allow_partials = False
+    assert not model.to_sqlmesh(context).allow_partials
+
+
+def test_grain():
+    context = DbtContext()
+    context._target = SnowflakeConfig(
+        name="target",
+        schema="test",
+        database="test",
+        account="account",
+        user="user",
+        password="password",
+    )
+
+    model = ModelConfig(
+        name="model",
+        alias="model",
+        package_name="package",
+        target_schema="test",
+        sql="SELECT * FROM baz",
+        materialized=Materialization.TABLE.value,
+        grain=["id_a", "id_b"],
+    )
+    assert model.to_sqlmesh(context).grains == [exp.to_column("id_a"), exp.to_column("id_b")]
+
+    model.grain = "id_a"
+    assert model.to_sqlmesh(context).grains == [exp.to_column("id_a")]
+
+
+@pytest.mark.xdist_group("dbt_manifest")
+def test_on_run_start_end():
+    sushi_context = Context(paths=["tests/fixtures/dbt/sushi_test"])
+    assert len(sushi_context._environment_statements) == 2
+
+    # Root project's on run start / on run end should be first by checking the macros
+    root_environment_statements = sushi_context._environment_statements[0]
+    assert "create_tables" in root_environment_statements.jinja_macros.root_macros
+
+    # Validate order of execution to be correct
+    assert root_environment_statements.before_all == [
+        "JINJA_STATEMENT_BEGIN;\nCREATE TABLE IF NOT EXISTS analytic_stats (physical_table VARCHAR, evaluation_time VARCHAR);\nJINJA_END;",
+        "JINJA_STATEMENT_BEGIN;\nCREATE TABLE IF NOT EXISTS to_be_executed_last (col VARCHAR);\nJINJA_END;",
+        """JINJA_STATEMENT_BEGIN;\nSELECT {{ var("yet_another_var") }} AS var, '{{ source("raw", "items").identifier }}' AS src, '{{ ref("waiters").identifier }}' AS ref;\nJINJA_END;""",
+        "JINJA_STATEMENT_BEGIN;\n{{ log_value('on-run-start') }}\nJINJA_END;",
+    ]
+    assert root_environment_statements.after_all == [
+        "JINJA_STATEMENT_BEGIN;\n{{ create_tables(schemas) }}\nJINJA_END;",
+        "JINJA_STATEMENT_BEGIN;\nDROP TABLE to_be_executed_last;\nJINJA_END;",
+    ]
+
+    assert root_environment_statements.jinja_macros.root_package_name == "sushi"
+
+    rendered_before_all = render_statements(
+        root_environment_statements.before_all,
+        dialect=sushi_context.default_dialect,
+        python_env=root_environment_statements.python_env,
+        jinja_macros=root_environment_statements.jinja_macros,
+        runtime_stage=RuntimeStage.BEFORE_ALL,
+    )
+
+    rendered_after_all = render_statements(
+        root_environment_statements.after_all,
+        dialect=sushi_context.default_dialect,
+        python_env=root_environment_statements.python_env,
+        jinja_macros=root_environment_statements.jinja_macros,
+        snapshots=sushi_context.snapshots,
+        runtime_stage=RuntimeStage.AFTER_ALL,
+        environment_naming_info=EnvironmentNamingInfo(name="dev"),
+    )
+
+    assert rendered_before_all == [
+        "CREATE TABLE IF NOT EXISTS analytic_stats (physical_table TEXT, evaluation_time TEXT)",
+        "CREATE TABLE IF NOT EXISTS to_be_executed_last (col TEXT)",
+        "SELECT 1 AS var, 'items' AS src, 'waiters' AS ref",
+    ]
+
+    # The jinja macro should have resolved the schemas for this environment and generated corresponding statements
+    assert sorted(rendered_after_all) == sorted(
+        [
+            "CREATE OR REPLACE TABLE schema_table_snapshots__dev AS SELECT 'snapshots__dev' AS schema",
+            "CREATE OR REPLACE TABLE schema_table_sushi__dev AS SELECT 'sushi__dev' AS schema",
+            "DROP TABLE to_be_executed_last",
+        ]
+    )
+
+    # Nested dbt_packages on run start / on run end
+    packaged_environment_statements = sushi_context._environment_statements[1]
+
+    # Validate order of execution to be correct
+    assert packaged_environment_statements.before_all == [
+        "JINJA_STATEMENT_BEGIN;\nCREATE TABLE IF NOT EXISTS to_be_executed_first (col VARCHAR);\nJINJA_END;",
+        "JINJA_STATEMENT_BEGIN;\nCREATE TABLE IF NOT EXISTS analytic_stats_packaged_project (physical_table VARCHAR, evaluation_time VARCHAR);\nJINJA_END;",
+    ]
+    assert packaged_environment_statements.after_all == [
+        "JINJA_STATEMENT_BEGIN;\nDROP TABLE to_be_executed_first\nJINJA_END;",
+        "JINJA_STATEMENT_BEGIN;\n{{ packaged_tables(schemas) }}\nJINJA_END;",
+    ]
+
+    assert "packaged_tables" in packaged_environment_statements.jinja_macros.root_macros
+    assert packaged_environment_statements.jinja_macros.root_package_name == "sushi"
+
+    rendered_before_all = render_statements(
+        packaged_environment_statements.before_all,
+        dialect=sushi_context.default_dialect,
+        python_env=packaged_environment_statements.python_env,
+        jinja_macros=packaged_environment_statements.jinja_macros,
+        runtime_stage=RuntimeStage.BEFORE_ALL,
+    )
+
+    rendered_after_all = render_statements(
+        packaged_environment_statements.after_all,
+        dialect=sushi_context.default_dialect,
+        python_env=packaged_environment_statements.python_env,
+        jinja_macros=packaged_environment_statements.jinja_macros,
+        snapshots=sushi_context.snapshots,
+        runtime_stage=RuntimeStage.AFTER_ALL,
+        environment_naming_info=EnvironmentNamingInfo(name="dev"),
+    )
+
+    # Validate order of execution to match dbt's
+    assert rendered_before_all == [
+        "CREATE TABLE IF NOT EXISTS to_be_executed_first (col TEXT)",
+        "CREATE TABLE IF NOT EXISTS analytic_stats_packaged_project (physical_table TEXT, evaluation_time TEXT)",
+    ]
+
+    # This on run end statement should be executed first
+    assert rendered_after_all[0] == "DROP TABLE to_be_executed_first"
+
+    # The table names is an indication of the rendering of the dbt_packages statements
+    assert sorted(rendered_after_all) == sorted(
+        [
+            "DROP TABLE to_be_executed_first",
+            "CREATE OR REPLACE TABLE schema_table_snapshots__dev_nested_package AS SELECT 'snapshots__dev' AS schema",
+            "CREATE OR REPLACE TABLE schema_table_sushi__dev_nested_package AS SELECT 'sushi__dev' AS schema",
+        ]
+    )

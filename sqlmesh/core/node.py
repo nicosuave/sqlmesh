@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import sys
 import typing as t
+import zoneinfo
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -14,19 +14,15 @@ from sqlmesh.utils.date import TimeLike, to_datetime, validate_date_range
 from sqlmesh.utils.errors import ConfigError
 from sqlmesh.utils.pydantic import (
     PydanticModel,
+    SQLGlotCron,
     field_validator,
     model_validator,
-    model_validator_v1_args,
     PRIVATE_FIELDS,
 )
 
 if t.TYPE_CHECKING:
+    from sqlmesh.core._typing import Self
     from sqlmesh.core.snapshot import Node
-
-    if sys.version_info >= (3, 11):
-        from typing import Self
-    else:
-        from typing_extensions import Self
 
 
 class IntervalUnit(str, Enum):
@@ -182,6 +178,7 @@ class _Node(PydanticModel):
             the date from the scheduler will be used
         cron: A cron string specifying how often the node should be run, leveraging the
             [croniter](https://github.com/kiorky/croniter) library.
+        cron_tz: Time zone for the cron, defaults to utc, [IANA time zones](https://docs.python.org/3/library/zoneinfo.html).
         interval_unit: The duration of an interval for the node. By default, it is computed from the cron expression.
         tags: A list of tags that can be used to filter nodes.
         stamp: An optional arbitrary string sequence used to create new node versions without making
@@ -194,7 +191,8 @@ class _Node(PydanticModel):
     owner: t.Optional[str] = None
     start: t.Optional[TimeLike] = None
     end: t.Optional[TimeLike] = None
-    cron: str = "@daily"
+    cron: SQLGlotCron = "@daily"
+    cron_tz: t.Optional[zoneinfo.ZoneInfo] = None
     interval_unit_: t.Optional[IntervalUnit] = Field(alias="interval_unit", default=None)
     tags: t.List[str] = []
     stamp: t.Optional[str] = None
@@ -231,6 +229,27 @@ class _Node(PydanticModel):
             return v.meta["sql"]
         return str(v)
 
+    @field_validator("cron_tz", mode="before")
+    def _cron_tz_validator(cls, v: t.Any) -> t.Optional[zoneinfo.ZoneInfo]:
+        if not v or v == "UTC":
+            return None
+
+        v = str_or_exp_to_str(v)
+
+        try:
+            return zoneinfo.ZoneInfo(v)
+        except Exception as e:
+            available_timezones = zoneinfo.available_timezones()
+
+            if available_timezones:
+                raise ConfigError(f"{e}. {v} must be in {available_timezones}.")
+            else:
+                raise ConfigError(
+                    f"{e}. IANA time zone data is not available on your system. `pip install tzdata` to leverage cron time zones or remove this field which will default to UTC."
+                )
+
+        return None
+
     @field_validator("start", "end", mode="before")
     @classmethod
     def _date_validator(cls, v: t.Any) -> t.Optional[TimeLike]:
@@ -239,19 +258,6 @@ class _Node(PydanticModel):
         if v and not to_datetime(v):
             raise ConfigError(f"'{v}' needs to be time-like: https://pypi.org/project/dateparser")
         return v
-
-    @field_validator("cron", mode="before")
-    @classmethod
-    def _cron_validator(cls, v: t.Any) -> t.Optional[str]:
-        cron = str_or_exp_to_str(v)
-        if cron:
-            from croniter import CroniterBadCronError, croniter
-
-            try:
-                croniter(cron)
-            except CroniterBadCronError:
-                raise ConfigError(f"Invalid cron expression '{cron}'")
-        return cron
 
     @field_validator("owner", "description", "stamp", mode="before")
     @classmethod
@@ -269,22 +275,24 @@ class _Node(PydanticModel):
         return v
 
     @model_validator(mode="after")
-    @model_validator_v1_args
-    def _node_root_validator(cls, values: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
-        interval_unit = values.get("interval_unit_")
-        if interval_unit:
-            cron = values["cron"]
+    def _node_root_validator(self) -> Self:
+        interval_unit = self.interval_unit_
+        if interval_unit and not getattr(self, "allow_partials", None):
+            cron = self.cron
             max_interval_unit = IntervalUnit.from_cron(cron)
             if interval_unit.seconds > max_interval_unit.seconds:
                 raise ConfigError(
-                    f"Interval unit of '{interval_unit}' is larger than cron period of '{cron}'"
+                    f"Cron '{cron}' cannot be more frequent than interval unit '{interval_unit.value}'. "
+                    "If this is intentional, set allow_partials to True."
                 )
-        start = values.get("start")
-        end = values.get("end")
+
+        start = self.start
+        end = self.end
+
         if end is not None and start is None:
             raise ConfigError("Must define a start date if an end date is defined.")
         validate_date_range(start, end)
-        return values
+        return self
 
     @property
     def batch_size(self) -> t.Optional[int]:
@@ -333,9 +341,9 @@ class _Node(PydanticModel):
 
     def croniter(self, value: TimeLike) -> CroniterCache:
         if self._croniter is None:
-            self._croniter = CroniterCache(self.cron, value)
+            self._croniter = CroniterCache(self.cron, value, tz=self.cron_tz)
         else:
-            self._croniter.curr = to_datetime(value)
+            self._croniter.curr = to_datetime(value, tz=self.cron_tz)
         return self._croniter
 
     def cron_next(self, value: TimeLike, estimate: bool = False) -> datetime:
@@ -377,7 +385,7 @@ class _Node(PydanticModel):
         """
         return self.croniter(self.cron_next(value, estimate=estimate)).get_prev(estimate=True)
 
-    def text_diff(self, other: Node) -> str:
+    def text_diff(self, other: Node, rendered: bool = False) -> str:
         """Produce a text diff against another node.
 
         Args:

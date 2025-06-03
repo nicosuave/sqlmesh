@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import typing as t
 from pathlib import Path
 import inspect
@@ -17,15 +16,17 @@ from sqlmesh.core.model.definition import (
     Model,
     create_python_model,
     create_sql_model,
+    create_models_from_blueprints,
     get_model_name,
+    parse_defaults_properties,
+    render_meta_fields,
+    render_model_defaults,
 )
 from sqlmesh.core.model.kind import ModelKindName, _ModelKind
-from sqlmesh.utils import registry_decorator
-from sqlmesh.utils.errors import ConfigError
+from sqlmesh.utils import registry_decorator, DECORATOR_RETURN_TYPE
+from sqlmesh.utils.errors import ConfigError, raise_config_error
 from sqlmesh.utils.metaprogramming import build_env, serialize_env
 
-
-logger = logging.getLogger(__name__)
 
 if t.TYPE_CHECKING:
     from sqlmesh.core.audit import ModelAudit
@@ -41,6 +42,7 @@ class model(registry_decorator):
         if not is_sql and "columns" not in kwargs:
             raise ConfigError("Python model must define column schema.")
 
+        self.name_provided = bool(name)
         self.name = name or ""
         self.is_sql = is_sql
         self.kwargs = kwargs
@@ -71,10 +73,66 @@ class model(registry_decorator):
             column_name: (
                 column_type
                 if isinstance(column_type, exp.DataType)
-                else exp.DataType.build(str(column_type))
+                else exp.DataType.build(
+                    str(column_type), dialect=self.kwargs.get("dialect", self._dialect)
+                )
             )
             for column_name, column_type in self.kwargs.pop("columns", {}).items()
         }
+
+    def __call__(
+        self, func: t.Callable[..., DECORATOR_RETURN_TYPE]
+    ) -> t.Callable[..., DECORATOR_RETURN_TYPE]:
+        if not self.name_provided:
+            self.name = get_model_name(Path(inspect.getfile(func)))
+        return super().__call__(func)
+
+    def models(
+        self,
+        get_variables: t.Callable[[t.Optional[str]], t.Dict[str, str]],
+        path: Path,
+        module_path: Path,
+        dialect: t.Optional[str] = None,
+        default_catalog_per_gateway: t.Optional[t.Dict[str, str]] = None,
+        **loader_kwargs: t.Any,
+    ) -> t.List[Model]:
+        blueprints = self.kwargs.pop("blueprints", None)
+
+        if isinstance(blueprints, str):
+            blueprints = parse_one(blueprints, dialect=dialect)
+
+        if isinstance(blueprints, MacroFunc):
+            from sqlmesh.core.model.definition import render_expression
+
+            blueprints = render_expression(
+                expression=blueprints,
+                module_path=module_path,
+                macros=loader_kwargs.get("macros"),
+                jinja_macros=loader_kwargs.get("jinja_macros"),
+                variables=get_variables(None),
+                path=path,
+                dialect=dialect,
+                default_catalog=loader_kwargs.get("default_catalog"),
+            )
+            if not blueprints:
+                raise_config_error("Failed to render blueprints property", path)
+
+            if len(blueprints) > 1:
+                blueprints = [exp.Tuple(expressions=blueprints)]
+
+            blueprints = blueprints[0]
+
+        return create_models_from_blueprints(
+            gateway=self.kwargs.get("gateway"),
+            blueprints=blueprints,
+            get_variables=get_variables,
+            loader=self.model,
+            path=path,
+            module_path=module_path,
+            dialect=dialect,
+            default_catalog_per_gateway=default_catalog_per_gateway,
+            **loader_kwargs,
+        )
 
     def model(
         self,
@@ -92,21 +150,21 @@ class model(registry_decorator):
         default_catalog: t.Optional[str] = None,
         variables: t.Optional[t.Dict[str, t.Any]] = None,
         infer_names: t.Optional[bool] = False,
+        blueprint_variables: t.Optional[t.Dict[str, t.Any]] = None,
     ) -> Model:
         """Get the model registered by this function."""
-        env: t.Dict[str, t.Any] = {}
+        env: t.Dict[str, t.Tuple[t.Any, t.Optional[bool]]] = {}
         entrypoint = self.func.__name__
 
-        if not self.name and infer_names:
-            self.name = get_model_name(Path(inspect.getfile(self.func)))
-
-        if not self.name:
+        if not self.name_provided and not infer_names:
             raise ConfigError("Python model must have a name.")
 
         kind = self.kwargs.get("kind", None)
         if kind is not None:
             if isinstance(kind, _ModelKind):
-                logger.warning(
+                from sqlmesh.core.console import get_console
+
+                get_console().log_warning(
                     f"""Python model "{self.name}"'s `kind` argument was passed a SQLMesh `{type(kind).__name__}` object. This may result in unexpected behavior - provide a dictionary instead."""
                 )
             elif isinstance(kind, dict):
@@ -117,8 +175,41 @@ class model(registry_decorator):
 
         build_env(self.func, env=env, name=entrypoint, path=module_path)
 
+        rendered_fields = render_meta_fields(
+            fields={"name": self.name, **self.kwargs},
+            module_path=module_path,
+            macros=macros,
+            jinja_macros=jinja_macros,
+            variables=variables,
+            path=path,
+            dialect=dialect,
+            default_catalog=default_catalog,
+            blueprint_variables=blueprint_variables,
+        )
+
+        rendered_name = rendered_fields["name"]
+        if isinstance(rendered_name, exp.Expression):
+            rendered_fields["name"] = rendered_name.sql(dialect=dialect)
+
+        rendered_defaults = (
+            render_model_defaults(
+                defaults=defaults,
+                module_path=module_path,
+                macros=macros,
+                jinja_macros=jinja_macros,
+                variables=variables,
+                path=path,
+                dialect=dialect,
+                default_catalog=default_catalog,
+            )
+            if defaults
+            else {}
+        )
+
+        rendered_defaults = parse_defaults_properties(rendered_defaults, dialect=dialect)
+
         common_kwargs = {
-            "defaults": defaults,
+            "defaults": rendered_defaults,
             "path": path,
             "time_column_format": time_column_format,
             "python_env": serialize_env(env, path=module_path),
@@ -132,10 +223,11 @@ class model(registry_decorator):
             "macros": macros,
             "jinja_macros": jinja_macros,
             "audit_definitions": audit_definitions,
-            **self.kwargs,
+            "blueprint_variables": blueprint_variables,
+            **rendered_fields,
         }
 
-        for key in ("pre_statements", "post_statements"):
+        for key in ("pre_statements", "post_statements", "on_virtual_update"):
             statements = common_kwargs.get(key)
             if statements:
                 common_kwargs[key] = [
@@ -145,5 +237,5 @@ class model(registry_decorator):
 
         if self.is_sql:
             query = MacroFunc(this=exp.Anonymous(this=entrypoint))
-            return create_sql_model(self.name, query, **common_kwargs)
-        return create_python_model(self.name, entrypoint, **common_kwargs)
+            return create_sql_model(query=query, **common_kwargs)
+        return create_python_model(entrypoint=entrypoint, **common_kwargs)

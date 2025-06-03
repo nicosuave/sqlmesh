@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import inspect
-import logging
 import sys
 import types
 import typing as t
 from enum import Enum
-from functools import reduce
+from functools import lru_cache, reduce
 from itertools import chain
 from pathlib import Path
 from string import Template
-from datetime import datetime
+from datetime import datetime, date
 
 import sqlglot
 from jinja2 import Environment
@@ -39,16 +38,22 @@ from sqlmesh.utils import (
     columns_to_types_all_known,
     registry_decorator,
 )
-from sqlmesh.utils.date import DatetimeRanges
+from sqlmesh.utils.date import DatetimeRanges, to_datetime, to_date
 from sqlmesh.utils.errors import MacroEvalError, SQLMeshError
 from sqlmesh.utils.jinja import JinjaMacroRegistry, has_jinja
-from sqlmesh.utils.metaprogramming import Executable, prepare_env, print_exception
+from sqlmesh.utils.metaprogramming import (
+    Executable,
+    SqlValue,
+    format_evaluated_code_exception,
+    prepare_env,
+)
 
 if t.TYPE_CHECKING:
     from sqlglot.dialects.dialect import DialectType
     from sqlmesh.core._typing import TableName
     from sqlmesh.core.engine_adapter import EngineAdapter
     from sqlmesh.core.snapshot import Snapshot
+    from sqlmesh.core.environment import EnvironmentNamingInfo
 
 
 if sys.version_info >= (3, 10):
@@ -57,14 +62,15 @@ else:
     UNION_TYPES = (t.Union,)
 
 
-logger = logging.getLogger(__name__)
-
-
 class RuntimeStage(Enum):
     LOADING = "loading"
     CREATING = "creating"
     EVALUATING = "evaluating"
+    PROMOTING = "promoting"
+    AUDITING = "auditing"
     TESTING = "testing"
+    BEFORE_ALL = "before_all"
+    AFTER_ALL = "after_all"
 
 
 class MacroStrTemplate(Template):
@@ -74,14 +80,24 @@ class MacroStrTemplate(Template):
 EXPRESSIONS_NAME_MAP = {}
 SQL = t.NewType("SQL", str)
 
-SUPPORTED_TYPES = {
-    "t": t,
-    "typing": t,
-    "List": t.List,
-    "Tuple": t.Tuple,
-    "Union": t.Union,
-    "DatetimeRanges": DatetimeRanges,
-}
+
+@lru_cache()
+def get_supported_types() -> t.Dict[str, t.Any]:
+    from sqlmesh.core.context import ExecutionContext
+
+    return {
+        "t": t,
+        "typing": t,
+        "List": t.List,
+        "Tuple": t.Tuple,
+        "Union": t.Union,
+        "DatetimeRanges": DatetimeRanges,
+        "exp": exp,
+        "SQL": SQL,
+        "MacroEvaluator": MacroEvaluator,
+        "ExecutionContext": ExecutionContext,
+    }
+
 
 for klass in sqlglot.Parser.EXPRESSION_PARSERS:
     name = klass if isinstance(klass, str) else klass.__name__  # type: ignore
@@ -149,14 +165,15 @@ class MacroEvaluator:
         self,
         dialect: DialectType = "",
         python_env: t.Optional[t.Dict[str, Executable]] = None,
-        jinja_env: t.Optional[Environment] = None,
         schema: t.Optional[MappingSchema] = None,
         runtime_stage: RuntimeStage = RuntimeStage.LOADING,
-        resolve_table: t.Optional[t.Callable[[str | exp.Expression], str]] = None,
+        resolve_table: t.Optional[t.Callable[[str | exp.Table], str]] = None,
         resolve_tables: t.Optional[t.Callable[[exp.Expression], exp.Expression]] = None,
         snapshots: t.Optional[t.Dict[str, Snapshot]] = None,
         default_catalog: t.Optional[str] = None,
         path: Path = Path(),
+        environment_naming_info: t.Optional[EnvironmentNamingInfo] = None,
+        model_fqn: t.Optional[str] = None,
     ):
         self.dialect = dialect
         self.generator = MacroDialect().generator()
@@ -171,15 +188,18 @@ class MacroEvaluator:
             "MacroEvaluator": MacroEvaluator,
         }
         self.python_env = python_env or {}
-        self._jinja_env: t.Optional[Environment] = jinja_env
         self.macros = {normalize_macro_name(k): v.func for k, v in macro.get_registry().items()}
+        self.columns_to_types_called = False
+        self.default_catalog = default_catalog
+
+        self._jinja_env: t.Optional[Environment] = None
         self._schema = schema
         self._resolve_table = resolve_table
         self._resolve_tables = resolve_tables
-        self.columns_to_types_called = False
         self._snapshots = snapshots if snapshots is not None else {}
-        self.default_catalog = default_catalog
         self._path = path
+        self._environment_naming_info = environment_naming_info
+        self._model_fqn = model_fqn
 
         prepare_env(self.python_env, self.env)
         for k, v in self.python_env.items():
@@ -188,7 +208,18 @@ class MacroEvaluator:
             elif v.is_import and getattr(self.env.get(k), c.SQLMESH_MACRO, None):
                 self.macros[normalize_macro_name(k)] = self.env[k]
             elif v.is_value:
-                self.locals[k] = self.env[k]
+                value = self.env[k]
+                if k in (c.SQLMESH_VARS, c.SQLMESH_BLUEPRINT_VARS):
+                    value = {
+                        var_name: (
+                            self.parse_one(var_value.sql)
+                            if isinstance(var_value, SqlValue)
+                            else var_value
+                        )
+                        for var_name, var_value in value.items()
+                    }
+
+                self.locals[k] = value
 
     def send(
         self, name: str, *args: t.Any, **kwargs: t.Any
@@ -196,13 +227,17 @@ class MacroEvaluator:
         func = self.macros.get(normalize_macro_name(name))
 
         if not callable(func):
-            raise SQLMeshError(f"Macro '{name}' does not exist.")
+            raise MacroEvalError(f"Macro '{name}' does not exist.")
 
         try:
-            return call_macro(func, self.dialect, self._path, self, *args, **kwargs)  # type: ignore
+            return call_macro(
+                func, self.dialect, self._path, provided_args=(self, *args), provided_kwargs=kwargs
+            )  # type: ignore
         except Exception as e:
-            print_exception(e, self.python_env)
-            raise MacroEvalError("Error trying to eval macro.") from e
+            raise MacroEvalError(
+                f"An error occurred during evaluation of '{name}'\n\n"
+                + format_evaluated_code_exception(e, self.python_env)
+            )
 
     def transform(
         self, expression: exp.Expression
@@ -216,13 +251,15 @@ class MacroEvaluator:
 
             if isinstance(node, MacroVar):
                 changed = True
-                variables = self.locals.get(c.SQLMESH_VARS, {})
+                variables = self.variables
+
                 if node.name not in self.locals and node.name.lower() not in variables:
                     if not isinstance(node.parent, StagedFilePath):
                         raise SQLMeshError(f"Macro variable '{node.name}' is undefined.")
 
                     return node
 
+                # Precedence order is locals (e.g. @DEF) > blueprint variables > config variables
                 value = self.locals.get(node.name, variables.get(node.name.lower()))
                 if isinstance(value, list):
                     return exp.convert(
@@ -230,15 +267,15 @@ class MacroEvaluator:
                             self.transform(v) if isinstance(v, exp.Expression) else v for v in value
                         )
                     )
+
                 return exp.convert(
                     self.transform(value) if isinstance(value, exp.Expression) else value
                 )
             if isinstance(node, exp.Identifier) and "@" in node.this:
-                text = self.template(node.this, self.locals)
+                text = self.template(node.this, {})
                 if node.this != text:
                     changed = True
-                    node.args["this"] = text
-                    return node
+                    return exp.to_identifier(text, quoted=node.quoted or None)
             if node.is_string:
                 text = node.this
                 if has_jinja(text):
@@ -262,7 +299,7 @@ class MacroEvaluator:
                     self.parse_one(node.sql(dialect=self.dialect, copy=False))
                     for node in transformed
                 ]
-            elif isinstance(transformed, exp.Expression):
+            if isinstance(transformed, exp.Expression):
                 return self.parse_one(transformed.sql(dialect=self.dialect, copy=False))
 
         return transformed
@@ -277,26 +314,12 @@ class MacroEvaluator:
         Returns:
            The rendered string.
         """
-        mapping = {}
-
-        variables = self.locals.get(c.SQLMESH_VARS, {})
-
-        for k, v in chain(variables.items(), self.locals.items(), local_variables.items()):
-            # try to convert all variables into sqlglot expressions
-            # because they're going to be converted into strings in sql
-            # we use bare Exception instead of ValueError because there's
-            # a recursive error with MagicMock.
-            # we don't convert strings because that would result in adding quotes
-            if not isinstance(v, str):
-                try:
-                    v = exp.convert(v)
-                except Exception:
-                    pass
-
-            if isinstance(v, exp.Expression):
-                v = v.sql(dialect=self.dialect)
-            mapping[k] = v
-
+        # We try to convert all variables into sqlglot expressions because they're going to be converted
+        # into strings; in sql we don't convert strings because that would result in adding quotes
+        mapping = {
+            k: convert_sql(v, self.dialect)
+            for k, v in chain(self.variables.items(), self.locals.items(), local_variables.items())
+        }
         return MacroStrTemplate(str(text)).safe_substitute(mapping)
 
     def evaluate(self, node: MacroFunc) -> exp.Expression | t.List[exp.Expression] | None:
@@ -357,10 +380,10 @@ class MacroEvaluator:
             code = self.generator.generate(node)
             return eval(code, self.env, self.locals)
         except Exception as e:
-            print_exception(e, self.python_env)
             raise MacroEvalError(
-                f"Error trying to eval macro.\n\nGenerated code: {code}\n\nOriginal sql: {node}"
-            ) from e
+                f"Error trying to eval macro.\n\nGenerated code: {code}\n\nOriginal sql: {node}\n\n"
+                + format_evaluated_code_exception(e, self.python_env)
+            )
 
     def parse_one(
         self, sql: str | exp.Expression, into: t.Optional[exp.IntoType] = None, **opts: t.Any
@@ -426,7 +449,7 @@ class MacroEvaluator:
             )
         )
 
-    def resolve_table(self, table: str | exp.Expression) -> str:
+    def resolve_table(self, table: str | exp.Table) -> str:
         """Gets the physical table name for a given model."""
         if not self._resolve_table:
             raise SQLMeshError(
@@ -448,6 +471,20 @@ class MacroEvaluator:
         return self.locals["runtime_stage"]
 
     @property
+    def this_model(self) -> str:
+        """Returns the resolved name of the surrounding model."""
+        this_model = self.locals.get("this_model")
+        if not this_model:
+            raise SQLMeshError("Model name is not available in the macro evaluator.")
+        return this_model.sql(dialect=self.dialect, identify=True, comments=False)
+
+    @property
+    def this_model_fqn(self) -> str:
+        if self._model_fqn is None:
+            raise SQLMeshError("Model name is not available in the macro evaluator.")
+        return self._model_fqn
+
+    @property
     def engine_adapter(self) -> EngineAdapter:
         engine_adapter = self.locals.get("engine_adapter")
         if not engine_adapter:
@@ -462,9 +499,46 @@ class MacroEvaluator:
         """Returns the gateway name."""
         return self.var(c.GATEWAY)
 
+    @property
+    def snapshots(self) -> t.Dict[str, Snapshot]:
+        """Returns the snapshots if available."""
+        return self._snapshots
+
+    @property
+    def this_env(self) -> str:
+        """Returns the name of the current environment in before after all."""
+        if "this_env" not in self.locals:
+            raise SQLMeshError("Environment name is only available in before_all and after_all")
+        return self.locals["this_env"]
+
+    @property
+    def schemas(self) -> t.List[str]:
+        """Returns the schemas of the current environment in before after all macros."""
+        if "schemas" not in self.locals:
+            raise SQLMeshError("Schemas are only available in before_all and after_all")
+        return self.locals["schemas"]
+
+    @property
+    def views(self) -> t.List[str]:
+        """Returns the views of the current environment in before after all macros."""
+        if "views" not in self.locals:
+            raise SQLMeshError("Views are only available in before_all and after_all")
+        return self.locals["views"]
+
     def var(self, var_name: str, default: t.Optional[t.Any] = None) -> t.Optional[t.Any]:
         """Returns the value of the specified variable, or the default value if it doesn't exist."""
         return (self.locals.get(c.SQLMESH_VARS) or {}).get(var_name.lower(), default)
+
+    def blueprint_var(self, var_name: str, default: t.Optional[t.Any] = None) -> t.Optional[t.Any]:
+        """Returns the value of the specified blueprint variable, or the default value if it doesn't exist."""
+        return (self.locals.get(c.SQLMESH_BLUEPRINT_VARS) or {}).get(var_name.lower(), default)
+
+    @property
+    def variables(self) -> t.Dict[str, t.Any]:
+        return {
+            **self.locals.get(c.SQLMESH_VARS, {}),
+            **self.locals.get(c.SQLMESH_BLUEPRINT_VARS, {}),
+        }
 
     def _coerce(self, expr: exp.Expression, typ: t.Any, strict: bool = False) -> t.Any:
         """Coerces the given expression to the specified type on a best-effort basis."""
@@ -765,7 +839,9 @@ def star(
     if exclude and not isinstance(exclude, (exp.Array, exp.Tuple)):
         raise SQLMeshError(f"Invalid exclude '{exclude}'. Expected an array.")
     if except_ != exp.tuple_():
-        logger.warning(
+        from sqlmesh.core.console import get_console
+
+        get_console().log_warning(
             "The 'except_' argument in @STAR will soon be deprecated. Use 'exclude' instead."
         )
         if not isinstance(exclude, (exp.Array, exp.Tuple)):
@@ -902,10 +978,16 @@ def safe_div(_: MacroEvaluator, numerator: exp.Expression, denominator: exp.Expr
 @macro()
 def union(
     evaluator: MacroEvaluator,
-    type_: exp.Literal = exp.Literal.string("ALL"),
-    *tables: exp.Table,
+    *args: exp.Expression,
 ) -> exp.Query:
     """Returns a UNION of the given tables. Only choosing columns that have the same name and type.
+
+    Args:
+        evaluator: MacroEvaluator that invoked the macro
+        args: Variable arguments that can be:
+            - First argument can be a condition (exp.Condition)
+            - A union type ('ALL' or 'DISTINCT') as exp.Literal
+            - Tables (exp.Table)
 
     Example:
         >>> from sqlglot import parse_one
@@ -914,10 +996,35 @@ def union(
         >>> sql = "@UNION('distinct', foo, bar)"
         >>> MacroEvaluator(schema=MappingSchema({"foo": {"a": "int", "b": "string", "c": "string"}, "bar": {"c": "string", "a": "int", "b": "int"}})).transform(parse_one(sql)).sql()
         'SELECT CAST(a AS INT) AS a, CAST(c AS TEXT) AS c FROM foo UNION SELECT CAST(a AS INT) AS a, CAST(c AS TEXT) AS c FROM bar'
+        >>> sql = "@UNION(True, 'distinct', foo, bar)"
+        >>> MacroEvaluator(schema=MappingSchema({"foo": {"a": "int", "b": "string", "c": "string"}, "bar": {"c": "string", "a": "int", "b": "int"}})).transform(parse_one(sql)).sql()
+        'SELECT CAST(a AS INT) AS a, CAST(c AS TEXT) AS c FROM foo UNION SELECT CAST(a AS INT) AS a, CAST(c AS TEXT) AS c FROM bar'
     """
+
+    if not args:
+        raise SQLMeshError("At least one table is required for the @UNION macro.")
+
+    arg_idx = 0
+    # Check for condition
+    condition = evaluator.eval_expression(args[arg_idx])
+    if isinstance(condition, bool):
+        arg_idx += 1
+        if arg_idx >= len(args):
+            raise SQLMeshError("Expected more arguments after the condition of the `@UNION` macro.")
+
+    # Check for union type
+    type_ = exp.Literal.string("ALL")
+    if isinstance(args[arg_idx], exp.Literal):
+        type_ = args[arg_idx]  # type: ignore
+        arg_idx += 1
     kind = type_.name.upper()
     if kind not in ("ALL", "DISTINCT"):
         raise SQLMeshError(f"Invalid type '{type_}'. Expected 'ALL' or 'DISTINCT'.")
+
+    # Remaining args should be tables
+    tables = [
+        exp.to_table(e.sql(evaluator.dialect), dialect=evaluator.dialect) for e in args[arg_idx:]
+    ]
 
     columns = {
         column
@@ -932,6 +1039,10 @@ def union(
         for column, type_ in evaluator.columns_to_types(tables[0]).items()
         if column in columns
     ]
+
+    # Skip the union if condition is False
+    if condition == False:
+        return exp.select(*projections).from_(tables[0])
 
     return reduce(
         lambda a, b: a.union(b, distinct=kind == "DISTINCT"),  # type: ignore
@@ -984,17 +1095,17 @@ def haversine_distance(
 @macro()
 def pivot(
     evaluator: MacroEvaluator,
-    column: exp.Column,
-    values: t.Union[exp.Array, exp.Tuple],
-    alias: exp.Boolean = exp.true(),
-    agg: exp.Literal = exp.Literal.string("SUM"),
-    cmp: exp.Literal = exp.Literal.string("="),
-    prefix: exp.Literal = exp.Literal.string(""),
-    suffix: exp.Literal = exp.Literal.string(""),
-    then_value: exp.Literal = exp.Literal.number(1),
-    else_value: exp.Literal = exp.Literal.number(0),
-    quote: exp.Boolean = exp.true(),
-    distinct: exp.Boolean = exp.false(),
+    column: SQL,
+    values: t.List[SQL],
+    alias: bool = True,
+    agg: exp.Expression = exp.Literal.string("SUM"),
+    cmp: exp.Expression = exp.Literal.string("="),
+    prefix: exp.Expression = exp.Literal.string(""),
+    suffix: exp.Expression = exp.Literal.string(""),
+    then_value: SQL = SQL("1"),
+    else_value: SQL = SQL("0"),
+    quote: bool = True,
+    distinct: bool = False,
 ) -> t.List[exp.Expression]:
     """Returns a list of projections as a result of pivoting the given column on the given values.
 
@@ -1004,17 +1115,29 @@ def pivot(
         >>> sql = "SELECT date_day, @PIVOT(status, ['cancelled', 'completed']) FROM rides GROUP BY 1"
         >>> MacroEvaluator().transform(parse_one(sql)).sql()
         'SELECT date_day, SUM(CASE WHEN status = \\'cancelled\\' THEN 1 ELSE 0 END) AS "\\'cancelled\\'", SUM(CASE WHEN status = \\'completed\\' THEN 1 ELSE 0 END) AS "\\'completed\\'" FROM rides GROUP BY 1'
+        >>> sql = "SELECT @PIVOT(a, ['v'], then_value := tv, suffix := '_sfx', quote := FALSE)"
+        >>> MacroEvaluator(dialect="bigquery").transform(parse_one(sql)).sql("bigquery")
+        "SELECT SUM(CASE WHEN a = 'v' THEN tv ELSE 0 END) AS `v_sfx`"
     """
     aggregates: t.List[exp.Expression] = []
-    for value in values.expressions:
-        proj = f"{agg.this}("
-        if distinct.this:
+    for value in values:
+        proj = f"{agg.name}("
+        if distinct:
             proj += "DISTINCT "
-        proj += f"CASE WHEN {column} {cmp.this} {value} THEN {then_value} ELSE {else_value} END) "
+
+        proj += f"CASE WHEN {column} {cmp.name} {value} THEN {then_value} ELSE {else_value} END) "
         node = evaluator.parse_one(proj)
-        if alias.this:
-            node = node.as_(f"{prefix.this}{value}{suffix.this}", quoted=quote.this, copy=False)
+
+        if alias:
+            node = node.as_(
+                f"{prefix.name}{value}{suffix.name}",
+                quoted=quote,
+                copy=False,
+                dialect=evaluator.dialect,
+            )
+
         aggregates.append(node)
+
     return aggregates
 
 
@@ -1049,6 +1172,19 @@ def var(
         raise SQLMeshError(f"Invalid variable name '{var_name.sql()}'. Expected a string literal.")
 
     return exp.convert(evaluator.var(var_name.this, default))
+
+
+@macro("BLUEPRINT_VAR")
+def blueprint_var(
+    evaluator: MacroEvaluator, var_name: exp.Expression, default: t.Optional[exp.Expression] = None
+) -> exp.Expression:
+    """Returns the value of a blueprint variable or the default value if the variable is not set."""
+    if not var_name.is_string:
+        raise SQLMeshError(
+            f"Invalid blueprint variable name '{var_name.sql()}'. Expected a string literal."
+        )
+
+    return exp.convert(evaluator.blueprint_var(var_name.this, default))
 
 
 @macro()
@@ -1131,30 +1267,35 @@ def date_spine(
         "SELECT date_week FROM UNNEST(GENERATE_DATE_ARRAY(CAST(\'2022-01-20\' AS DATE), CAST(\'2024-12-16\' AS DATE), INTERVAL \'1\' WEEK)) AS _exploded(date_week)"
     """
     datepart_name = datepart.name.lower()
-    start_date_name = start_date.name
-    end_date_name = end_date.name
-
     if datepart_name not in ("day", "week", "month", "quarter", "year"):
         raise SQLMeshError(
             f"Invalid datepart '{datepart_name}'. Expected: 'day', 'week', 'month', 'quarter', or 'year'"
         )
 
+    start_date_name = start_date.name
+    end_date_name = end_date.name
+
     try:
-        start_date_obj = datetime.strptime(start_date_name, "%Y-%m-%d").date()
-        end_date_obj = datetime.strptime(end_date_name, "%Y-%m-%d").date()
+        if start_date.is_string and end_date.is_string:
+            start_date_obj = datetime.strptime(start_date_name, "%Y-%m-%d").date()
+            end_date_obj = datetime.strptime(end_date_name, "%Y-%m-%d").date()
+        else:
+            start_date_obj = None
+            end_date_obj = None
     except Exception as e:
         raise SQLMeshError(
             f"Invalid date format - start_date and end_date must be in format: YYYY-MM-DD. Error: {e}"
         )
 
-    if start_date_obj > end_date_obj:
-        raise SQLMeshError(
-            f"Invalid date range - start_date '{start_date_name}' is after end_date '{end_date_name}'."
-        )
+    if start_date_obj and end_date_obj:
+        if start_date_obj > end_date_obj:
+            raise SQLMeshError(
+                f"Invalid date range - start_date '{start_date_name}' is after end_date '{end_date_name}'."
+            )
 
-    alias_name = f"date_{datepart_name}"
-    start_date_column = exp.cast(start_date, "DATE")
-    end_date_column = exp.cast(end_date, "DATE")
+        start_date = exp.cast(start_date, "DATE")
+        end_date = exp.cast(end_date, "DATE")
+
     if datepart_name == "quarter" and evaluator.dialect in (
         "spark",
         "spark2",
@@ -1167,14 +1308,68 @@ def date_spine(
 
     generate_date_array = exp.func(
         "GENERATE_DATE_ARRAY",
-        start_date_column,
-        end_date_column,
+        start_date,
+        end_date,
         date_interval,
     )
 
+    alias_name = f"date_{datepart_name}"
     exploded = exp.alias_(exp.func("unnest", generate_date_array), "_exploded", table=[alias_name])
 
     return exp.select(alias_name).from_(exploded)
+
+
+@macro()
+def resolve_template(
+    evaluator: MacroEvaluator,
+    template: exp.Literal,
+    mode: str = "literal",
+) -> t.Union[exp.Literal, exp.Table]:
+    """
+    Generates either a String literal or an exp.Table representing a physical table location, based on rendering the provided template String literal.
+
+    Note: It relies on the @this_model variable being available in the evaluation context (@this_model resolves to an exp.Table object
+    representing the current physical table).
+    Therefore, the @resolve_template macro must be used at creation or evaluation time and not at load time.
+
+    Args:
+        template: Template string literal. Can contain the following placeholders:
+            @{catalog_name} -> replaced with the catalog of the exp.Table returned from @this_model
+            @{schema_name} -> replaced with the schema of the exp.Table returned from @this_model
+            @{table_name} -> replaced with the name of the exp.Table returned from @this_model
+        mode: What to return.
+            'literal' -> return an exp.Literal string
+            'table' -> return an exp.Table
+
+    Example:
+        >>> from sqlglot import parse_one, exp
+        >>> from sqlmesh.core.macros import MacroEvaluator, RuntimeStage
+        >>> sql = "@resolve_template('s3://data-bucket/prod/@{catalog_name}/@{schema_name}/@{table_name}')"
+        >>> evaluator = MacroEvaluator(runtime_stage=RuntimeStage.CREATING)
+        >>> evaluator.locals.update({"this_model": exp.to_table("test_catalog.sqlmesh__test.test__test_model__2517971505")})
+        >>> evaluator.transform(parse_one(sql)).sql()
+        "'s3://data-bucket/prod/test_catalog/sqlmesh__test/test__test_model__2517971505'"
+    """
+    if "this_model" in evaluator.locals:
+        this_model = exp.to_table(evaluator.locals["this_model"], dialect=evaluator.dialect)
+        template_str: str = template.this
+        result = (
+            template_str.replace("@{catalog_name}", this_model.catalog)
+            .replace("@{schema_name}", this_model.db)
+            .replace("@{table_name}", this_model.name)
+        )
+
+        if mode.lower() == "table":
+            return exp.to_table(result, dialect=evaluator.dialect)
+        return exp.Literal.string(result)
+    if evaluator.runtime_stage != RuntimeStage.LOADING.value:
+        # only error if we are CREATING, EVALUATING or TESTING and @this_model is not present; this could indicate a bug
+        # otherwise, for LOADING, it's a no-op
+        raise SQLMeshError(
+            "@this_model must be present in the macro evaluation context in order to use @resolve_template"
+        )
+
+    return template
 
 
 def normalize_macro_name(name: str) -> str:
@@ -1190,16 +1385,25 @@ def call_macro(
     func: t.Callable,
     dialect: DialectType,
     path: Path,
-    *args: t.Any,
-    **kwargs: t.Any,
+    provided_args: t.Tuple[t.Any, ...],
+    provided_kwargs: t.Dict[str, t.Any],
+    **optional_kwargs: t.Any,
 ) -> t.Any:
     # Bind the macro's actual parameters to its formal parameters
     sig = inspect.signature(func)
-    bound = sig.bind(*args, **kwargs)
+
+    if optional_kwargs:
+        provided_kwargs = provided_kwargs.copy()
+
+    for k, v in optional_kwargs.items():
+        if k in sig.parameters:
+            provided_kwargs[k] = v
+
+    bound = sig.bind(*provided_args, **provided_kwargs)
     bound.apply_defaults()
 
     try:
-        annotations = t.get_type_hints(func, localns=SUPPORTED_TYPES)
+        annotations = t.get_type_hints(func, localns=get_supported_types())
     except (NameError, TypeError):  # forward references aren't handled
         annotations = {}
 
@@ -1224,7 +1428,7 @@ def call_macro(
 
 
 def _coerce(
-    expr: exp.Expression,
+    expr: t.Any,
     typ: t.Any,
     dialect: DialectType,
     path: Path,
@@ -1233,7 +1437,7 @@ def _coerce(
     """Coerces the given expression to the specified type on a best-effort basis."""
     base_err_msg = f"Failed to coerce expression '{expr}' to type '{typ}'."
     try:
-        if typ is None or typ is t.Any:
+        if typ is None or typ is t.Any or not isinstance(expr, exp.Expression):
             return expr
         base = t.get_origin(typ) or typ
 
@@ -1274,13 +1478,17 @@ def _coerce(
             return expr.name
         if base is bool and isinstance(expr, exp.Boolean):
             return expr.this
+        if base is datetime and isinstance(expr, exp.Literal):
+            return to_datetime(expr.this)
+        if base is date and isinstance(expr, exp.Literal):
+            return to_date(expr.this)
         if base is tuple and isinstance(expr, (exp.Tuple, exp.Array)):
             generic = t.get_args(typ)
             if not generic:
                 return tuple(expr.expressions)
             if generic[-1] is ...:
                 return tuple(_coerce(expr, generic[0], dialect, path) for expr in expr.expressions)
-            elif len(generic) == len(expr.expressions):
+            if len(generic) == len(expr.expressions):
                 return tuple(
                     _coerce(expr, generic[i], dialect, path)
                     for i, expr in enumerate(expr.expressions)
@@ -1295,10 +1503,41 @@ def _coerce(
     except Exception:
         if strict:
             raise
-        logger.error(
-            "Coercion of expression '%s' to type '%s' failed. Using non coerced expression at '%s'",
-            expr,
-            typ,
-            path,
+
+        from sqlmesh.core.console import get_console
+
+        get_console().log_error(
+            f"Coercion of expression '{expr}' to type '{typ}' failed. Using non coerced expression at '{path}'",
         )
         return expr
+
+
+def convert_sql(v: t.Any, dialect: DialectType) -> t.Any:
+    try:
+        return _cache_convert_sql(v, dialect, v.__class__)
+    # dicts aren't hashable but are convertable
+    except TypeError:
+        return _convert_sql(v, dialect)
+
+
+def _convert_sql(v: t.Any, dialect: DialectType) -> t.Any:
+    if not isinstance(v, str):
+        try:
+            v = exp.convert(v)
+        # we use bare Exception instead of ValueError because there's
+        # a recursive error with MagicMock.
+        except Exception:
+            pass
+
+    if isinstance(v, exp.Expression):
+        if (isinstance(v, exp.Column) and not v.table) or (
+            isinstance(v, exp.Identifier) or v.is_string
+        ):
+            return v.name
+        v = v.sql(dialect=dialect)
+    return v
+
+
+@lru_cache(maxsize=1028)
+def _cache_convert_sql(v: t.Any, dialect: DialectType, t: type) -> t.Any:
+    return _convert_sql(v, dialect)

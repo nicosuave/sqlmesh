@@ -16,6 +16,8 @@ from sqlmesh.core.model.common import (
     default_catalog_validator,
     depends_on_validator,
     expression_validator,
+    sort_python_env,
+    sorted_python_env_payloads,
 )
 from sqlmesh.core.model.common import make_python_env, single_value_or_tuple
 from sqlmesh.core.node import _Node
@@ -28,14 +30,10 @@ from sqlmesh.utils.jinja import (
     extract_macro_references_and_variables,
 )
 from sqlmesh.utils.metaprogramming import Executable
-from sqlmesh.utils.pydantic import (
-    PydanticModel,
-    field_validator,
-    model_validator,
-    model_validator_v1_args,
-)
+from sqlmesh.utils.pydantic import PydanticModel, field_validator, model_validator
 
 if t.TYPE_CHECKING:
+    from sqlmesh.core._typing import Self
     from sqlmesh.core.snapshot import DeployabilityIndex, Node, Snapshot
 
 
@@ -73,6 +71,7 @@ class AuditMixin(AuditCommonMetaMixin):
     defaults: t.Dict[str, exp.Expression]
     expressions_: t.Optional[t.List[exp.Expression]]
     jinja_macros: JinjaMacroRegistry
+    formatting: t.Optional[bool]
 
     @property
     def expressions(self) -> t.List[exp.Expression]:
@@ -99,7 +98,7 @@ def audit_map_validator(cls: t.Type, v: t.Any, values: t.Any) -> t.Dict[str, t.A
         return dict([_maybe_parse_arg_pair(v.unnest())])
     if isinstance(v, (exp.Tuple, exp.Array)):
         return dict(map(_maybe_parse_arg_pair, v.expressions))
-    elif isinstance(v, dict):
+    if isinstance(v, dict):
         dialect = get_dialect(values)
         return {
             key: value
@@ -107,10 +106,7 @@ def audit_map_validator(cls: t.Type, v: t.Any, values: t.Any) -> t.Dict[str, t.A
             else d.parse_one(str(value), dialect=dialect)
             for key, value in v.items()
         }
-    else:
-        raise_config_error(
-            "Defaults must be a tuple of exp.EQ or a dict", error_type=AuditConfigError
-        )
+    raise_config_error("Defaults must be a tuple of exp.EQ or a dict", error_type=AuditConfigError)
     return {}
 
 
@@ -130,6 +126,7 @@ class ModelAudit(PydanticModel, AuditMixin, frozen=True):
     defaults: t.Dict[str, exp.Expression] = {}
     expressions_: t.Optional[t.List[exp.Expression]] = Field(default=None, alias="expressions")
     jinja_macros: JinjaMacroRegistry = JinjaMacroRegistry()
+    formatting: t.Optional[bool] = Field(default=None, exclude=True)
 
     _path: t.Optional[Path] = None
 
@@ -163,6 +160,7 @@ class StandaloneAudit(_Node, AuditMixin):
     default_catalog: t.Optional[str] = None
     depends_on_: t.Optional[t.Set[str]] = Field(default=None, alias="depends_on")
     python_env: t.Dict[str, Executable] = {}
+    formatting: t.Optional[bool] = Field(default=None, exclude=True)
 
     source_type: t.Literal["audit"] = "audit"
 
@@ -175,12 +173,10 @@ class StandaloneAudit(_Node, AuditMixin):
     _depends_on_validator = depends_on_validator
 
     @model_validator(mode="after")
-    @model_validator_v1_args
-    def _node_root_validator(cls, values: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
-        if values.get("blocking"):
-            name = values.get("name")
-            raise AuditConfigError(f"Standalone audits cannot be blocking: '{name}'.")
-        return values
+    def _node_root_validator(self) -> Self:
+        if self.blocking:
+            raise AuditConfigError(f"Standalone audits cannot be blocking: '{self.name}'.")
+        return self
 
     def render_audit_query(
         self,
@@ -245,7 +241,7 @@ class StandaloneAudit(_Node, AuditMixin):
     @property
     def sorted_python_env(self) -> t.List[t.Tuple[str, Executable]]:
         """Returns the python env sorted by executable kind and then var name."""
-        return sorted(self.python_env.items(), key=lambda x: (x[1].kind, x[0]))
+        return sort_python_env(self.python_env)
 
     @property
     def data_hash(self) -> str:
@@ -276,6 +272,8 @@ class StandaloneAudit(_Node, AuditMixin):
                 *sorted(self.tags),
                 str(self.sorted_python_env),
                 self.stamp,
+                self.cron,
+                self.cron_tz.key if self.cron_tz else None,
             ]
 
             query = self.render_audit_query() or self.query
@@ -283,11 +281,12 @@ class StandaloneAudit(_Node, AuditMixin):
             self._metadata_hash = hash_data(data)
         return self._metadata_hash
 
-    def text_diff(self, other: Node) -> str:
+    def text_diff(self, other: Node, rendered: bool = False) -> str:
         """Produce a text diff against another node.
 
         Args:
             other: The node to diff against.
+            rendered: Whether the diff should be between raw vs rendered nodes
 
         Returns:
             A unified text diff showing additions and deletions.
@@ -298,11 +297,17 @@ class StandaloneAudit(_Node, AuditMixin):
             )
 
         return d.text_diff(
-            self.render_definition(), other.render_definition(), self.dialect, other.dialect
+            self.render_definition(render_query=rendered),
+            other.render_definition(render_query=rendered),
+            self.dialect,
+            other.dialect,
         ).strip()
 
     def render_definition(
-        self, include_python: bool = True, include_defaults: bool = False
+        self,
+        include_python: bool = True,
+        include_defaults: bool = False,
+        render_query: bool = False,
     ) -> t.List[exp.Expression]:
         """Returns the original list of sql expressions comprising the model definition.
 
@@ -337,18 +342,19 @@ class StandaloneAudit(_Node, AuditMixin):
         jinja_expressions = []
         python_expressions = []
         if include_python:
-            python_env = d.PythonCode(
-                expressions=[
-                    v.payload if v.is_import or v.is_definition else f"{k} = {v.payload}"
-                    for k, v in self.sorted_python_env
-                ]
-            )
+            python_env = d.PythonCode(expressions=sorted_python_env_payloads(self.python_env))
             if python_env.expressions:
                 python_expressions.append(python_env)
 
             jinja_expressions = self.jinja_macros.to_expressions()
 
-        return [audit, *python_expressions, *jinja_expressions, *self.expressions, self.query]
+        return [
+            audit,
+            *python_expressions,
+            *jinja_expressions,
+            *self.expressions,
+            self.render_audit_query() if render_query else self.query,
+        ]
 
     @property
     def is_audit(self) -> bool:
@@ -377,6 +383,7 @@ def load_audit(
     dialect: t.Optional[str] = None,
     default_catalog: t.Optional[str] = None,
     variables: t.Optional[t.Dict[str, t.Any]] = None,
+    project: t.Optional[str] = None,
 ) -> Audit:
     """Load an audit from a parsed SQLMesh audit file.
 
@@ -449,6 +456,8 @@ def load_audit(
             used_variables=used_variables,
         )
         extra_kwargs["default_catalog"] = default_catalog
+        if project is not None:
+            extra_kwargs["project"] = project
 
     dialect = meta_fields.pop("dialect", dialect)
     try:
@@ -476,6 +485,7 @@ def load_multiple_audits(
     dialect: t.Optional[str] = None,
     default_catalog: t.Optional[str] = None,
     variables: t.Optional[t.Dict[str, t.Any]] = None,
+    project: t.Optional[str] = None,
 ) -> t.Generator[Audit, None, None]:
     audit_block: t.List[exp.Expression] = []
     for expression in expressions:
@@ -490,6 +500,7 @@ def load_multiple_audits(
                     dialect=dialect,
                     default_catalog=default_catalog,
                     variables=variables,
+                    project=project,
                 )
                 audit_block.clear()
         audit_block.append(expression)
@@ -499,6 +510,7 @@ def load_multiple_audits(
         dialect=dialect,
         default_catalog=default_catalog,
         variables=variables,
+        project=project,
     )
 
 

@@ -13,14 +13,14 @@ import NotificationCenterProvider, {
 } from './library/pages/root/context/notificationCenter'
 import { isNotNil } from './utils'
 
-import './index.css'
+import './styles/index.css'
 
 export interface PropsComponent extends HTMLAttributes<HTMLElement> {}
 
 const client = new QueryClient({
   queryCache: new QueryCache({
     onError(error, query) {
-      ;(query.meta as ApiQueryMeta).onError(error as ErrorIDE)
+      ;(query.meta as ApiQueryMeta).onError(error as unknown as ErrorIDE)
     },
     onSuccess(_, query) {
       ;(query.meta as ApiQueryMeta).onSuccess()

@@ -17,7 +17,7 @@ on_tag_filter: &on_tag_filter
       only: /^v.+/
 
 orbs:
-  path-filtering: circleci/path-filtering@1.1.0
+  path-filtering: circleci/path-filtering@1.2.0
 
 jobs:
   publish:
@@ -59,35 +59,36 @@ jobs:
     steps:
       - checkout
       - run:
-          name: Install packages
-          command: npm --prefix web/client ci
+          name: Install Dependencies
+          command: |
+            pnpm install
       - run:
           name: Build UI
-          command: npm --prefix web/client run build
+          command: pnpm --prefix web/client run build
       - persist_to_workspace:
           root: web/client
           paths:
             - dist
   trigger_private_renovate:
-      docker:
-        - image: cimg/base:2021.11
-      resource_class: small
-      steps:
-        - run:
-            name: Trigger private renovate
-            command: |
-              curl --request POST \
-                --url $TOBIKO_PRIVATE_CIRCLECI_URL \
-                --header "Circle-Token: $TOBIKO_PRIVATE_CIRCLECI_KEY" \
-                --header "content-type: application/json" \
-                --data '{
-                  "branch":"main",
-                  "parameters":{
-                    "run_main_pr":false,
-                    "run_sqlmesh_commit":false,
-                    "run_renovate":true
-                    }
-                }'
+    docker:
+      - image: cimg/base:2021.11
+    resource_class: small
+    steps:
+      - run:
+          name: Trigger private renovate
+          command: |
+            curl --request POST \
+              --url $TOBIKO_PRIVATE_CIRCLECI_URL \
+              --header "Circle-Token: $TOBIKO_PRIVATE_CIRCLECI_KEY" \
+              --header "content-type: application/json" \
+              --data '{
+                "branch":"main",
+                "parameters":{
+                  "run_main_pr":false,
+                  "run_sqlmesh_commit":false,
+                  "run_renovate":true
+                  }
+              }'
 
 workflows:
   setup-workflow:
@@ -96,9 +97,10 @@ workflows:
           mapping: |
             web/client/.* client true
             (sqlmesh|tests|examples|web/server)/.* python true
-            pytest.ini|setup.cfg|setup.py python true
+            pytest.ini|setup.cfg|setup.py|pyproject.toml python true
             \.circleci/.*|Makefile|\.pre-commit-config\.yaml common true
-
+            vscode/extensions/.* vscode true
+          tag: "3.9"
       - gh-release:
           <<: *on_tag_filter
       - ui-build:

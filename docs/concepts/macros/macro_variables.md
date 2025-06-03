@@ -44,7 +44,7 @@ This example used one of SQLMesh's predefined variables, but you can also define
 
 We describe SQLMesh's predefined variables below; user-defined macro variables are discussed in the [SQLMesh macros](./sqlmesh_macros.md#user-defined-variables) and [Jinja macros](./jinja_macros.md#user-defined-variables) pages.
 
-## Predefined Variables
+## Predefined variables
 SQLMesh comes with predefined variables that can be used in your queries. They are automatically set by the SQLMesh runtime.
 
 Most predefined variables are related to time and use a combination of prefixes (start, end, etc.) and postfixes (date, ds, ts, etc.). They are described in the next section; [other predefined variables](#runtime-variables) are discussed in the following section.
@@ -120,14 +120,35 @@ All predefined temporal macro variables:
 
 ### Runtime variables
 
-SQLMesh provides two other predefined variables used to modify model behavior based on information available at runtime.
+SQLMesh provides additional predefined variables used to modify model behavior based on information available at runtime.
 
 * @runtime_stage - A string value denoting the current stage of the SQLMesh runtime. Typically used in models to conditionally execute pre/post-statements (learn more [here](../models/sql_models.md#optional-prepost-statements)). It returns one of these values:
     * 'loading' - The project is being loaded into SQLMesh's runtime context.
     * 'creating' - The model tables are being created.
     * 'evaluating' - The model query logic is being evaluated.
+    * 'promoting' - The model is being promoted in the target environment (virtual layer update).
+    * 'auditing' - The audit is being run.
     * 'testing' - The model query logic is being evaluated in the context of a unit test.
 * @gateway - A string value containing the name of the current [gateway](../../guides/connections.md).
-* @this_model - A string value containing the name of the physical table the model view selects from. Typically used to create [generic audits](../audits.md#generic-audits).
-    * Can be used in model definitions when SQLGlot cannot fully parse a statement and you need to reference the model's underlying physical table directly.
-    * Can be passed as an argument to macros that access or interact with the underlying physical table.
+* @this_model - The physical table name that the model's view selects from. Typically used to create [generic audits](../audits.md#generic-audits). When used in [on_virtual_update statements](../models/sql_models.md#optional-on-virtual-update-statements), it contains the qualified view name instead.
+* @model_kind_name - A string value containing the name of the current model kind. Intended to be used in scenarios where you need to control the [physical properties in model defaults](../../reference/model_configuration.md#model-defaults).
+
+!!! note "Embedding variables in strings"
+
+    Macro variable references sometimes use the curly brace syntax `@{variable}`, which serves a different purpose than the regular `@variable` syntax.
+
+    The curly brace syntax tells SQLMesh that the rendered string should be treated as an identifier, instead of simply replacing the macro variable value.
+
+    For example, if `variable` is defined as `@DEF(`variable`, foo.bar)`, then `@variable` produces `foo.bar`, while `@{variable}` produces `"foo.bar"`. This is because SQLMesh converts `foo.bar` into an identifier, using double quotes to correctly include the `.` character in the identifier name.
+
+    In practice, `@{variable}` is most commonly used to interpolate a value within an identifier, e.g., `@{variable}_suffix`, whereas `@variable` is used to do plain substitutions for string literals.
+
+    Learn more [above](#embedding-variables-in-strings).
+
+#### Before all and after all variables
+
+The following variables are also available in [`before_all` and `after_all` statements](../../guides/configuration.md#before_all-and-after_all-statements), as well as in macros invoked within them.
+
+* @this_env - A string value containing the name of the current [environment](../environments.md).
+* @schemas - A list of the schema names of the [virtual layer](../../concepts/glossary.md#virtual-layer) of the current environment.
+* @views - A list of the view names of the [virtual layer](../../concepts/glossary.md#virtual-layer) of the current environment.

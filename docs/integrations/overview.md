@@ -3,7 +3,6 @@
 ## Tools
 SQLMesh supports integrations with the following tools:
 
-* [Airflow](airflow.md)
 * [dbt](dbt.md)
 * [dlt](dlt.md)
 * [GitHub Actions](github.md)
@@ -13,6 +12,7 @@ SQLMesh supports integrations with the following tools:
 SQLMesh supports the following execution engines for running SQLMesh projects:
 
 * [Athena](./engines/athena.md)
+* [Azure SQL](./engines/azuresql.md)
 * [BigQuery](./engines/bigquery.md)
 * [ClickHouse](./engines/clickhouse.md)
 * [Databricks](./engines/databricks.md)

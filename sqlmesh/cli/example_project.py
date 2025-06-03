@@ -8,9 +8,13 @@ from sqlglot import Dialect
 from sqlmesh.integrations.dlt import generate_dlt_models_and_settings
 from sqlmesh.utils.date import yesterday_ds
 
+from sqlmesh.core.config.connection import CONNECTION_CONFIG_TO_TYPE
+
+
+PRIMITIVES = (str, int, bool, float)
+
 
 class ProjectTemplate(Enum):
-    AIRFLOW = "airflow"
     DBT = "dbt"
     DLT = "dlt"
     DEFAULT = "default"
@@ -29,34 +33,59 @@ def _gen_config(
       database: db.db"""
     )
 
+    if not settings and template != ProjectTemplate.DBT:
+        doc_link = "https://sqlmesh.readthedocs.io/en/stable/integrations/engines{engine_link}"
+        engine_link = ""
+
+        engine = "mssql" if dialect == "tsql" else dialect
+
+        if engine in CONNECTION_CONFIG_TO_TYPE:
+            required_fields = []
+            non_required_fields = []
+
+            for name, field in CONNECTION_CONFIG_TO_TYPE[engine].model_fields.items():
+                field_name = field.alias or name
+                default_value = field.get_default()
+
+                if isinstance(default_value, Enum):
+                    default_value = default_value.value
+                elif not isinstance(default_value, PRIMITIVES):
+                    default_value = ""
+
+                required = field.is_required() or field_name == "type"
+                option_str = f"      {'# ' if not required else ''}{field_name}: {default_value}\n"
+
+                # specify the DuckDB database field so quickstart runs out of the box
+                if engine == "duckdb" and field_name == "database":
+                    option_str = "      database: db.db\n"
+                    required = True
+
+                if required:
+                    required_fields.append(option_str)
+                else:
+                    non_required_fields.append(option_str)
+
+            connection_settings = "".join(required_fields + non_required_fields)
+
+            engine_link = f"/{engine}/#connection-options"
+
+        connection_settings = (
+            "      # For more information on configuring the connection to your execution engine, visit:\n"
+            "      # https://sqlmesh.readthedocs.io/en/stable/reference/configuration/#connections\n"
+            f"      # {doc_link.format(engine_link=engine_link)}\n{connection_settings}"
+        )
+
     default_configs = {
         ProjectTemplate.DEFAULT: f"""gateways:
-  local:
+  {dialect}:
     connection:
 {connection_settings}
 
-default_gateway: local
+default_gateway: {dialect}
 
 model_defaults:
   dialect: {dialect}
   start: {start or yesterday_ds()}
-""",
-        ProjectTemplate.AIRFLOW: f"""gateways:
-  local:
-    connection:
-      {connection_settings}
-
-default_gateway: local
-
-default_scheduler:
-  type: airflow
-  airflow_url: http://localhost:8080/
-  username: airflow
-  password: airflow
-
-model_defaults:
-  dialect: {dialect}
-  start: {yesterday_ds()}
 """,
         ProjectTemplate.DBT: """from pathlib import Path
 
@@ -98,93 +127,93 @@ def _gen_example_objects(schema_name: str) -> ExampleObjects:
     seed_model_name = f"{schema_name}.seed_model"
 
     full_model_def = f"""MODEL (
-    name {full_model_name},
-    kind FULL,
-    cron '@daily',
-    grain item_id,
-    audits (assert_positive_order_ids),
-  );
+  name {full_model_name},
+  kind FULL,
+  cron '@daily',
+  grain item_id,
+  audits (assert_positive_order_ids),
+);
 
-  SELECT
-    item_id,
-    COUNT(DISTINCT id) AS num_orders,
-  FROM
-    {incremental_model_name}
-  GROUP BY item_id
+SELECT
+  item_id,
+  COUNT(DISTINCT id) AS num_orders,
+FROM
+  {incremental_model_name}
+GROUP BY item_id
   """
 
     incremental_model_def = f"""MODEL (
-    name {incremental_model_name},
-    kind INCREMENTAL_BY_TIME_RANGE (
-      time_column event_date
-    ),
-    start '2020-01-01',
-    cron '@daily',
-    grain (id, event_date)
-  );
+  name {incremental_model_name},
+  kind INCREMENTAL_BY_TIME_RANGE (
+    time_column event_date
+  ),
+  start '2020-01-01',
+  cron '@daily',
+  grain (id, event_date)
+);
 
-  SELECT
-    id,
-    item_id,
-    event_date,
-  FROM
-    {seed_model_name}
-  WHERE
-    event_date BETWEEN @start_date AND @end_date
+SELECT
+  id,
+  item_id,
+  event_date,
+FROM
+  {seed_model_name}
+WHERE
+  event_date BETWEEN @start_date AND @end_date
   """
 
     seed_model_def = f"""MODEL (
-    name {seed_model_name},
-    kind SEED (
-      path '../seeds/seed_data.csv'
-    ),
-    columns (
-      id INTEGER,
-      item_id INTEGER,
-      event_date DATE
-    ),
-    grain (id, event_date)
-  );
+  name {seed_model_name},
+  kind SEED (
+    path '../seeds/seed_data.csv'
+  ),
+  columns (
+    id INTEGER,
+    item_id INTEGER,
+    event_date DATE
+  ),
+  grain (id, event_date)
+);
   """
 
     audit_def = """AUDIT (
-    name assert_positive_order_ids,
-  );
+  name assert_positive_order_ids,
+);
 
-  SELECT *
-  FROM @this_model
-  WHERE
-    item_id < 0
+SELECT *
+FROM @this_model
+WHERE
+  item_id < 0
   """
 
     seed_data = """id,item_id,event_date
-  1,2,2020-01-01
-  2,1,2020-01-01
-  3,3,2020-01-03
-  4,1,2020-01-04
-  5,1,2020-01-05
-  6,1,2020-01-06
-  7,1,2020-01-07
-  """
+1,2,2020-01-01
+2,1,2020-01-01
+3,3,2020-01-03
+4,1,2020-01-04
+5,1,2020-01-05
+6,1,2020-01-06
+7,1,2020-01-07
+"""
 
     test_def = f"""test_example_full_model:
-    model: {full_model_name}
-    inputs:
-      {incremental_model_name}:
-        rows:
-        - id: 1
-          item_id: 1
-        - id: 2
-          item_id: 1
-        - id: 3
-          item_id: 2
-    outputs:
-      query:
-        rows:
-        - item_id: 1
-          num_orders: 2
-        - item_id: 2
-          num_orders: 1
+  model: {full_model_name}
+  inputs:
+    {incremental_model_name}:
+      rows:
+      - id: 1
+        item_id: 1
+      - id: 2
+        item_id: 1
+      - id: 3
+        item_id: 2
+  outputs:
+    query:
+      rows:
+      - item_id: 1
+        num_orders: 2
+      - item_id: 2
+        num_orders: 1
   """
 
     return ExampleObjects(
@@ -206,6 +235,7 @@ def init_example_project(
     dialect: t.Optional[str],
     template: ProjectTemplate = ProjectTemplate.DEFAULT,
     pipeline: t.Optional[str] = None,
+    dlt_path: t.Optional[str] = None,
     schema_name: str = "sqlmesh_example",
 ) -> None:
     root_path = Path(path)
@@ -230,7 +260,9 @@ def init_example_project(
     start = None
     if template == ProjectTemplate.DLT:
         if pipeline and dialect:
-            models, settings, start = generate_dlt_models_and_settings(pipeline, dialect)
+            models, settings, start = generate_dlt_models_and_settings(
+                pipeline_name=pipeline, dialect=dialect, dlt_path=dlt_path
+            )
         else:
             raise click.ClickException(
                 "DLT pipeline is a required argument to generate a SQLMesh project from DLT"

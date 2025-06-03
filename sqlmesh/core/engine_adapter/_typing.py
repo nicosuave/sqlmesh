@@ -1,13 +1,15 @@
 import typing as t
 
-import pandas as pd
 from sqlglot import exp
 
 from sqlmesh.utils import optional_import
 
 if t.TYPE_CHECKING:
+    import pandas as pd
     import pyspark
     import pyspark.sql.connect.dataframe
+    from bigframes.session import Session as BigframeSession  # noqa
+    from bigframes.dataframe import DataFrame as BigframeDataFrame
 
     snowpark = optional_import("snowflake.snowpark")
 
@@ -23,6 +25,7 @@ if t.TYPE_CHECKING:
         pd.DataFrame,
         pyspark.sql.DataFrame,
         pyspark.sql.connect.dataframe.DataFrame,
+        BigframeDataFrame,
         SnowparkDataFrame,
     ]
 

@@ -1,12 +1,13 @@
 import typing as t
 
-import pandas as pd
+import pandas as pd  # noqa: TID253
 import pytest
 from pytest_mock.plugin import MockerFixture
 from sqlglot import exp, parse_one
 
 import sqlmesh.core.dialect as d
 from sqlmesh.core.dialect import normalize_model_name
+from sqlmesh.core.engine_adapter.base import EngineAdapter
 from sqlmesh.core.model import load_sql_based_model
 from sqlmesh.core.engine_adapter import SnowflakeEngineAdapter
 from sqlmesh.core.model.definition import SqlModel
@@ -14,8 +15,16 @@ from sqlmesh.core.node import IntervalUnit
 from sqlmesh.utils.errors import SQLMeshError
 from sqlmesh.utils import optional_import
 from tests.core.engine_adapter import to_sql_calls
+from sqlmesh.core.model.kind import ViewKind
 
 pytestmark = [pytest.mark.engine, pytest.mark.snowflake]
+
+
+@pytest.fixture
+def snowflake_mocked_engine_adapter(
+    make_mocked_engine_adapter: t.Callable,
+) -> SnowflakeEngineAdapter:
+    return make_mocked_engine_adapter(SnowflakeEngineAdapter)
 
 
 def test_get_temp_table(mocker: MockerFixture, make_mocked_engine_adapter: t.Callable):
@@ -269,11 +278,25 @@ def test_create_managed_table(make_mocked_engine_adapter: t.Callable, mocker: Mo
         },
     )
 
+    # table_format=iceberg
+    adapter.create_managed_table(
+        table_name="test_table",
+        query=query,
+        columns_to_types=columns_to_types,
+        table_properties={
+            "target_lag": exp.Literal.string("20 minutes"),
+            "catalog": exp.Literal.string("snowflake"),
+            "external_volume": exp.Literal.string("test"),
+        },
+        table_format="iceberg",
+    )
+
     assert to_sql_calls(adapter) == [
         """CREATE OR REPLACE DYNAMIC TABLE "test_table" TARGET_LAG='20 minutes' WAREHOUSE="default_warehouse" AS SELECT CAST("a" AS INT) AS "a", CAST("b" AS INT) AS "b" FROM (SELECT "a", "b" FROM "source_table") AS "_subquery\"""",
         """CREATE OR REPLACE DYNAMIC TABLE "test_table" TARGET_LAG='20 minutes' WAREHOUSE="foo" AS SELECT CAST("a" AS INT) AS "a", CAST("b" AS INT) AS "b" FROM (SELECT "a", "b" FROM "source_table") AS "_subquery\"""",
         """CREATE OR REPLACE DYNAMIC TABLE "test_table" CLUSTER BY ("a") TARGET_LAG='20 minutes' WAREHOUSE="default_warehouse" AS SELECT CAST("a" AS INT) AS "a", CAST("b" AS INT) AS "b" FROM (SELECT "a", "b" FROM "source_table") AS "_subquery\"""",
         """CREATE OR REPLACE DYNAMIC TABLE "test_table" TARGET_LAG='20 minutes' REFRESH_MODE='auto' INITIALIZE='on_create' WAREHOUSE="default_warehouse" AS SELECT CAST("a" AS INT) AS "a", CAST("b" AS INT) AS "b" FROM (SELECT "a", "b" FROM "source_table") AS "_subquery\"""",
+        """CREATE OR REPLACE DYNAMIC ICEBERG TABLE "test_table" TARGET_LAG='20 minutes' CATALOG='snowflake' EXTERNAL_VOLUME='test' WAREHOUSE="default_warehouse" AS SELECT CAST("a" AS INT) AS "a", CAST("b" AS INT) AS "b" FROM (SELECT "a", "b" FROM "source_table") AS "_subquery\"""",
     ]
 
 
@@ -402,6 +425,10 @@ def test_replace_query_snowpark_dataframe(
     from snowflake.snowpark.dataframe import DataFrame as SnowparkDataFrame
 
     session = Session.builder.config("local_testing", True).create()
+    # df.createOrReplaceTempView() throws "[Local Testing] Mocking SnowflakePlan Rename is not supported" when used against the Snowflake local_testing session
+    # since we cant trace any queries from the Snowpark library anyway, we just suppress this and verify the cleanup queries issued by our EngineAdapter
+    session._conn._suppress_not_implemented_error = True
+
     df: SnowparkDataFrame = session.create_dataframe([(1, "name")], schema=["ID", "NAME"])
     assert isinstance(df, SnowparkDataFrame)
 
@@ -416,11 +443,6 @@ def test_replace_query_snowpark_dataframe(
         query_or_df=df,
         columns_to_types={"ID": exp.DataType.build("INT"), "NAME": exp.DataType.build("VARCHAR")},
     )
-
-    # the Snowflake library generates "CREATE TEMPORARY VIEW" from a direct DataFrame call
-    # which doesnt pass through our EngineAdapter so we cant capture it
-    spy.assert_called()
-    assert "__temp_foo_e6wjkjj6" in spy.call_args[0][0]
 
     # verify that DROP VIEW is called instead of DROP TABLE
     assert to_sql_calls(adapter) == [
@@ -633,4 +655,140 @@ def test_create_view(make_mocked_engine_adapter: t.Callable):
     assert sql_calls == [
         'CREATE OR REPLACE VIEW "test_view" COPY GRANTS AS SELECT 1',
         'CREATE VIEW "test_view" AS SELECT 1',
+    ]
+
+
+def test_clone_table(mocker: MockerFixture, make_mocked_engine_adapter: t.Callable):
+    mocker.patch("sqlmesh.core.engine_adapter.snowflake.SnowflakeEngineAdapter.set_current_catalog")
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter, default_catalog="test_catalog")
+    adapter.clone_table("target_table", "source_table")
+    adapter.cursor.execute.assert_called_once_with(
+        'CREATE TABLE "target_table" CLONE "source_table"'
+    )
+
+    # Validate with transient type we create the clone table accordingly
+    rendered_physical_properties = {
+        "creatable_type": exp.column("transient"),
+    }
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter, default_catalog="test_catalog")
+    adapter.clone_table(
+        "target_table", "source_table", rendered_physical_properties=rendered_physical_properties
+    )
+    adapter.cursor.execute.assert_called_once_with(
+        'CREATE TRANSIENT TABLE "target_table" CLONE "source_table"'
+    )
+
+    # Validate other engine adapters would work as usual even when we pass the properties
+    adapter = make_mocked_engine_adapter(EngineAdapter, default_catalog="test_catalog")
+    adapter.SUPPORTS_CLONING = True
+    adapter.clone_table(
+        "target_table", "source_table", rendered_physical_properties=rendered_physical_properties
+    )
+    adapter.cursor.execute.assert_called_once_with(
+        'CREATE TABLE "target_table" CLONE "source_table"'
+    )
+
+
+def test_table_format_iceberg(snowflake_mocked_engine_adapter: SnowflakeEngineAdapter) -> None:
+    adapter = snowflake_mocked_engine_adapter
+
+    model = load_sql_based_model(
+        expressions=d.parse("""
+        MODEL (
+            name test.table,
+            kind full,
+            table_format iceberg,
+            physical_properties (
+              catalog = 'snowflake',
+              external_volume = 'test'
+            )
+        );
+        SELECT a::INT;
+        """)
+    )
+    assert isinstance(model, SqlModel)
+    assert model.table_format == "iceberg"
+
+    adapter.create_table(
+        table_name=model.name,
+        columns_to_types=model.columns_to_types_or_raise,
+        table_format=model.table_format,
+        table_properties=model.physical_properties,
+    )
+
+    adapter.ctas(
+        table_name=model.name,
+        query_or_df=model.render_query_or_raise(),
+        columns_to_types=model.columns_to_types_or_raise,
+        table_format=model.table_format,
+        table_properties=model.physical_properties,
+    )
+
+    assert to_sql_calls(adapter) == [
+        'CREATE ICEBERG TABLE IF NOT EXISTS "test"."table" ("a" INT) CATALOG=\'snowflake\' EXTERNAL_VOLUME=\'test\'',
+        'CREATE ICEBERG TABLE IF NOT EXISTS "test"."table" CATALOG=\'snowflake\' EXTERNAL_VOLUME=\'test\' AS SELECT CAST("a" AS INT) AS "a" FROM (SELECT CAST("a" AS INT) AS "a") AS "_subquery"',
+    ]
+
+
+def test_create_view_with_schema_and_grants(
+    snowflake_mocked_engine_adapter: SnowflakeEngineAdapter,
+):
+    adapter = snowflake_mocked_engine_adapter
+
+    model_v = load_sql_based_model(
+        d.parse(f"""
+                MODEL (
+                    name test.v,
+                    kind VIEW,
+                    description 'normal **view** from integration test',
+                    dialect 'snowflake'
+                );
+
+                select 1 as "ID", 'foo' as "NAME";
+                """)
+    )
+
+    model_mv = load_sql_based_model(
+        d.parse(f"""
+            MODEL (
+                name test.mv,
+                kind VIEW (
+                    materialized true
+                ),
+                description 'materialized **view** from integration test',
+                dialect 'snowflake'
+            );
+
+            select 1 as "ID", 'foo' as "NAME";
+            """)
+    )
+
+    assert isinstance(model_v.kind, ViewKind)
+    assert isinstance(model_mv.kind, ViewKind)
+
+    adapter.create_view(
+        "target_view",
+        model_v.render_query_or_raise(),
+        model_v.columns_to_types,
+        materialized=model_v.kind.materialized,
+        view_properties=model_v.render_physical_properties(),
+        table_description=model_v.description,
+        column_descriptions=model_v.column_descriptions,
+    )
+
+    adapter.create_view(
+        "target_materialized_view",
+        model_mv.render_query_or_raise(),
+        model_mv.columns_to_types,
+        materialized=model_mv.kind.materialized,
+        view_properties=model_mv.render_physical_properties(),
+        table_description=model_mv.description,
+        column_descriptions=model_mv.column_descriptions,
+    )
+
+    assert to_sql_calls(adapter) == [
+        # normal view - COPY GRANTS goes after the column list
+        """CREATE OR REPLACE VIEW "target_view" ("ID", "NAME") COPY GRANTS COMMENT='normal **view** from integration test' AS SELECT 1 AS "ID", 'foo' AS "NAME\"""",
+        # materialized view - COPY GRANTS goes before the column list
+        """CREATE OR REPLACE MATERIALIZED VIEW "target_materialized_view" COPY GRANTS ("ID", "NAME") COMMENT='materialized **view** from integration test' AS SELECT 1 AS "ID", 'foo' AS "NAME\"""",
     ]

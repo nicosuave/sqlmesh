@@ -26,6 +26,7 @@ class TestExecutionContext(ExecutionContext):
         default_dialect: t.Optional[str] = None,
         default_catalog: t.Optional[str] = None,
         variables: t.Optional[t.Dict[str, t.Any]] = None,
+        blueprint_variables: t.Optional[t.Dict[str, t.Any]] = None,
     ):
         self._engine_adapter = engine_adapter
         self._models = models
@@ -33,15 +34,24 @@ class TestExecutionContext(ExecutionContext):
         self._default_catalog = default_catalog
         self._default_dialect = default_dialect
         self._variables = variables or {}
+        self._blueprint_variables = variables or {}
 
     @cached_property
     def _model_tables(self) -> t.Dict[str, str]:
         """Returns a mapping of model names to tables."""
+
+        # Include upstream dependencies to ensure they can be resolved during test execution
         return {
-            name: self._test._test_fixture_table(name).sql() for name, model in self._models.items()
+            name: self._test._test_fixture_table(name).sql()
+            for model in self._models.values()
+            for name in [model.name, *model.depends_on]
         }
 
-    def with_variables(self, variables: t.Dict[str, t.Any]) -> TestExecutionContext:
+    def with_variables(
+        self,
+        variables: t.Dict[str, t.Any],
+        blueprint_variables: t.Optional[t.Dict[str, t.Any]] = None,
+    ) -> TestExecutionContext:
         """Returns a new TestExecutionContext with additional variables."""
         return TestExecutionContext(
             self._engine_adapter,
@@ -50,4 +60,5 @@ class TestExecutionContext(ExecutionContext):
             self._default_dialect,
             self._default_catalog,
             variables=variables,
+            blueprint_variables=blueprint_variables,
         )

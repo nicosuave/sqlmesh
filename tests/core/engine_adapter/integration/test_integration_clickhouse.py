@@ -1,45 +1,36 @@
 import typing as t
 import pytest
+from pytest import FixtureRequest
 from tests.core.engine_adapter.integration import TestContext
-import pandas as pd
+from sqlmesh.core.engine_adapter.clickhouse import ClickhouseEngineAdapter
+import pandas as pd  # noqa: TID253
 from sqlglot import exp, parse_one
+from sqlmesh.core.snapshot import SnapshotChangeCategory
+
+from tests.core.engine_adapter.integration import (
+    TestContext,
+    generate_pytest_params,
+    ENGINES_BY_NAME,
+    IntegrationTestEngine,
+)
 
 
 @pytest.fixture(
-    params=[
-        pytest.param(
-            "clickhouse",
-            marks=[
-                pytest.mark.docker,
-                pytest.mark.engine,
-                pytest.mark.clickhouse,
-            ],
-        ),
-        pytest.param(
-            "clickhouse_cluster",
-            marks=[
-                pytest.mark.docker,
-                pytest.mark.engine,
-                pytest.mark.clickhouse_cluster,
-            ],
-        ),
-        pytest.param(
-            "clickhouse_cloud",
-            marks=[
-                pytest.mark.engine,
-                pytest.mark.remote,
-                pytest.mark.clickhouse_cloud,
-            ],
-        ),
-    ]
+    params=list(
+        generate_pytest_params([ENGINES_BY_NAME["clickhouse"], ENGINES_BY_NAME["clickhouse_cloud"]])
+    )
 )
-def mark_gateway(request) -> t.Tuple[str, str]:
-    return request.param, f"inttest_{request.param}"
+def ctx(
+    request: FixtureRequest,
+    create_test_context: t.Callable[[IntegrationTestEngine, str, str], t.Iterable[TestContext]],
+) -> t.Iterable[TestContext]:
+    yield from create_test_context(*request.param)
 
 
 @pytest.fixture
-def test_type() -> str:
-    return "query"
+def engine_adapter(ctx: TestContext) -> ClickhouseEngineAdapter:
+    assert isinstance(ctx.engine_adapter, ClickhouseEngineAdapter)
+    return ctx.engine_adapter
 
 
 def _get_source_queries_and_columns_to_types(
@@ -497,3 +488,75 @@ def test_insert_overwrite_by_condition_inc_by_partition(ctx: TestContext):
             ]
         ),
     )
+
+
+def test_inc_by_time_auto_partition_string(ctx: TestContext):
+    # ensure automatic time partitioning works when the time column is not a Date/DateTime type
+    existing_table_name = _create_table_and_insert_existing_data(
+        ctx,
+        columns_to_types={
+            "id": exp.DataType.build("Int8", "clickhouse"),
+            "ds": exp.DataType.build("String", "clickhouse"),  # String time column
+        },
+        table_name="data_existing",
+        partitioned_by=None,
+    )
+
+    sqlmesh_context, model = ctx.upsert_sql_model(
+        f"""
+        MODEL (
+            name test.inc_by_time_no_partition,
+            kind INCREMENTAL_BY_TIME_RANGE (
+                time_column ds
+            ),
+            dialect clickhouse,
+            start '2023-01-01'
+        );
+
+        SELECT
+            id::Int8,
+            ds::String
+        FROM {existing_table_name.sql()}
+        WHERE ds BETWEEN @start_ds AND @end_ds
+        """
+    )
+
+    plan = sqlmesh_context.plan(no_prompts=True, auto_apply=True)
+
+    physical_location = ctx.engine_adapter.get_data_objects(
+        plan.environment.snapshots[0].physical_schema
+    )[0]
+
+    partitions = ctx.engine_adapter.fetchall(
+        exp.select("_partition_id")
+        .distinct()
+        .from_(f"{physical_location.schema_name}.{physical_location.name}")
+    )
+
+    # The automatic time partitioning creates one partition per week. The 4 input data points
+    # are located in three distinct weeks, which should have one partition each.
+    assert len(partitions) == 3
+
+
+def test_diff_requires_dialect(ctx: TestContext):
+    sql = """
+        MODEL (
+          name test_schema.some_view,
+          kind VIEW,
+          dialect clickhouse
+        );
+
+        SELECT
+          maxIf('2020-01-01'::Date, 1={rhs})::Nullable(Date) as col
+    """
+
+    sqlmesh_context, model = ctx.upsert_sql_model(sql.format(rhs="1"))
+    sqlmesh_context.plan(no_prompts=True, auto_apply=True)
+
+    _, model = ctx.upsert_sql_model(sql.format(rhs="2"))
+    sqlmesh_context.upsert_model(model)
+
+    plan = sqlmesh_context.plan(no_prompts=True, auto_apply=True, no_diff=True)
+
+    new_snapshot = plan.context_diff.modified_snapshots['"test_schema"."some_view"'][0]
+    assert new_snapshot.change_category == SnapshotChangeCategory.BREAKING

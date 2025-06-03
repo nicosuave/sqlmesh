@@ -1,16 +1,10 @@
 .PHONY: docs
 
 install-dev:
-	pip3 install -e ".[dev,web,slack,dlt]"
-
-install-cicd-test:
-	pip3 install -e ".[dev,web,slack,cicdtest,dlt]"
+	pip3 install -e ".[dev,web,slack,dlt,lsp]" ./examples/custom_materializations
 
 install-doc:
 	pip3 install -r ./docs/requirements.txt
-
-install-engine-test:
-	pip3 install -e ".[dev,web,slack,mysql,postgres,databricks,redshift,bigquery,snowflake,trino,mssql,clickhouse,athena]"
 
 install-pre-commit:
 	pre-commit install
@@ -22,43 +16,22 @@ py-style:
 	SKIP=prettier,eslint pre-commit run --all-files
 
 ui-style:
-	SKIP=ruff,ruff-format,mypy pre-commit run --all-files
+	pnpm run lint
 
 doc-test:
-	PYTEST_PLUGINS=tests.common_fixtures pytest --doctest-modules sqlmesh/core sqlmesh/utils
+	python -m pytest --doctest-modules sqlmesh/core sqlmesh/utils
 
 package:
-	pip3 install wheel && python3 setup.py sdist bdist_wheel
+	pip3 install build && python3 -m build
 
 publish: package
 	pip3 install twine && python3 -m twine upload dist/*
 
 package-tests:
-	pip3 install wheel && python3 tests/setup.py sdist bdist_wheel
+	pip3 install build && cp pyproject.toml tests/sqlmesh_pyproject.toml && python3 -m build tests/
 
 publish-tests: package-tests
 	pip3 install twine && python3 -m twine upload -r tobiko-private tests/dist/*
-
-develop:
-	python3 setup.py develop
-
-airflow-init:
-	export AIRFLOW_ENGINE_OPERATOR=spark && make -C ./examples/airflow init
-
-airflow-run:
-	make -C ./examples/airflow run
-
-airflow-stop:
-	make -C ./examples/airflow stop
-
-airflow-clean:
-	make -C ./examples/airflow clean
-
-airflow-psql:
-	make -C ./examples/airflow psql
-
-airflow-spark-sql:
-	make -C ./examples/airflow spark-sql
 
 docs-serve:
 	mkdocs serve
@@ -91,36 +64,19 @@ engine-up: engine-clickhouse-up engine-mssql-up engine-mysql-up engine-postgres-
 engine-down: engine-clickhouse-down engine-mssql-down engine-mysql-down engine-postgres-down engine-spark-down engine-trino-down
 
 fast-test:
-	pytest -n auto -m "fast and not cicdonly" && pytest -m "isolated"
+	pytest -n auto -m "fast and not cicdonly" --junitxml=test-results/junit-fast-test.xml && pytest -m "isolated" && pytest -m "registry_isolation"
 
 slow-test:
-	pytest -n auto -m "(fast or slow) and not cicdonly" && pytest -m "isolated"
+	pytest -n auto -m "(fast or slow) and not cicdonly" && pytest -m "isolated" && pytest -m "registry_isolation"
 
 cicd-test:
-	pytest -n auto -m "fast or slow" --junitxml=test-results/junit-cicd.xml && pytest -m "isolated"
+	pytest -n auto -m "fast or slow" --junitxml=test-results/junit-cicd.xml && pytest -m "isolated" && pytest -m "registry_isolation"
 
 core-fast-test:
-	pytest -n auto -m "fast and not web and not github and not dbt and not airflow and not jupyter"
+	pytest -n auto -m "fast and not web and not github and not dbt and not jupyter"
 
 core-slow-test:
-	pytest -n auto -m "(fast or slow) and not web and not github and not dbt and not airflow and not jupyter"
-
-airflow-fast-test:
-	pytest -n auto -m "fast and airflow"
-
-airflow-test:
-	pytest -n auto -m "(fast or slow) and airflow"
-
-airflow-local-test:
-	export AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@localhost/airflow && \
-		pytest -n 1 -m "docker and airflow"
-
-airflow-docker-test:
-	make -C ./examples/airflow docker-test
-
-airflow-local-test-with-env: develop airflow-clean airflow-init airflow-run airflow-local-test airflow-stop
-
-airflow-docker-test-with-env: develop airflow-clean airflow-init airflow-run airflow-docker-test airflow-stop
+	pytest -n auto -m "(fast or slow) and not web and not github and not dbt and not jupyter"
 
 engine-slow-test:
 	pytest -n auto -m "(fast or slow) and engine"
@@ -153,7 +109,7 @@ guard-%:
 	fi
 
 engine-%-install:
-	pip3 install -e ".[dev,web,slack,${*}]"
+	pip3 install -e ".[dev,web,slack,lsp,${*}]" ./examples/custom_materializations
 
 engine-docker-%-up:
 	docker compose -f ./tests/core/engine_adapter/integration/docker/compose.${*}.yaml up -d
@@ -170,48 +126,61 @@ engine-%-down:
 ##################
 
 clickhouse-test: engine-clickhouse-up
-	pytest -n auto -x -m "clickhouse" --retries 3 --junitxml=test-results/junit-clickhouse.xml
-
-clickhouse-cluster-test: engine-clickhouse-up
-	pytest -n auto -x -m "clickhouse_cluster" --retries 3 --junitxml=test-results/junit-clickhouse-cluster.xml
+	pytest -n auto -m "clickhouse" --retries 3 --junitxml=test-results/junit-clickhouse.xml
 
 duckdb-test: engine-duckdb-install
-	pytest -n auto -x -m "duckdb" --retries 3 --junitxml=test-results/junit-duckdb.xml
+	pytest -n auto -m "duckdb" --retries 3 --junitxml=test-results/junit-duckdb.xml
 
 mssql-test: engine-mssql-up
-	pytest -n auto -x -m "mssql" --retries 3 --junitxml=test-results/junit-mssql.xml
+	pytest -n auto -m "mssql" --retries 3 --junitxml=test-results/junit-mssql.xml
 
 mysql-test: engine-mysql-up
-	pytest -n auto -x -m "mysql" --retries 3 --junitxml=test-results/junit-mysql.xml
+	pytest -n auto -m "mysql" --retries 3 --junitxml=test-results/junit-mysql.xml
 
 postgres-test: engine-postgres-up
-	pytest -n auto -x -m "postgres" --retries 3 --junitxml=test-results/junit-postgres.xml
+	pytest -n auto -m "postgres" --retries 3 --junitxml=test-results/junit-postgres.xml
 
 spark-test: engine-spark-up
-	pytest -n auto -x -m "spark or pyspark" --retries 3 --junitxml=test-results/junit-spark.xml
+	pytest -n auto -m "spark" --retries 3 --junitxml=test-results/junit-spark.xml
 
 trino-test: engine-trino-up
-	pytest -n auto -x -m "trino or trino_iceberg or trino_delta" --retries 3 --junitxml=test-results/junit-trino.xml
+	pytest -n auto -m "trino" --retries 3 --junitxml=test-results/junit-trino.xml
+
+risingwave-test: engine-risingwave-up
+	pytest -n auto -m "risingwave" --retries 3 --junitxml=test-results/junit-risingwave.xml
 
 #################
 # Cloud Engines #
 #################
 
 snowflake-test: guard-SNOWFLAKE_ACCOUNT guard-SNOWFLAKE_WAREHOUSE guard-SNOWFLAKE_DATABASE guard-SNOWFLAKE_USER guard-SNOWFLAKE_PASSWORD engine-snowflake-install
-	pytest -n auto -x -m "snowflake" --retries 3 --junitxml=test-results/junit-snowflake.xml
+	pytest -n auto -m "snowflake" --retries 3 --junitxml=test-results/junit-snowflake.xml
 
 bigquery-test: guard-BIGQUERY_KEYFILE engine-bigquery-install
-	pytest -n auto -x -m "bigquery" --retries 3 --junitxml=test-results/junit-bigquery.xml
+	pip install -e ".[bigframes]"
+	pytest -n auto -m "bigquery" --retries 3 --junitxml=test-results/junit-bigquery.xml
 
 databricks-test: guard-DATABRICKS_CATALOG guard-DATABRICKS_SERVER_HOSTNAME guard-DATABRICKS_HTTP_PATH guard-DATABRICKS_ACCESS_TOKEN guard-DATABRICKS_CONNECT_VERSION engine-databricks-install
 	pip install 'databricks-connect==${DATABRICKS_CONNECT_VERSION}'
-	pytest -n auto -x -m "databricks" --retries 3 --junitxml=test-results/junit-databricks.xml
+	pytest -n auto -m "databricks" --retries 3 --junitxml=test-results/junit-databricks.xml
 
 redshift-test: guard-REDSHIFT_HOST guard-REDSHIFT_USER guard-REDSHIFT_PASSWORD guard-REDSHIFT_DATABASE engine-redshift-install
-	pytest -n auto -x -m "redshift" --retries 3 --junitxml=test-results/junit-redshift.xml
+	pytest -n auto -m "redshift" --retries 3 --junitxml=test-results/junit-redshift.xml
 
 clickhouse-cloud-test: guard-CLICKHOUSE_CLOUD_HOST guard-CLICKHOUSE_CLOUD_USERNAME guard-CLICKHOUSE_CLOUD_PASSWORD engine-clickhouse-install
-	pytest -n auto -x -m "clickhouse_cloud" --retries 3 --junitxml=test-results/junit-clickhouse-cloud.xml
+	pytest -n 1 -m "clickhouse_cloud" --retries 3 --junitxml=test-results/junit-clickhouse-cloud.xml
 
 athena-test: guard-AWS_ACCESS_KEY_ID guard-AWS_SECRET_ACCESS_KEY guard-ATHENA_S3_WAREHOUSE_LOCATION engine-athena-install
-	pytest -n auto -x -m "athena" --retries 3 --retry-delay 10 --junitxml=test-results/junit-athena.xml
+	pytest -n auto -m "athena" --retries 3 --junitxml=test-results/junit-athena.xml
+
+vscode_settings:
+	mkdir -p .vscode
+	cp -r ./tooling/vscode/*.json .vscode/
+
+vscode-generate-openapi:
+	python3 web/server/openapi.py --output vscode/openapi.json
+	pnpm run fmt
+	cd vscode/react && pnpm run generate:api
+
+benchmark-ci:
+	python benchmarks/lsp_render_model_bench.py --debug-single-value

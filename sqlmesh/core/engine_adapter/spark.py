@@ -4,7 +4,6 @@ import logging
 import typing as t
 from functools import partial
 
-import pandas as pd
 from sqlglot import exp
 
 from sqlmesh.core.dialect import to_schema
@@ -28,6 +27,7 @@ from sqlmesh.utils import classproperty
 from sqlmesh.utils.errors import SQLMeshError
 
 if t.TYPE_CHECKING:
+    import pandas as pd
     from pyspark.sql import types as spark_types
 
     from sqlmesh.core._typing import SchemaName, TableName
@@ -51,7 +51,6 @@ class SparkEngineAdapter(
     DIALECT = "spark"
     SUPPORTS_TRANSACTIONS = False
     INSERT_OVERWRITE_STRATEGY = InsertOverwriteStrategy.INSERT_OVERWRITE
-    CATALOG_SUPPORT = CatalogSupport.FULL_SUPPORT
     COMMENT_CREATION_TABLE = CommentCreationTable.IN_SCHEMA_DEF_NO_CTAS
     COMMENT_CREATION_VIEW = CommentCreationView.IN_SCHEMA_DEF_NO_COMMANDS
     # Note: Some formats (like Delta and Iceberg) support REPLACE TABLE but since we don't
@@ -84,6 +83,10 @@ class SparkEngineAdapter(
     def use_serverless(self) -> bool:
         return False
 
+    @property
+    def catalog_support(self) -> CatalogSupport:
+        return CatalogSupport.FULL_SUPPORT
+
     @classproperty
     def _sqlglot_to_spark_primitive_mapping(self) -> t.Dict[t.Any, t.Any]:
         from pyspark.sql import types as spark_types
@@ -102,6 +105,7 @@ class SparkEngineAdapter(
             exp.DataType.Type.BINARY: spark_types.BinaryType,
             exp.DataType.Type.BOOLEAN: spark_types.BooleanType,
             exp.DataType.Type.DATE: spark_types.DateType,
+            exp.DataType.Type.TIMESTAMPNTZ: spark_types.TimestampNTZType,
             exp.DataType.Type.DATETIME: spark_types.TimestampNTZType,
             exp.DataType.Type.TIMESTAMPLTZ: spark_types.TimestampType,
             exp.DataType.Type.TIMESTAMP: spark_types.TimestampType,
@@ -228,6 +232,8 @@ class SparkEngineAdapter(
 
     @classmethod
     def try_get_pandas_df(cls, value: t.Any) -> t.Optional[pd.DataFrame]:
+        import pandas as pd
+
         if isinstance(value, pd.DataFrame):
             return value
         return None
@@ -275,10 +281,16 @@ class SparkEngineAdapter(
     ) -> PySparkDataFrame:
         pyspark_df = self.try_get_pyspark_df(generic_df)
         if pyspark_df:
+            if columns_to_types:
+                # ensure Spark dataframe column order matches columns_to_types
+                pyspark_df = pyspark_df.select(*columns_to_types)
             return pyspark_df
         df = self.try_get_pandas_df(generic_df)
         if df is None:
             raise SQLMeshError("Ensure PySpark DF can only be run on a PySpark or Pandas DataFrame")
+        if columns_to_types:
+            # ensure Pandas dataframe column order matches columns_to_types
+            df = df[list(columns_to_types)]
         kwargs = (
             dict(schema=self.sqlglot_to_spark_types(columns_to_types)) if columns_to_types else {}
         )
@@ -372,51 +384,14 @@ class SparkEngineAdapter(
             partitioned_by=[exp.column(x) for x in primary_key] if primary_key else None,
         )
 
-    def create_view(
+    def _native_df_to_pandas_df(
         self,
-        view_name: TableName,
         query_or_df: QueryOrDF,
-        columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
-        replace: bool = True,
-        materialized: bool = False,
-        materialized_properties: t.Optional[t.Dict[str, t.Any]] = None,
-        table_description: t.Optional[str] = None,
-        column_descriptions: t.Optional[t.Dict[str, str]] = None,
-        view_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
-        **create_kwargs: t.Any,
-    ) -> None:
-        """Create a view with a query or dataframe.
+    ) -> t.Union[Query, pd.DataFrame]:
+        if pyspark_df := self.try_get_pyspark_df(query_or_df):
+            return pyspark_df.toPandas()
 
-        If a dataframe is passed in, it will be converted into a literal values statement.
-        This should only be done if the dataframe is very small!
-
-        Args:
-            view_name: The view name.
-            query_or_df: A query or dataframe.
-            columns_to_types: Columns to use in the view statement.
-            replace: Whether or not to replace an existing view - defaults to True.
-            materialized: Whether or not the view should be materialized - defaults to False.
-            materialized_properties: Optional materialized view properties to add to the view.
-            table_description: Optional table description from MODEL DDL.
-            column_descriptions: Optional column descriptions from model query.
-            create_kwargs: Additional kwargs to pass into the Create expression
-            view_properties: Optional view properties to add to the view.
-        """
-        pyspark_df = self.try_get_pyspark_df(query_or_df)
-        if pyspark_df:
-            query_or_df = pyspark_df.toPandas()
-        super().create_view(
-            view_name,
-            query_or_df,
-            columns_to_types,
-            replace,
-            materialized,
-            materialized_properties,
-            table_description,
-            column_descriptions,
-            view_properties=view_properties,
-            **create_kwargs,
-        )
+        return super()._native_df_to_pandas_df(query_or_df)
 
     def _create_table(
         self,

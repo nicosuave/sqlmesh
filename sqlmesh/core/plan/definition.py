@@ -7,7 +7,8 @@ from enum import Enum
 from functools import cached_property
 
 from sqlmesh.core.context_diff import ContextDiff
-from sqlmesh.core.environment import Environment, EnvironmentNamingInfo
+from sqlmesh.core.environment import Environment, EnvironmentNamingInfo, EnvironmentStatements
+from sqlmesh.utils.metaprogramming import Executable  # noqa
 from sqlmesh.core.node import IntervalUnit
 from sqlmesh.core.snapshot import (
     DeployabilityIndex,
@@ -27,6 +28,7 @@ from sqlmesh.utils.date import TimeLike, now, to_datetime, to_timestamp
 from sqlmesh.utils.pydantic import PydanticModel
 
 SnapshotMapping = t.Dict[SnapshotId, t.Set[SnapshotId]]
+UserProvidedFlags = t.Union[TimeLike, str, bool, t.List[str]]
 
 
 class Plan(PydanticModel, frozen=True):
@@ -61,6 +63,8 @@ class Plan(PydanticModel, frozen=True):
     """All models that should be backfilled as part of this plan."""
     effective_from: t.Optional[TimeLike] = None
     execution_time: t.Optional[TimeLike] = None
+
+    user_provided_flags: t.Optional[t.Dict[str, UserProvidedFlags]] = None
 
     @cached_property
     def start(self) -> TimeLike:
@@ -108,7 +112,7 @@ class Plan(PydanticModel, frozen=True):
         """Returns the already categorized snapshots."""
         return [
             self.context_diff.snapshots[s_id]
-            for s_id in sorted(self.directly_modified)
+            for s_id in sorted({*self.directly_modified, *self.metadata_updated})
             if self.context_diff.snapshots[s_id].version
         ]
 
@@ -136,6 +140,15 @@ class Plan(PydanticModel, frozen=True):
                 for s_id in sorted(downstream_s_ids)
             },
             **self.context_diff.removed_snapshots,
+            **{s_id: self.context_diff.snapshots[s_id] for s_id in sorted(self.metadata_updated)},
+        }
+
+    @cached_property
+    def metadata_updated(self) -> t.Set[SnapshotId]:
+        return {
+            snapshot.snapshot_id
+            for snapshot, _ in self.context_diff.modified_snapshots.values()
+            if self.context_diff.metadata_updated(snapshot.name)
         }
 
     @property
@@ -246,6 +259,13 @@ class Plan(PydanticModel, frozen=True):
             models_to_backfill=self.models_to_backfill,
             interval_end_per_model=self.interval_end_per_model,
             execution_time=self.execution_time,
+            disabled_restatement_models={
+                s.name
+                for s in self.snapshots.values()
+                if s.is_model and s.model.disable_restatement
+            },
+            environment_statements=self.context_diff.environment_statements,
+            user_provided_flags=self.user_provided_flags,
         )
 
     @cached_property
@@ -276,6 +296,9 @@ class EvaluatablePlan(PydanticModel):
     models_to_backfill: t.Optional[t.Set[str]] = None
     interval_end_per_model: t.Optional[t.Dict[str, int]] = None
     execution_time: t.Optional[TimeLike] = None
+    disabled_restatement_models: t.Set[str]
+    environment_statements: t.Optional[t.List[EnvironmentStatements]] = None
+    user_provided_flags: t.Optional[t.Dict[str, UserProvidedFlags]] = None
 
     def is_selected_for_backfill(self, model_fqn: str) -> bool:
         return self.models_to_backfill is None or model_fqn in self.models_to_backfill
@@ -283,6 +306,10 @@ class EvaluatablePlan(PydanticModel):
     @property
     def plan_id(self) -> str:
         return self.environment.plan_id
+
+    @property
+    def is_prod(self) -> bool:
+        return not self.is_dev
 
 
 class PlanStatus(str, Enum):

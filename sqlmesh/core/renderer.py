@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import typing as t
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 
 from sqlglot import exp, parse
@@ -15,10 +16,9 @@ from sqlglot.optimizer.simplify import simplify
 from sqlmesh.core import constants as c
 from sqlmesh.core import dialect as d
 from sqlmesh.core.macros import MacroEvaluator, RuntimeStage
-from sqlmesh.utils.date import TimeLike, date_dict, make_inclusive_end, to_datetime
+from sqlmesh.utils.date import TimeLike, date_dict, make_inclusive, to_datetime
 from sqlmesh.utils.errors import (
     ConfigError,
-    MacroEvalError,
     ParsetimeAdapterCallError,
     SQLMeshError,
     raise_config_error,
@@ -30,6 +30,7 @@ if t.TYPE_CHECKING:
     from sqlglot._typing import E
     from sqlglot.dialects.dialect import DialectType
 
+    from sqlmesh.core.linter.rule import Rule
     from sqlmesh.core.snapshot import DeployabilityIndex, Snapshot
 
 
@@ -51,6 +52,7 @@ class BaseExpressionRenderer:
         quote_identifiers: bool = True,
         model_fqn: t.Optional[str] = None,
         normalize_identifiers: bool = True,
+        optimize_query: t.Optional[bool] = True,
     ):
         self._expression = expression
         self._dialect = dialect
@@ -65,6 +67,7 @@ class BaseExpressionRenderer:
         self.update_schema({} if schema is None else schema)
         self._cache: t.List[t.Optional[exp.Expression]] = []
         self._model_fqn = model_fqn
+        self._optimize_query_flag = optimize_query is not False
 
     def update_schema(self, schema: t.Dict[str, t.Any]) -> None:
         self.schema = d.normalize_mapping_schema(schema, dialect=self._dialect)
@@ -103,41 +106,100 @@ class BaseExpressionRenderer:
         if should_cache and self._cache:
             return self._cache
 
+        environment_naming_info = kwargs.get("environment_naming_info")
+        if environment_naming_info is not None:
+            kwargs["this_env"] = getattr(environment_naming_info, "name")
+            if snapshots:
+                schemas, views = set(), []
+                for snapshot in snapshots.values():
+                    if snapshot.is_model and not snapshot.is_symbolic:
+                        schemas.add(
+                            snapshot.qualified_view_name.schema_for_environment(
+                                environment_naming_info, dialect=self._dialect
+                            )
+                        )
+                        views.append(
+                            snapshot.display_name(
+                                environment_naming_info, self._default_catalog, self._dialect
+                            )
+                        )
+                if schemas:
+                    kwargs["schemas"] = list(schemas)
+                if views:
+                    kwargs["views"] = views
+
         this_model = kwargs.pop("this_model", None)
 
+        this_snapshot = (snapshots or {}).get(self._model_fqn) if self._model_fqn else None
         if not this_model and self._model_fqn:
-            this_snapshot = (snapshots or {}).get(self._model_fqn)
             this_model = self._resolve_table(
                 self._model_fqn,
                 snapshots={self._model_fqn: this_snapshot} if this_snapshot else None,
                 deployability_index=deployability_index,
+                table_mapping=table_mapping,
             )
+        if this_snapshot and (kind := this_snapshot.model_kind_name):
+            kwargs["model_kind_name"] = kind.name
 
-        expressions = [self._expression]
+        def _resolve_table(table: str | exp.Table) -> str:
+            return self._resolve_table(
+                d.normalize_model_name(table, self._default_catalog, self._dialect),
+                snapshots=snapshots,
+                table_mapping=table_mapping,
+                deployability_index=deployability_index,
+            ).sql(dialect=self._dialect, identify=True, comments=False)
+
+        macro_evaluator = MacroEvaluator(
+            self._dialect,
+            python_env=self._python_env,
+            schema=self.schema,
+            runtime_stage=runtime_stage,
+            resolve_table=_resolve_table,
+            resolve_tables=lambda e: self._resolve_tables(
+                e,
+                snapshots=snapshots,
+                table_mapping=table_mapping,
+                deployability_index=deployability_index,
+                start=start,
+                end=end,
+                execution_time=execution_time,
+                runtime_stage=runtime_stage,
+            ),
+            snapshots=snapshots,
+            default_catalog=self._default_catalog,
+            path=self._path,
+            environment_naming_info=environment_naming_info,
+            model_fqn=self._model_fqn,
+        )
+
+        start_time, end_time = (
+            make_inclusive(start or c.EPOCH, end or c.EPOCH, self._dialect)
+            if not self._only_execution_time
+            else (None, None)
+        )
 
         render_kwargs = {
             **date_dict(
                 to_datetime(execution_time or c.EPOCH),
-                to_datetime(start or c.EPOCH) if not self._only_execution_time else None,
-                make_inclusive_end(end or c.EPOCH) if not self._only_execution_time else None,
+                start_time,
+                end_time,
             ),
             **kwargs,
         }
 
         variables = kwargs.pop("variables", {})
         jinja_env_kwargs = {
-            **{**render_kwargs, **prepare_env(self._python_env), **variables},
+            **{
+                **render_kwargs,
+                **_prepare_python_env_for_jinja(macro_evaluator, self._python_env),
+                **variables,
+            },
             "snapshots": snapshots or {},
             "table_mapping": table_mapping,
             "deployability_index": deployability_index,
             "default_catalog": self._default_catalog,
             "runtime_stage": runtime_stage.value,
-            "resolve_table": lambda table: self._resolve_table(
-                table,
-                snapshots=snapshots,
-                table_mapping=table_mapping,
-                deployability_index=deployability_index,
-            ).sql(dialect=self._dialect, identify=True, comments=False),
+            "resolve_table": _resolve_table,
         }
         if this_model:
             render_kwargs["this_model"] = this_model
@@ -147,6 +209,7 @@ class BaseExpressionRenderer:
 
         jinja_env = self._jinja_macro_registry.build_environment(**jinja_env_kwargs)
 
+        expressions = [self._expression]
         if isinstance(self._expression, d.Jinja):
             try:
                 expressions = []
@@ -163,46 +226,29 @@ class BaseExpressionRenderer:
                     f"Could not render or parse jinja at '{self._path}'.\n{ex}"
                 ) from ex
 
-        macro_evaluator = MacroEvaluator(
-            self._dialect,
-            python_env=self._python_env,
-            jinja_env=jinja_env,
-            schema=self.schema,
-            runtime_stage=runtime_stage,
-            resolve_table=jinja_env.globals["resolve_table"],  # type: ignore
-            resolve_tables=lambda e: self._resolve_tables(
-                e,
-                snapshots=snapshots,
-                table_mapping=table_mapping,
-                deployability_index=deployability_index,
-                start=start,
-                end=end,
-                execution_time=execution_time,
-                runtime_stage=runtime_stage,
-            ),
-            snapshots=snapshots,
-            default_catalog=self._default_catalog,
-            path=self._path,
-        )
-
-        for definition in self._macro_definitions:
-            try:
-                macro_evaluator.evaluate(definition)
-            except MacroEvalError as ex:
-                raise_config_error(f"Failed to evaluate macro '{definition}'. {ex}", self._path)
-
         macro_evaluator.locals.update(render_kwargs)
 
         if variables:
             macro_evaluator.locals.setdefault(c.SQLMESH_VARS, {}).update(variables)
+
+        for definition in self._macro_definitions:
+            try:
+                macro_evaluator.evaluate(definition)
+            except Exception as ex:
+                raise_config_error(
+                    f"Failed to evaluate macro '{definition}'.\n\n{ex}\n", self._path
+                )
 
         resolved_expressions: t.List[t.Optional[exp.Expression]] = []
 
         for expression in expressions:
             try:
                 transformed_expressions = ensure_list(macro_evaluator.transform(expression))
-            except MacroEvalError as ex:
-                raise_config_error(f"Failed to resolve macro for expression. {ex}", self._path)
+            except Exception as ex:
+                raise_config_error(
+                    f"Failed to resolve macros for\n\n{expression.sql(dialect=self._dialect, pretty=True)}\n\n{ex}\n",
+                    self._path,
+                )
 
             for expression in t.cast(t.List[exp.Expression], transformed_expressions):
                 with self._normalize_and_quote(expression) as expression:
@@ -315,8 +361,7 @@ class BaseExpressionRenderer:
                                     alias=node.alias or model.view_name,
                                     copy=False,
                                 )
-                            else:
-                                logger.warning("Failed to expand the nested model '%s'", name)
+                            logger.warning("Failed to expand the nested model '%s'", name)
                     return node
 
                 expression = expression.transform(_expand, copy=False)  # type: ignore
@@ -368,6 +413,7 @@ class ExpressionRenderer(BaseExpressionRenderer):
                 execution_time=execution_time,
                 snapshots=snapshots,
                 deployability_index=deployability_index,
+                table_mapping=table_mapping,
                 **kwargs,
             )
         except ParsetimeAdapterCallError:
@@ -390,10 +436,45 @@ class ExpressionRenderer(BaseExpressionRenderer):
         ]
 
 
+def render_statements(
+    statements: t.List[str],
+    dialect: str,
+    default_catalog: t.Optional[str] = None,
+    python_env: t.Optional[t.Dict[str, Executable]] = None,
+    jinja_macros: t.Optional[JinjaMacroRegistry] = None,
+    **render_kwargs: t.Any,
+) -> t.List[str]:
+    rendered_statements: t.List[str] = []
+    for statement in statements:
+        for expression in d.parse(statement, default_dialect=dialect):
+            if expression:
+                rendered = ExpressionRenderer(
+                    expression,
+                    dialect,
+                    [],
+                    jinja_macro_registry=jinja_macros,
+                    python_env=python_env,
+                    default_catalog=default_catalog,
+                    quote_identifiers=False,
+                    normalize_identifiers=False,
+                ).render(**render_kwargs)
+
+                if not rendered:
+                    # Warning instead of raising for cases where a statement is conditionally executed
+                    logger.warning(
+                        f"Rendering `{expression.sql(dialect=dialect)}` did not return an expression"
+                    )
+                else:
+                    rendered_statements.extend(expr.sql(dialect=dialect) for expr in rendered)
+
+    return rendered_statements
+
+
 class QueryRenderer(BaseExpressionRenderer):
     def __init__(self, *args: t.Any, **kwargs: t.Any):
         super().__init__(*args, **kwargs)
         self._optimized_cache: t.Optional[exp.Query] = None
+        self._violated_rules: t.Dict[type[Rule], t.Any] = {}
 
     def update_schema(self, schema: t.Dict[str, t.Any]) -> None:
         super().update_schema(schema)
@@ -437,6 +518,8 @@ class QueryRenderer(BaseExpressionRenderer):
         should_cache = self._should_cache(
             runtime_stage, start, end, execution_time, *kwargs.values()
         )
+
+        needs_optimization = needs_optimization and self._optimize_query_flag
 
         if should_cache and self._optimized_cache:
             query = self._optimized_cache
@@ -499,7 +582,12 @@ class QueryRenderer(BaseExpressionRenderer):
 
         return query
 
-    def update_cache(self, expression: t.Optional[exp.Expression], optimized: bool = False) -> None:
+    def update_cache(
+        self,
+        expression: t.Optional[exp.Expression],
+        violated_rules: t.Optional[t.Dict[type[Rule], t.Any]] = None,
+        optimized: bool = False,
+    ) -> None:
         if optimized:
             if not isinstance(expression, exp.Query):
                 raise SQLMeshError(f"Expected a Query but got: {expression}")
@@ -507,7 +595,14 @@ class QueryRenderer(BaseExpressionRenderer):
         else:
             super().update_cache(expression)
 
+        self._violated_rules = violated_rules or {}
+
     def _optimize_query(self, query: exp.Query, all_deps: t.Set[str]) -> exp.Query:
+        from sqlmesh.core.linter.rules.builtin import (
+            AmbiguousOrInvalidColumn,
+            InvalidSelectStarExpansion,
+        )
+
         # We don't want to normalize names in the schema because that's handled by the optimizer
         original = query
         missing_deps = set()
@@ -521,12 +616,7 @@ class QueryRenderer(BaseExpressionRenderer):
 
         if self._model_fqn and not should_optimize and any(s.is_star for s in query.selects):
             deps = ", ".join(f"'{dep}'" for dep in sorted(missing_deps))
-
-            logger.warning(
-                f"SELECT * cannot be expanded due to missing schema(s) for model(s): {deps}. "
-                "Run `sqlmesh create_external_models` and / or make sure that the model "
-                f"'{self._model_fqn}' can be rendered at parse time.",
-            )
+            self._violated_rules[InvalidSelectStarExpansion] = deps
 
         try:
             if should_optimize:
@@ -542,14 +632,15 @@ class QueryRenderer(BaseExpressionRenderer):
                             quote_identifiers=self._quote_identifiers,
                         ),
                         schema=self.schema,
-                    )
+                        dialect=self._dialect,
+                    ),
+                    dialect=self._dialect,
                 )
         except SqlglotError as ex:
+            self._violated_rules[AmbiguousOrInvalidColumn] = ex
+
             query = original
 
-            logger.warning(
-                "%s for model '%s', the column may not exist or is ambiguous", ex, self._model_fqn
-            )
         except Exception as ex:
             raise_config_error(
                 f"Failed to optimize query, please file an issue at https://github.com/TobikoData/sqlmesh/issues/new. {ex}",
@@ -561,3 +652,15 @@ class QueryRenderer(BaseExpressionRenderer):
                 annotate_types(select)
 
         return query
+
+
+def _prepare_python_env_for_jinja(
+    evaluator: MacroEvaluator,
+    python_env: t.Dict[str, Executable],
+) -> t.Dict[str, t.Any]:
+    prepared_env = prepare_env(python_env)
+    # Pass the evaluator to all macro functions
+    return {
+        key: partial(value, evaluator) if callable(value) else value
+        for key, value in prepared_env.items()
+    }

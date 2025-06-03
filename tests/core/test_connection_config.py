@@ -1,4 +1,5 @@
 import base64
+import re
 import typing as t
 
 import pytest
@@ -12,14 +13,17 @@ from sqlmesh.core.config.connection import (
     DuckDBAttachOptions,
     DuckDBConnectionConfig,
     GCPPostgresConnectionConfig,
+    MotherDuckConnectionConfig,
     MySQLConnectionConfig,
     PostgresConnectionConfig,
     SnowflakeConnectionConfig,
     TrinoAuthenticationMethod,
     AthenaConnectionConfig,
     _connection_config_validator,
+    _get_engine_import_validator,
 )
 from sqlmesh.utils.errors import ConfigError
+from sqlmesh.utils.pydantic import PydanticModel
 
 
 @pytest.fixture
@@ -388,12 +392,51 @@ def test_trino(make_config):
         make_config(method="ldap", http_scheme="http", **required_kwargs)
 
 
+def test_trino_schema_location_mapping(make_config):
+    required_kwargs = dict(
+        type="trino",
+        user="user",
+        host="host",
+        catalog="catalog",
+    )
+
+    with pytest.raises(
+        ConfigError, match=r".*needs to include the '@\{schema_name\}' placeholder.*"
+    ):
+        make_config(**required_kwargs, schema_location_mapping={".*": "s3://foo"})
+
+    config = make_config(
+        **required_kwargs,
+        schema_location_mapping={
+            "^utils$": "s3://utils-bucket/@{schema_name}",
+            "^staging.*$": "s3://bucket/@{schema_name}_dev",
+            "^sqlmesh.*$": "s3://sqlmesh-internal/dev/@{schema_name}",
+        },
+    )
+
+    assert config.schema_location_mapping is not None
+    assert len(config.schema_location_mapping) == 3
+
+    assert all((isinstance(k, re.Pattern) for k in config.schema_location_mapping))
+    assert all((isinstance(v, str) for v in config.schema_location_mapping.values()))
+
+
 def test_duckdb(make_config):
     config = make_config(
         type="duckdb",
         database="test",
         connector_config={"foo": "bar"},
+        secrets=[
+            {
+                "type": "s3",
+                "region": "aws_region",
+                "key_id": "aws_access_key",
+                "secret": "aws_secret",
+            }
+        ],
     )
+    assert config.connector_config
+    assert config.secrets
     assert isinstance(config, DuckDBConnectionConfig)
     assert not config.is_recommended_for_state_sync
 
@@ -559,6 +602,33 @@ def test_duckdb_attach_catalog(make_config):
     assert not config.is_recommended_for_state_sync
 
 
+def test_duckdb_attach_ducklake_catalog(make_config):
+    config = make_config(
+        type="duckdb",
+        catalogs={
+            "ducklake": DuckDBAttachOptions(
+                type="ducklake",
+                path="catalog.ducklake",
+                data_path="/tmp/ducklake_data",
+                encrypted=True,
+                data_inlining_row_limit=10,
+            ),
+        },
+    )
+    assert isinstance(config, DuckDBConnectionConfig)
+    ducklake_catalog = config.catalogs.get("ducklake")
+    assert ducklake_catalog is not None
+    assert ducklake_catalog.type == "ducklake"
+    assert ducklake_catalog.path == "catalog.ducklake"
+    assert ducklake_catalog.data_path == "/tmp/ducklake_data"
+    assert ducklake_catalog.encrypted is True
+    assert ducklake_catalog.data_inlining_row_limit == 10
+    # Check that the generated SQL includes DATA_PATH
+    assert "DATA_PATH '/tmp/ducklake_data'" in ducklake_catalog.to_sql("ducklake")
+    assert "ENCRYPTED" in ducklake_catalog.to_sql("ducklake")
+    assert "DATA_INLINING_ROW_LIMIT 10" in ducklake_catalog.to_sql("ducklake")
+
+
 def test_duckdb_attach_options():
     options = DuckDBAttachOptions(
         type="postgres", path="dbname=postgres user=postgres host=127.0.0.1", read_only=True
@@ -566,17 +636,73 @@ def test_duckdb_attach_options():
 
     assert (
         options.to_sql(alias="db")
-        == "ATTACH 'dbname=postgres user=postgres host=127.0.0.1' AS db (TYPE POSTGRES, READ_ONLY)"
+        == "ATTACH IF NOT EXISTS 'dbname=postgres user=postgres host=127.0.0.1' AS db (TYPE POSTGRES, READ_ONLY)"
     )
 
     options = DuckDBAttachOptions(type="duckdb", path="test.db", read_only=False)
 
-    assert options.to_sql(alias="db") == "ATTACH 'test.db' AS db"
+    assert options.to_sql(alias="db") == "ATTACH IF NOT EXISTS 'test.db' AS db"
+
+
+def test_duckdb_config_json_strings(make_config):
+    config = make_config(
+        type="duckdb",
+        extensions='["foo","bar"]',
+        catalogs="""{
+            "test1": "test1.duckdb",
+            "test2": {
+                "type": "duckdb",
+                "path": "test2.duckdb"
+            }
+        }""",
+    )
+    assert isinstance(config, DuckDBConnectionConfig)
+
+    assert config.extensions == ["foo", "bar"]
+
+    assert config.get_catalog() == "test1"
+    assert config.catalogs.get("test1") == "test1.duckdb"
+    assert config.catalogs.get("test2").path == "test2.duckdb"
+
+
+def test_motherduck_attach_catalog(make_config):
+    config = make_config(
+        type="motherduck",
+        catalogs={
+            "test1": "md:test1",
+            "test2": DuckDBAttachOptions(
+                type="motherduck",
+                path="md:test2",
+            ),
+        },
+    )
+    assert isinstance(config, MotherDuckConnectionConfig)
+    assert config.get_catalog() == "test1"
+
+    assert config.catalogs.get("test2").read_only is False
+    assert config.catalogs.get("test2").path == "md:test2"
+    assert not config.is_recommended_for_state_sync
+
+
+def test_motherduck_attach_options():
+    options = DuckDBAttachOptions(
+        type="postgres", path="dbname=postgres user=postgres host=127.0.0.1", read_only=True
+    )
+
+    assert (
+        options.to_sql(alias="db")
+        == "ATTACH IF NOT EXISTS 'dbname=postgres user=postgres host=127.0.0.1' AS db (TYPE POSTGRES, READ_ONLY)"
+    )
+
+    options = DuckDBAttachOptions(type="motherduck", path="md:test.db", read_only=False)
+
+    # Here the alias should be ignored compared to duckdb
+    assert options.to_sql(alias="db") == "ATTACH IF NOT EXISTS 'md:test.db'"
 
 
 def test_duckdb_multithreaded_connection_factory(make_config):
     from sqlmesh.core.engine_adapter import DuckDBEngineAdapter
-    from sqlmesh.utils.connection_pool import ThreadLocalConnectionPool
+    from sqlmesh.utils.connection_pool import ThreadLocalSharedConnectionPool
     from threading import Thread
 
     config = make_config(type="duckdb")
@@ -589,7 +715,7 @@ def test_duckdb_multithreaded_connection_factory(make_config):
     config = make_config(type="duckdb", concurrent_tasks=8)
     adapter = config.create_engine_adapter()
     assert isinstance(adapter, DuckDBEngineAdapter)
-    assert isinstance(adapter._connection_pool, ThreadLocalConnectionPool)
+    assert isinstance(adapter._connection_pool, ThreadLocalSharedConnectionPool)
 
     threads = []
     connection_objects = []
@@ -615,12 +741,76 @@ def test_duckdb_multithreaded_connection_factory(make_config):
     assert adapter.fetchone("select 1") == (1,)
 
 
+def test_motherduck_token_mask(make_config):
+    config_1 = make_config(
+        type="motherduck",
+        token="short",
+        database="whodunnit",
+    )
+    config_2 = make_config(
+        type="motherduck",
+        token="longtoken123456789",
+        database="whodunnit",
+    )
+    config_3 = make_config(
+        type="motherduck",
+        token="secret1235",
+        catalogs={
+            "test1": DuckDBAttachOptions(
+                type="motherduck",
+                path="md:whodunnit",
+            ),
+        },
+    )
+
+    assert isinstance(config_1, MotherDuckConnectionConfig)
+    assert isinstance(config_2, MotherDuckConnectionConfig)
+    assert isinstance(config_3, MotherDuckConnectionConfig)
+    assert config_1._mask_motherduck_token(config_1.database) == "whodunnit"
+    assert (
+        config_1._mask_motherduck_token(f"md:{config_1.database}?motherduck_token={config_1.token}")
+        == "md:whodunnit?motherduck_token=*****"
+    )
+    assert (
+        config_1._mask_motherduck_token(
+            f"md:{config_1.database}?attach_mode=single&motherduck_token={config_1.token}"
+        )
+        == "md:whodunnit?attach_mode=single&motherduck_token=*****"
+    )
+    assert (
+        config_2._mask_motherduck_token(f"md:{config_2.database}?motherduck_token={config_2.token}")
+        == "md:whodunnit?motherduck_token=******************"
+    )
+    assert (
+        config_3._mask_motherduck_token(f"md:?motherduck_token={config_3.token}")
+        == "md:?motherduck_token=**********"
+    )
+    assert (
+        config_1._mask_motherduck_token("?motherduck_token=secret1235")
+        == "?motherduck_token=**********"
+    )
+    assert (
+        config_1._mask_motherduck_token("md:whodunnit?motherduck_token=short")
+        == "md:whodunnit?motherduck_token=*****"
+    )
+    assert (
+        config_1._mask_motherduck_token("md:whodunnit?motherduck_token=longtoken123456789")
+        == "md:whodunnit?motherduck_token=******************"
+    )
+    assert (
+        config_1._mask_motherduck_token("md:whodunnit?motherduck_token=")
+        == "md:whodunnit?motherduck_token="
+    )
+    assert config_1._mask_motherduck_token(":memory:") == ":memory:"
+
+
 def test_bigquery(make_config):
     config = make_config(
         type="bigquery",
         project="project",
         execution_project="execution_project",
         quota_project="quota_project",
+        check_import=False,
     )
 
     assert isinstance(config, BigQueryConnectionConfig)
@@ -631,10 +821,25 @@ def test_bigquery(make_config):
     assert config.is_recommended_for_state_sync is False
 
     with pytest.raises(ConfigError, match="you must also specify the `project` field"):
-        make_config(type="bigquery", execution_project="execution_project")
+        make_config(type="bigquery", execution_project="execution_project", check_import=False)
 
     with pytest.raises(ConfigError, match="you must also specify the `project` field"):
-        make_config(type="bigquery", quota_project="quota_project")
+        make_config(type="bigquery", quota_project="quota_project", check_import=False)
+
+
+def test_bigquery_config_json_string(make_config):
+    config = make_config(
+        type="bigquery",
+        project="project",
+        # these can be present as strings if they came from env vars
+        scopes='["a","b","c"]',
+        keyfile_json='{"foo":"bar"}',
+    )
+
+    assert isinstance(config, BigQueryConnectionConfig)
+
+    assert config.scopes == ("a", "b", "c")
+    assert config.keyfile_json == {"foo": "bar"}
 
 
 def test_postgres(make_config):
@@ -657,9 +862,21 @@ def test_gcp_postgres(make_config):
         user="user",
         password="password",
         db="database",
+        check_import=False,
     )
     assert isinstance(config, GCPPostgresConnectionConfig)
     assert config.is_recommended_for_state_sync is True
+    assert config.ip_type == "public"
+    config = make_config(
+        type="gcp_postgres",
+        instance_connection_string="something",
+        user="user",
+        password="password",
+        db="database",
+        ip_type="private",
+        check_import=False,
+    )
+    assert config.ip_type == "private"
 
 
 def test_mysql(make_config):
@@ -668,6 +885,7 @@ def test_mysql(make_config):
         host="host",
         user="user",
         password="password",
+        check_import=False,
     )
     assert isinstance(config, MySQLConnectionConfig)
     assert config.is_recommended_for_state_sync is True
@@ -684,6 +902,13 @@ def test_clickhouse(make_config):
         cluster="default",
         use_compression=True,
         connection_settings={"this_setting": "1"},
+        server_host_name="server_host_name",
+        verify=True,
+        ca_cert="ca_cert",
+        client_cert="client_cert",
+        client_cert_key="client_cert_key",
+        https_proxy="https://proxy",
+        connection_pool_options={"pool_option": "value"},
     )
     assert isinstance(config, ClickhouseConnectionConfig)
     assert config.cluster == "default"
@@ -693,6 +918,14 @@ def test_clickhouse(make_config):
     assert config._static_connection_kwargs["this_setting"] == "1"
     assert config.is_recommended_for_state_sync is False
     assert config.is_forbidden_for_state_sync
+
+    pool = config._connection_factory.keywords["pool_mgr"]
+    assert pool.connection_pool_kw["server_hostname"] == "server_host_name"
+    assert pool.connection_pool_kw["assert_hostname"] == "server_host_name"  # because verify=True
+    assert pool.connection_pool_kw["ca_certs"] == "ca_cert"
+    assert pool.connection_pool_kw["cert_file"] == "client_cert"
+    assert pool.connection_pool_kw["key_file"] == "client_cert_key"
+    assert pool.connection_pool_kw["pool_option"] == "value"
 
     config2 = make_config(
         type="clickhouse",
@@ -834,13 +1067,13 @@ def test_databricks(make_config):
     assert oauth_u2m_config.oauth_client_secret is None
 
     # auth_type must match the AuthType enum if specified
-    with pytest.raises(ValueError, match=r".*nonexist does not match a valid option.*"):
+    with pytest.raises(ConfigError, match=r".*nonexist does not match a valid option.*"):
         make_config(
             type="databricks", server_hostname="dbc-test.cloud.databricks.com", auth_type="nonexist"
         )
 
     # if client_secret is specified, client_id must also be specified
-    with pytest.raises(ValueError, match=r"`oauth_client_id` is required.*"):
+    with pytest.raises(ConfigError, match=r"`oauth_client_id` is required.*"):
         make_config(
             type="databricks",
             server_hostname="dbc-test.cloud.databricks.com",
@@ -849,9 +1082,48 @@ def test_databricks(make_config):
         )
 
     # http_path is still required when auth_type is specified
-    with pytest.raises(ValueError, match=r"`http_path` is still required.*"):
+    with pytest.raises(ConfigError, match=r"`http_path` is still required.*"):
         make_config(
             type="databricks",
             server_hostname="dbc-test.cloud.databricks.com",
             auth_type="databricks-oauth",
         )
+
+
+def test_engine_import_validator():
+    with pytest.raises(
+        ConfigError,
+        match=re.escape(
+            "Failed to import the 'bigquery' engine library. This may be due to a missing "
+            "or incompatible installation. Please ensure the required dependency is installed by "
+            'running: `pip install "sqlmesh[bigquery]"`. For more details, check the logs '
+            "in the 'logs/' folder, or rerun the command with the '--debug' flag."
+        ),
+    ):
+
+        class TestConfigA(PydanticModel):
+            _engine_import_validator = _get_engine_import_validator("missing", "bigquery")
+
+        TestConfigA()
+
+    with pytest.raises(
+        ConfigError,
+        match=re.escape(
+            "Failed to import the 'bigquery' engine library. This may be due to a missing "
+            "or incompatible installation. Please ensure the required dependency is installed by "
+            'running: `pip install "sqlmesh[bigquery_extra]"`. For more details, check the logs '
+            "in the 'logs/' folder, or rerun the command with the '--debug' flag."
+        ),
+    ):
+
+        class TestConfigB(PydanticModel):
+            _engine_import_validator = _get_engine_import_validator(
+                "missing", "bigquery", "bigquery_extra"
+            )
+
+        TestConfigB()
+
+    class TestConfigC(PydanticModel):
+        _engine_import_validator = _get_engine_import_validator("sqlmesh", "bigquery")
+
+    TestConfigC()

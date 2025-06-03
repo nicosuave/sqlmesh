@@ -30,7 +30,6 @@ from collections import defaultdict
 from contextlib import contextmanager
 from functools import reduce
 
-import pandas as pd
 from sqlglot import exp, select
 from sqlglot.executor import execute
 
@@ -49,24 +48,32 @@ from sqlmesh.core.model import (
     SCDType2ByColumnKind,
     SCDType2ByTimeKind,
     ViewKind,
+    CustomKind,
 )
+from sqlmesh.utils import CompletionStatus
 from sqlmesh.core.schema_diff import has_drop_alteration, get_dropped_column_names
 from sqlmesh.core.snapshot import (
     DeployabilityIndex,
     Intervals,
     Snapshot,
-    SnapshotChangeCategory,
     SnapshotId,
     SnapshotInfoLike,
     SnapshotTableCleanupTask,
 )
+from sqlmesh.core.snapshot.definition import parent_snapshots_by_name
 from sqlmesh.utils import random_id
 from sqlmesh.utils.concurrency import (
     concurrent_apply_to_snapshots,
     concurrent_apply_to_values,
+    NodeExecutionFailedError,
 )
 from sqlmesh.utils.date import TimeLike, now, time_like_to_str
-from sqlmesh.utils.errors import ConfigError, SQLMeshError
+from sqlmesh.utils.errors import (
+    ConfigError,
+    DestructiveChangeError,
+    SQLMeshError,
+    format_destructive_change_msg,
+)
 
 if sys.version_info >= (3, 12):
     from importlib import metadata
@@ -78,6 +85,16 @@ if t.TYPE_CHECKING:
     from sqlmesh.core.environment import EnvironmentNamingInfo
 
 logger = logging.getLogger(__name__)
+
+
+class SnapshotCreationFailedError(SQLMeshError):
+    def __init__(
+        self, errors: t.List[NodeExecutionFailedError[SnapshotId]], skipped: t.List[SnapshotId]
+    ):
+        messages = "\n\n".join(f"{error}\n  {error.__cause__}" for error in errors)
+        super().__init__(f"Physical table creation failed:\n\n{messages}")
+        self.errors = errors
+        self.skipped = skipped
 
 
 class SnapshotEvaluator:
@@ -203,6 +220,11 @@ class SnapshotEvaluator:
         target_snapshots: t.Iterable[Snapshot],
         environment_naming_info: EnvironmentNamingInfo,
         deployability_index: t.Optional[DeployabilityIndex] = None,
+        start: t.Optional[TimeLike] = None,
+        end: t.Optional[TimeLike] = None,
+        execution_time: t.Optional[TimeLike] = None,
+        snapshots: t.Optional[t.Dict[SnapshotId, Snapshot]] = None,
+        table_mapping: t.Optional[t.Dict[str, str]] = None,
         on_complete: t.Optional[t.Callable[[SnapshotInfoLike], None]] = None,
     ) -> None:
         """Promotes the given collection of snapshots in the target environment by replacing a corresponding
@@ -214,24 +236,37 @@ class SnapshotEvaluator:
             deployability_index: Determines snapshots that are deployable in the context of this promotion.
             on_complete: A callback to call on each successfully promoted snapshot.
         """
-        self._create_schemas(
-            [
-                s.qualified_view_name.table_for_environment(
-                    environment_naming_info, dialect=self.adapter.dialect
+
+        tables_by_gateway: t.Dict[t.Union[str, None], t.List[exp.Table]] = defaultdict(list)
+        for snapshot in target_snapshots:
+            if snapshot.is_model and not snapshot.is_symbolic:
+                gateway = (
+                    snapshot.model_gateway if environment_naming_info.gateway_managed else None
                 )
-                for s in target_snapshots
-                if s.is_model and not s.is_symbolic
-            ]
-        )
+                adapter = self.get_adapter(gateway)
+                table = snapshot.qualified_view_name.table_for_environment(
+                    environment_naming_info, dialect=adapter.dialect
+                )
+                tables_by_gateway[gateway].append(table)
+
+        # A schema can be shared across multiple engines, so we need to group by gateway
+        for gateway, tables in tables_by_gateway.items():
+            self._create_schemas(tables=tables, gateway=gateway)
+
         deployability_index = deployability_index or DeployabilityIndex.all_deployable()
         with self.concurrent_context():
             concurrent_apply_to_snapshots(
                 target_snapshots,
                 lambda s: self._promote_snapshot(
                     s,
-                    environment_naming_info,
-                    deployability_index,  # type: ignore
-                    on_complete,
+                    start=start,
+                    end=end,
+                    execution_time=execution_time,
+                    snapshots=snapshots,
+                    table_mapping=table_mapping,
+                    environment_naming_info=environment_naming_info,
+                    deployability_index=deployability_index,  # type: ignore
+                    on_complete=on_complete,
                 ),
                 self.ddl_concurrent_tasks,
             )
@@ -261,22 +296,29 @@ class SnapshotEvaluator:
         target_snapshots: t.Iterable[Snapshot],
         snapshots: t.Dict[SnapshotId, Snapshot],
         deployability_index: t.Optional[DeployabilityIndex] = None,
+        on_start: t.Optional[t.Callable] = None,
         on_complete: t.Optional[t.Callable[[SnapshotInfoLike], None]] = None,
-        allow_destructive_snapshots: t.Set[str] = set(),
-    ) -> None:
+        allow_destructive_snapshots: t.Optional[t.Set[str]] = None,
+    ) -> CompletionStatus:
         """Creates a physical snapshot schema and table for the given collection of snapshots.
 
         Args:
             target_snapshots: Target snapshots.
             snapshots: Mapping of snapshot ID to snapshot.
             deployability_index: Determines snapshots that are deployable in the context of this creation.
+            on_start: A callback to initialize the snapshot creation progress bar.
             on_complete: A callback to call on each successfully created snapshot.
             allow_destructive_snapshots: Set of snapshots that are allowed to have destructive schema changes.
+
+        Returns:
+            CompletionStatus: The status of the creation operation (success, failure, nothing to do).
         """
         snapshots_with_table_names = defaultdict(set)
-        tables_by_schema = defaultdict(set)
-        gateway_by_schema: t.Dict[exp.Table, str] = {}
+        tables_by_gateway_and_schema: t.Dict[t.Union[str, None], t.Dict[exp.Table, set[str]]] = (
+            defaultdict(lambda: defaultdict(set))
+        )
         table_deployability: t.Dict[str, bool] = {}
+        allow_destructive_snapshots = allow_destructive_snapshots or set()
 
         for snapshot in target_snapshots:
             if not snapshot.is_model or snapshot.is_symbolic:
@@ -296,24 +338,33 @@ class SnapshotEvaluator:
                 snapshots_with_table_names[snapshot].add(table.name)
                 table_deployability[table.name] = is_deployable
                 table_schema = d.schema_(table.db, catalog=table.catalog)
-                tables_by_schema[table_schema].add(table.name)
-                gateway_by_schema[table_schema] = snapshot.model.gateway or ""
+                tables_by_gateway_and_schema[snapshot.model_gateway][table_schema].add(table.name)
 
-        def _get_data_objects(schema: exp.Table, gateway: t.Optional[str] = None) -> t.Set[str]:
+        def _get_data_objects(
+            schema: exp.Table,
+            object_names: t.Optional[t.Set[str]] = None,
+            gateway: t.Optional[str] = None,
+        ) -> t.Set[str]:
             logger.info("Listing data objects in schema %s", schema.sql())
-            objs = self._get_adapter(gateway).get_data_objects(schema, tables_by_schema[schema])
+            objs = self.get_adapter(gateway).get_data_objects(schema, object_names)
             return {obj.name for obj in objs}
 
         with self.concurrent_context():
-            existing_objects = {
-                obj
-                for objs in concurrent_apply_to_values(
-                    list(tables_by_schema),
-                    lambda s: _get_data_objects(s, gateway_by_schema[s]),
-                    self.ddl_concurrent_tasks,
-                )
-                for obj in objs
-            }
+            existing_objects: t.Set[str] = set()
+            # A schema can be shared across multiple engines, so we need to group tables by both gateway and schema
+            for gateway, tables_by_schema in tables_by_gateway_and_schema.items():
+                objs_for_gateway = {
+                    obj
+                    for objs in concurrent_apply_to_values(
+                        list(tables_by_schema),
+                        lambda s: _get_data_objects(
+                            schema=s, object_names=tables_by_schema.get(s), gateway=gateway
+                        ),
+                        self.ddl_concurrent_tasks,
+                    )
+                    for obj in objs
+                }
+                existing_objects.update(objs_for_gateway)
 
         snapshots_to_create = []
         target_deployability_flags: t.Dict[str, t.List[bool]] = defaultdict(list)
@@ -326,20 +377,24 @@ class SnapshotEvaluator:
                         table_deployability[table_name]
                     )
                 target_deployability_flags[snapshot.name].sort()
-            elif on_complete:
-                on_complete(snapshot)
 
         if not snapshots_to_create:
-            return
-        self._create_schemas(tables_by_schema, gateway_by_schema)
+            return CompletionStatus.NOTHING_TO_DO
+        if on_start:
+            on_start(snapshots_to_create)
+
+        for gateway, tables_by_schema in tables_by_gateway_and_schema.items():
+            self._create_schemas(tables=tables_by_schema, gateway=gateway)
+
         self._create_snapshots(
-            snapshots_to_create,
-            snapshots,
-            target_deployability_flags,
-            deployability_index,
-            on_complete,
-            allow_destructive_snapshots,
+            snapshots_to_create=snapshots_to_create,
+            snapshots=snapshots,
+            target_deployability_flags=target_deployability_flags,
+            deployability_index=deployability_index,
+            on_complete=on_complete,
+            allow_destructive_snapshots=allow_destructive_snapshots,
         )
+        return CompletionStatus.SUCCESS
 
     def _create_snapshots(
         self,
@@ -350,26 +405,30 @@ class SnapshotEvaluator:
         on_complete: t.Optional[t.Callable[[SnapshotInfoLike], None]],
         allow_destructive_snapshots: t.Set[str],
     ) -> None:
-        """Internal method to create tables in parrallel."""
+        """Internal method to create tables in parallel."""
         with self.concurrent_context():
-            concurrent_apply_to_snapshots(
+            errors, skipped = concurrent_apply_to_snapshots(
                 snapshots_to_create,
                 lambda s: self._create_snapshot(
                     s,
-                    snapshots,
-                    target_deployability_flags[s.name],
-                    deployability_index,
-                    on_complete,
-                    allow_destructive_snapshots,
+                    snapshots=snapshots,
+                    deployability_flags=target_deployability_flags[s.name],
+                    deployability_index=deployability_index,
+                    on_complete=on_complete,
+                    allow_destructive_snapshots=allow_destructive_snapshots,
                 ),
                 self.ddl_concurrent_tasks,
+                raise_on_error=False,
             )
+            if errors:
+                raise SnapshotCreationFailedError(errors, skipped)
 
     def migrate(
         self,
         target_snapshots: t.Iterable[Snapshot],
         snapshots: t.Dict[SnapshotId, Snapshot],
-        allow_destructive_snapshots: t.Set[str] = set(),
+        allow_destructive_snapshots: t.Optional[t.Set[str]] = None,
+        deployability_index: t.Optional[DeployabilityIndex] = None,
     ) -> None:
         """Alters a physical snapshot table to match its snapshot's schema for the given collection of snapshots.
 
@@ -377,8 +436,10 @@ class SnapshotEvaluator:
             target_snapshots: Target snapshots.
             snapshots: Mapping of snapshot ID to snapshot.
             allow_destructive_snapshots: Set of snapshots that are allowed to have destructive schema changes.
+            deployability_index: Determines snapshots that are deployable in the context of this evaluation.
         """
-
+        allow_destructive_snapshots = allow_destructive_snapshots or set()
+        deployability_index = deployability_index or DeployabilityIndex.all_deployable()
         with self.concurrent_context():
             concurrent_apply_to_snapshots(
                 target_snapshots,
@@ -386,7 +447,8 @@ class SnapshotEvaluator:
                     s,
                     snapshots,
                     allow_destructive_snapshots,
-                    self._get_adapter(s.model_gateway),
+                    self.get_adapter(s.model_gateway),
+                    deployability_index,
                 ),
                 self.ddl_concurrent_tasks,
             )
@@ -394,7 +456,6 @@ class SnapshotEvaluator:
     def cleanup(
         self,
         target_snapshots: t.Iterable[SnapshotTableCleanupTask],
-        snapshot_gateways: t.Optional[t.Dict[str, str]] = None,
         on_complete: t.Optional[t.Callable[[str], None]] = None,
     ) -> None:
         """Cleans up the given snapshots by removing its table
@@ -413,9 +474,7 @@ class SnapshotEvaluator:
                 lambda s: self._cleanup_snapshot(
                     s,
                     snapshots_to_dev_table_only[s.snapshot_id],
-                    self._get_adapter(
-                        snapshot_gateways.get(s.snapshot_id.name) if snapshot_gateways else None
-                    ),
+                    self.get_adapter(s.model_gateway),
                     on_complete,
                 ),
                 self.ddl_concurrent_tasks,
@@ -447,10 +506,7 @@ class SnapshotEvaluator:
             kwargs: Additional kwargs to pass to the renderer.
         """
         deployability_index = deployability_index or DeployabilityIndex.all_deployable()
-        adapter = self._get_adapter(snapshot.model_gateway)
-        if not deployability_index.is_deployable(snapshot) and not adapter.SUPPORTS_CLONING:
-            # We can't audit a temporary table.
-            return []
+        adapter = self.get_adapter(snapshot.model_gateway)
 
         if not snapshot.version:
             raise ConfigError(
@@ -478,10 +534,24 @@ class SnapshotEvaluator:
 
         audits_with_args = snapshot.node.audits_with_args
 
+        force_non_blocking = False
+
         if audits_with_args:
             logger.info("Auditing snapshot %s", snapshot.snapshot_id)
 
+            if not deployability_index.is_deployable(snapshot) and not adapter.SUPPORTS_CLONING:
+                # For dev preview tables that aren't based on clones of the production table, only a subset of the data is typically available
+                # However, users still expect audits to run anwyay. Some audits (such as row count) are practically guaranteed to fail
+                # when run on only a subset of data, so we switch all audits to non blocking and the user can decide if they still want to proceed
+                force_non_blocking = True
+
         for audit, audit_args in audits_with_args:
+            if force_non_blocking:
+                # remove any blocking indicator on the model itself
+                audit_args.pop("blocking", None)
+                # so that we can fall back to the audit's setting, which we override to blocking: False
+                audit = audit.model_copy(update={"blocking": False})
+
             results.append(
                 self._audit(
                     audit=audit,
@@ -498,7 +568,7 @@ class SnapshotEvaluator:
 
         if wap_id is not None:
             logger.info(
-                "Publishing evalaution results for snapshot %s, WAP ID '%s'",
+                "Publishing evaluation results for snapshot %s, WAP ID '%s'",
                 snapshot.snapshot_id,
                 wap_id,
             )
@@ -570,12 +640,34 @@ class SnapshotEvaluator:
             else snapshot.table_name(is_deployable=deployability_index.is_deployable(snapshot))
         )
 
-        adapter = self._get_adapter(model.gateway)
+        adapter = self.get_adapter(model.gateway)
         evaluation_strategy = _evaluation_strategy(snapshot, adapter)
 
         # https://github.com/TobikoData/sqlmesh/issues/2609
         # If there are no existing intervals yet; only consider this a first insert for the first snapshot in the batch
         is_first_insert = not _intervals(snapshot, deployability_index) and batch_index == 0
+
+        from sqlmesh.core.context import ExecutionContext
+
+        common_render_kwargs = dict(
+            start=start,
+            end=end,
+            execution_time=execution_time,
+            snapshot=snapshot,
+            runtime_stage=RuntimeStage.EVALUATING,
+            **kwargs,
+        )
+
+        render_statements_kwargs = dict(
+            engine_adapter=adapter,
+            snapshots=snapshots,
+            deployability_index=deployability_index,
+            **common_render_kwargs,
+        )
+
+        rendered_physical_properties = snapshot.model.render_physical_properties(
+            **render_statements_kwargs
+        )
 
         def apply(query_or_df: QueryOrDF, index: int = 0) -> None:
             if index > 0:
@@ -590,6 +682,7 @@ class SnapshotEvaluator:
                     start=start,
                     end=end,
                     execution_time=execution_time,
+                    physical_properties=rendered_physical_properties,
                 )
             else:
                 logger.info(
@@ -610,27 +703,13 @@ class SnapshotEvaluator:
                     start=start,
                     end=end,
                     execution_time=execution_time,
+                    physical_properties=rendered_physical_properties,
                 )
 
-        from sqlmesh.core.context import ExecutionContext
-
-        common_render_kwargs = dict(
-            start=start,
-            end=end,
-            execution_time=execution_time,
-            snapshot=snapshot,
-            runtime_stage=RuntimeStage.EVALUATING,
-            **kwargs,
-        )
-
-        render_statements_kwargs = dict(
-            engine_adapter=adapter,
-            snapshots=snapshots,
-            deployability_index=deployability_index,
-            **common_render_kwargs,
-        )
-
-        with adapter.transaction(), adapter.session(snapshot.model.session_properties):
+        with (
+            adapter.transaction(),
+            adapter.session(snapshot.model.render_session_properties(**render_statements_kwargs)),
+        ):
             wap_id: t.Optional[str] = None
             if (
                 table_name
@@ -656,11 +735,13 @@ class SnapshotEvaluator:
             )
 
             if limit is not None:
+                import pandas as pd
+
                 query_or_df = next(queries_or_dfs)
                 if isinstance(query_or_df, pd.DataFrame):
                     return query_or_df.head(limit)
                 if not isinstance(query_or_df, exp.Expression):
-                    # We assume that if this branch is reached, `query_or_df` is a pyspark / snowpark dataframe,
+                    # We assume that if this branch is reached, `query_or_df` is a pyspark / snowpark / bigframe dataframe,
                     # so we use `limit` instead of `head` to get back a dataframe instead of List[Row]
                     # https://spark.apache.org/docs/3.1.1/api/python/reference/api/pyspark.sql.DataFrame.head.html#pyspark.sql.DataFrame.head
                     return query_or_df.limit(limit)
@@ -681,7 +762,7 @@ class SnapshotEvaluator:
             # workaround for that would be to serialize pandas to disk and then read it back with Spark.
             # Note: We assume that if multiple things are yielded from `queries_or_dfs` that they are dataframes
             # and not SQL expressions.
-            elif (
+            if (
                 adapter.INSERT_OVERWRITE_STRATEGY
                 in (
                     InsertOverwriteStrategy.INSERT_OVERWRITE,
@@ -689,6 +770,8 @@ class SnapshotEvaluator:
                 )
                 and snapshot.is_incremental_by_time_range
             ):
+                import pandas as pd
+
                 query_or_df = reduce(
                     lambda a, b: (
                         pd.concat([a, b], ignore_index=True)  # type: ignore
@@ -719,32 +802,23 @@ class SnapshotEvaluator:
         if not snapshot.is_model:
             return
 
-        parent_snapshots_by_name = {
-            snapshots[p_sid].name: snapshots[p_sid] for p_sid in snapshot.parents
-        }
-        parent_snapshots_by_name[snapshot.name] = snapshot
-
         deployability_index = deployability_index or DeployabilityIndex.all_deployable()
 
-        adapter = self._get_adapter(snapshot.model.gateway)
-        common_render_kwargs: t.Dict[str, t.Any] = dict(
+        adapter = self.get_adapter(snapshot.model.gateway)
+        create_render_kwargs: t.Dict[str, t.Any] = dict(
             engine_adapter=adapter,
-            snapshots=parent_snapshots_by_name,
+            snapshots=parent_snapshots_by_name(snapshot, snapshots),
             runtime_stage=RuntimeStage.CREATING,
+            deployability_index=deployability_index,
         )
-        pre_post_render_kwargs = dict(
-            **common_render_kwargs,
-            deployability_index=deployability_index.with_deployable(snapshot),
-        )
-        create_render_kwargs = dict(**common_render_kwargs, deployability_index=deployability_index)
 
-        # It can still be useful for some strategies to know if the snapshot was actually deployable
-        is_snapshot_deployable = deployability_index.is_deployable(snapshot)
-
-        evaluation_strategy = _evaluation_strategy(snapshot, adapter)
-
-        with adapter.transaction(), adapter.session(snapshot.model.session_properties):
-            adapter.execute(snapshot.model.render_pre_statements(**pre_post_render_kwargs))
+        with (
+            adapter.transaction(),
+            adapter.session(snapshot.model.render_session_properties(**create_render_kwargs)),
+        ):
+            rendered_physical_properties = snapshot.model.render_physical_properties(
+                **create_render_kwargs
+            )
 
             if (
                 snapshot.is_forward_only
@@ -753,6 +827,8 @@ class SnapshotEvaluator:
                 and adapter.SUPPORTS_CLONING
                 # managed models cannot have their schema mutated because theyre based on queries, so clone + alter wont work
                 and not snapshot.is_managed
+                # If the deployable table is missing we can't clone it
+                and True not in deployability_flags
             ):
                 target_table_name = snapshot.table_name(is_deployable=False)
                 tmp_table_name = f"{target_table_name}__schema_migration_source"
@@ -760,18 +836,23 @@ class SnapshotEvaluator:
 
                 logger.info(f"Cloning table '{source_table_name}' into '{target_table_name}'")
 
-                evaluation_strategy.create(
+                self._execute_create(
+                    snapshot=snapshot,
                     table_name=tmp_table_name,
-                    model=snapshot.model,
                     is_table_deployable=False,
-                    render_kwargs=dict(
-                        table_mapping={snapshot.name: tmp_table_name},
-                        **create_render_kwargs,
-                    ),
-                    is_snapshot_deployable=is_snapshot_deployable,
+                    deployability_index=deployability_index,
+                    create_render_kwargs=create_render_kwargs,
+                    rendered_physical_properties=rendered_physical_properties,
+                    dry_run=True,
                 )
+
                 try:
-                    adapter.clone_table(target_table_name, snapshot.table_name(), replace=True)
+                    adapter.clone_table(
+                        target_table_name,
+                        snapshot.table_name(),
+                        replace=True,
+                        rendered_physical_properties=rendered_physical_properties,
+                    )
                     alter_expressions = adapter.get_alter_expressions(
                         target_table_name, tmp_table_name
                     )
@@ -787,16 +868,28 @@ class SnapshotEvaluator:
             else:
                 dry_run = len(deployability_flags) == 1
                 for is_table_deployable in deployability_flags:
-                    evaluation_strategy.create(
+                    if (
+                        is_table_deployable
+                        and snapshot.model.forward_only
+                        and not deployability_index.is_representative(snapshot)
+                    ):
+                        logger.info(
+                            "Skipping creation of the deployable table '%s' for the forward-only model %s. "
+                            "The table will be created when the snapshot is deployed to production",
+                            snapshot.table_name(is_deployable=is_table_deployable),
+                            snapshot.snapshot_id,
+                        )
+                        continue
+
+                    self._execute_create(
+                        snapshot=snapshot,
                         table_name=snapshot.table_name(is_deployable=is_table_deployable),
-                        model=snapshot.model,
                         is_table_deployable=is_table_deployable,
-                        render_kwargs=create_render_kwargs,
-                        is_snapshot_deployable=is_snapshot_deployable,
+                        deployability_index=deployability_index,
+                        create_render_kwargs=create_render_kwargs,
+                        rendered_physical_properties=rendered_physical_properties,
                         dry_run=dry_run,
                     )
-
-            adapter.execute(snapshot.model.render_post_statements(**pre_post_render_kwargs))
 
         if on_complete is not None:
             on_complete(snapshot)
@@ -807,31 +900,59 @@ class SnapshotEvaluator:
         snapshots: t.Dict[SnapshotId, Snapshot],
         allow_destructive_snapshots: t.Set[str],
         adapter: EngineAdapter,
+        deployability_index: DeployabilityIndex,
     ) -> None:
-        if not snapshot.is_paused or not snapshot.is_model:
+        if (
+            not snapshot.is_paused
+            or not snapshot.is_model
+            or (deployability_index.is_representative(snapshot) and not snapshot.is_view)
+        ):
             return
 
-        needs_migration = snapshot.model.forward_only or snapshot.change_category in (
-            SnapshotChangeCategory.FORWARD_ONLY,
-            SnapshotChangeCategory.INDIRECT_NON_BREAKING,
-        )
-        if not needs_migration:
-            return
-
-        parent_snapshots_by_name = {
-            snapshots[p_sid].name: snapshots[p_sid] for p_sid in snapshot.parents
-        }
-        parent_snapshots_by_name[snapshot.name] = snapshot
-
-        tmp_table_name = snapshot.table_name(is_deployable=False)
         target_table_name = snapshot.table_name()
-        _evaluation_strategy(snapshot, adapter).migrate(
-            target_table_name=target_table_name,
-            source_table_name=tmp_table_name,
-            snapshot=snapshot,
-            snapshots=parent_snapshots_by_name,
-            allow_destructive_snapshots=allow_destructive_snapshots,
-        )
+        if adapter.table_exists(target_table_name):
+            evaluation_strategy = _evaluation_strategy(snapshot, adapter)
+            tmp_table_name = snapshot.table_name(is_deployable=False)
+            logger.info(
+                "Migrating table schema from '%s' to '%s'",
+                tmp_table_name,
+                target_table_name,
+            )
+            evaluation_strategy.migrate(
+                target_table_name=target_table_name,
+                source_table_name=tmp_table_name,
+                snapshot=snapshot,
+                snapshots=parent_snapshots_by_name(snapshot, snapshots),
+                allow_destructive_snapshots=allow_destructive_snapshots,
+            )
+        else:
+            logger.info(
+                "Creating table '%s' for the snapshot of the forward-only model %s",
+                target_table_name,
+                snapshot.snapshot_id,
+            )
+            deployability_index = DeployabilityIndex.all_deployable()
+            render_kwargs: t.Dict[str, t.Any] = dict(
+                engine_adapter=adapter,
+                snapshots=parent_snapshots_by_name(snapshot, snapshots),
+                runtime_stage=RuntimeStage.CREATING,
+                deployability_index=deployability_index,
+            )
+            with (
+                adapter.transaction(),
+                adapter.session(snapshot.model.render_session_properties(**render_kwargs)),
+            ):
+                self._execute_create(
+                    snapshot=snapshot,
+                    table_name=target_table_name,
+                    is_table_deployable=True,
+                    deployability_index=deployability_index,
+                    create_render_kwargs=render_kwargs,
+                    rendered_physical_properties=snapshot.model.render_physical_properties(
+                        **render_kwargs
+                    ),
+                    dry_run=False,
+                )
 
     def _promote_snapshot(
         self,
@@ -839,19 +960,43 @@ class SnapshotEvaluator:
         environment_naming_info: EnvironmentNamingInfo,
         deployability_index: DeployabilityIndex,
         on_complete: t.Optional[t.Callable[[SnapshotInfoLike], None]],
+        start: t.Optional[TimeLike] = None,
+        end: t.Optional[TimeLike] = None,
+        execution_time: t.Optional[TimeLike] = None,
+        snapshots: t.Optional[t.Dict[SnapshotId, Snapshot]] = None,
+        table_mapping: t.Optional[t.Dict[str, str]] = None,
     ) -> None:
         if snapshot.is_model:
-            adapter = self.adapter
+            adapter = (
+                self.get_adapter(snapshot.model_gateway)
+                if environment_naming_info.gateway_managed
+                else self.adapter
+            )
             table_name = snapshot.table_name(deployability_index.is_representative(snapshot))
             view_name = snapshot.qualified_view_name.for_environment(
                 environment_naming_info, dialect=adapter.dialect
+            )
+            render_kwargs: t.Dict[str, t.Any] = dict(
+                start=start,
+                end=end,
+                execution_time=execution_time,
+                engine_adapter=adapter,
+                deployability_index=deployability_index,
+                table_mapping=table_mapping,
+                runtime_stage=RuntimeStage.PROMOTING,
             )
             _evaluation_strategy(snapshot, adapter).promote(
                 table_name=table_name,
                 view_name=view_name,
                 model=snapshot.model,
                 environment=environment_naming_info.name,
+                snapshots=snapshots,
+                **render_kwargs,
             )
+
+            snapshot_by_name = {s.name: s for s in (snapshots or {}).values()}
+            render_kwargs["snapshots"] = snapshot_by_name
+            adapter.execute(snapshot.model.render_on_virtual_update(**render_kwargs))
 
         if on_complete is not None:
             on_complete(snapshot)
@@ -862,7 +1007,11 @@ class SnapshotEvaluator:
         environment_naming_info: EnvironmentNamingInfo,
         on_complete: t.Optional[t.Callable[[SnapshotInfoLike], None]],
     ) -> None:
-        adapter = self.adapter
+        adapter = (
+            self.get_adapter(snapshot.model_gateway)
+            if environment_naming_info.gateway_managed
+            else self.adapter
+        )
         view_name = snapshot.qualified_view_name.for_environment(
             environment_naming_info, dialect=adapter.dialect
         )
@@ -903,7 +1052,7 @@ class SnapshotEvaluator:
     ) -> None:
         deployability_index = deployability_index or DeployabilityIndex.all_deployable()
         table_name = snapshot.table_name(is_deployable=deployability_index.is_deployable(snapshot))
-        adapter = self._get_adapter(snapshot.model_gateway)
+        adapter = self.get_adapter(snapshot.model_gateway)
         adapter.wap_publish(table_name, wap_id)
 
     def _audit(
@@ -921,6 +1070,7 @@ class SnapshotEvaluator:
         if audit.skip:
             return AuditResult(
                 audit=audit,
+                audit_args=audit_args,
                 model=snapshot.model_or_none,
                 skipped=True,
             )
@@ -929,7 +1079,7 @@ class SnapshotEvaluator:
         blocking = audit_args.pop("blocking", None)
         blocking = blocking == exp.true() if blocking else audit.blocking
 
-        adapter = self._get_adapter(snapshot.model_gateway)
+        adapter = self.get_adapter(snapshot.model_gateway)
 
         kwargs = {
             "start": start,
@@ -938,6 +1088,7 @@ class SnapshotEvaluator:
             "snapshots": snapshots,
             "deployability_index": deployability_index,
             "engine_adapter": adapter,
+            "runtime_stage": RuntimeStage.AUDITING,
             **audit_args,
             **kwargs,
         }
@@ -956,6 +1107,7 @@ class SnapshotEvaluator:
 
         return AuditResult(
             audit=audit,
+            audit_args=audit_args,
             model=snapshot.model_or_none,
             count=count,
             query=query,
@@ -965,7 +1117,7 @@ class SnapshotEvaluator:
     def _create_schemas(
         self,
         tables: t.Iterable[t.Union[exp.Table, str]],
-        gateways: t.Optional[t.Dict[exp.Table, str]] = None,
+        gateway: t.Optional[str] = None,
     ) -> None:
         table_exprs = [exp.to_table(t) for t in tables]
         unique_schemas = {(t.args["db"], t.args.get("catalog")) for t in table_exprs if t and t.db}
@@ -974,16 +1126,50 @@ class SnapshotEvaluator:
         for schema_name, catalog in unique_schemas:
             schema = schema_(schema_name, catalog)
             logger.info("Creating schema '%s'", schema)
-            adapter = self._get_adapter(gateways.get(schema)) if gateways else self.adapter
+            adapter = self.get_adapter(gateway)
             adapter.create_schema(schema)
 
-    def _get_adapter(self, gateway: t.Optional[str] = None) -> EngineAdapter:
+    def get_adapter(self, gateway: t.Optional[str] = None) -> EngineAdapter:
         """Returns the adapter for the specified gateway or the default adapter if none is provided."""
         if gateway:
             if adapter := self.adapters.get(gateway):
                 return adapter
             raise SQLMeshError(f"Gateway '{gateway}' not found in the available engine adapters.")
         return self.adapter
+
+    def _execute_create(
+        self,
+        snapshot: Snapshot,
+        table_name: str,
+        is_table_deployable: bool,
+        deployability_index: DeployabilityIndex,
+        create_render_kwargs: t.Dict[str, t.Any],
+        rendered_physical_properties: t.Dict[str, exp.Expression],
+        dry_run: bool,
+    ) -> None:
+        adapter = self.get_adapter(snapshot.model.gateway)
+        evaluation_strategy = _evaluation_strategy(snapshot, adapter)
+
+        # It can still be useful for some strategies to know if the snapshot was actually deployable
+        is_snapshot_deployable = deployability_index.is_deployable(snapshot)
+        is_snapshot_representative = deployability_index.is_representative(snapshot)
+
+        create_render_kwargs = {
+            **create_render_kwargs,
+            "table_mapping": {snapshot.name: table_name},
+        }
+        adapter.execute(snapshot.model.render_pre_statements(**create_render_kwargs))
+        evaluation_strategy.create(
+            table_name=table_name,
+            model=snapshot.model,
+            is_table_deployable=is_table_deployable,
+            render_kwargs=create_render_kwargs,
+            is_snapshot_deployable=is_snapshot_deployable,
+            is_snapshot_representative=is_snapshot_representative,
+            dry_run=dry_run,
+            physical_properties=rendered_physical_properties,
+        )
+        adapter.execute(snapshot.model.render_post_statements(**create_render_kwargs))
 
 
 def _evaluation_strategy(snapshot: SnapshotInfoLike, adapter: EngineAdapter) -> EvaluationStrategy:
@@ -1013,7 +1199,7 @@ def _evaluation_strategy(snapshot: SnapshotInfoLike, adapter: EngineAdapter) -> 
             raise SQLMeshError(
                 f"Missing the name of a custom evaluation strategy in model '{snapshot.name}'."
             )
-        klass = get_custom_materialization_type(snapshot.custom_materialization)
+        _, klass = get_custom_materialization_type_or_raise(snapshot.custom_materialization)
         return klass(adapter)
     elif snapshot.is_managed:
         klass = EngineManagedStrategy
@@ -1136,7 +1322,9 @@ class EvaluationStrategy(abc.ABC):
             view_name: The name of the target view in the virtual layer.
         """
 
-    def _replace_query_for_model(self, model: Model, name: str, query_or_df: QueryOrDF) -> None:
+    def _replace_query_for_model(
+        self, model: Model, name: str, query_or_df: QueryOrDF, **kwargs: t.Any
+    ) -> None:
         """Replaces the table for the given model.
 
         Args:
@@ -1156,9 +1344,9 @@ class EvaluationStrategy(abc.ABC):
             table_format=model.table_format,
             storage_format=model.storage_format,
             partitioned_by=model.partitioned_by,
-            partition_interval_unit=model.interval_unit,
+            partition_interval_unit=model.partition_interval_unit,
             clustered_by=model.clustered_by,
-            table_properties=model.physical_properties,
+            table_properties=kwargs.get("physical_properties", model.physical_properties),
             table_description=model.description,
             column_descriptions=model.column_descriptions,
             columns_to_types=columns_to_types,
@@ -1245,12 +1433,22 @@ class PromotableStrategy(EvaluationStrategy):
     ) -> None:
         is_prod = environment == c.PROD
         logger.info("Updating view '%s' to point at table '%s'", view_name, table_name)
+        render_kwargs: t.Dict[str, t.Any] = dict(
+            start=kwargs.get("start"),
+            end=kwargs.get("end"),
+            execution_time=kwargs.get("execution_time"),
+            engine_adapter=kwargs.get("engine_adapter"),
+            snapshots=kwargs.get("snapshots"),
+            deployability_index=kwargs.get("deployability_index"),
+            table_mapping=kwargs.get("table_mapping"),
+            runtime_stage=kwargs.get("runtime_stage"),
+        )
         self.adapter.create_view(
             view_name,
             exp.select("*").from_(table_name, dialect=self.adapter.dialect),
             table_description=model.description if is_prod else None,
             column_descriptions=model.column_descriptions if is_prod else None,
-            view_properties=model.virtual_properties,
+            view_properties=model.render_virtual_properties(**render_kwargs),
         )
 
     def demote(self, view_name: str, **kwargs: t.Any) -> None:
@@ -1277,6 +1475,7 @@ class MaterializableStrategy(PromotableStrategy):
         **kwargs: t.Any,
     ) -> None:
         ctas_query = model.ctas_query(**render_kwargs)
+        physical_properties = kwargs.get("physical_properties", model.physical_properties)
 
         logger.info("Creating table '%s'", table_name)
         if model.annotated:
@@ -1286,9 +1485,9 @@ class MaterializableStrategy(PromotableStrategy):
                 table_format=model.table_format,
                 storage_format=model.storage_format,
                 partitioned_by=model.partitioned_by,
-                partition_interval_unit=model.interval_unit,
+                partition_interval_unit=model.partition_interval_unit,
                 clustered_by=model.clustered_by,
-                table_properties=model.physical_properties,
+                table_properties=physical_properties,
                 table_description=model.description if is_table_deployable else None,
                 column_descriptions=model.column_descriptions if is_table_deployable else None,
             )
@@ -1310,9 +1509,9 @@ class MaterializableStrategy(PromotableStrategy):
                 table_format=model.table_format,
                 storage_format=model.storage_format,
                 partitioned_by=model.partitioned_by,
-                partition_interval_unit=model.interval_unit,
+                partition_interval_unit=model.partition_interval_unit,
                 clustered_by=model.clustered_by,
-                table_properties=model.physical_properties,
+                table_properties=physical_properties,
                 table_description=model.description if is_table_deployable else None,
                 column_descriptions=model.column_descriptions if is_table_deployable else None,
             )
@@ -1346,12 +1545,15 @@ class IncrementalByPartitionStrategy(MaterializableStrategy):
         is_first_insert: bool,
         **kwargs: t.Any,
     ) -> None:
-        self.adapter.insert_overwrite_by_partition(
-            table_name,
-            query_or_df,
-            partitioned_by=model.partitioned_by,
-            columns_to_types=model.columns_to_types,
-        )
+        if is_first_insert:
+            self._replace_query_for_model(model, table_name, query_or_df, **kwargs)
+        else:
+            self.adapter.insert_overwrite_by_partition(
+                table_name,
+                query_or_df,
+                partitioned_by=model.partitioned_by,
+                columns_to_types=model.columns_to_types,
+            )
 
 
 class IncrementalByTimeRangeStrategy(MaterializableStrategy):
@@ -1384,7 +1586,7 @@ class IncrementalByUniqueKeyStrategy(MaterializableStrategy):
         **kwargs: t.Any,
     ) -> None:
         if is_first_insert:
-            self._replace_query_for_model(model, table_name, query_or_df)
+            self._replace_query_for_model(model, table_name, query_or_df, **kwargs)
         else:
             self.adapter.merge(
                 table_name,
@@ -1392,6 +1594,11 @@ class IncrementalByUniqueKeyStrategy(MaterializableStrategy):
                 columns_to_types=model.columns_to_types,
                 unique_key=model.unique_key,
                 when_matched=model.when_matched,
+                merge_filter=model.render_merge_filter(
+                    start=kwargs.get("start"),
+                    end=kwargs.get("end"),
+                    execution_time=kwargs.get("execution_time"),
+                ),
             )
 
     def append(
@@ -1407,6 +1614,11 @@ class IncrementalByUniqueKeyStrategy(MaterializableStrategy):
             columns_to_types=model.columns_to_types,
             unique_key=model.unique_key,
             when_matched=model.when_matched,
+            merge_filter=model.render_merge_filter(
+                start=kwargs.get("start"),
+                end=kwargs.get("end"),
+                execution_time=kwargs.get("execution_time"),
+            ),
         )
 
 
@@ -1420,7 +1632,7 @@ class IncrementalUnmanagedStrategy(MaterializableStrategy):
         **kwargs: t.Any,
     ) -> None:
         if is_first_insert:
-            self._replace_query_for_model(model, table_name, query_or_df)
+            self._replace_query_for_model(model, table_name, query_or_df, **kwargs)
         elif isinstance(model.kind, IncrementalUnmanagedKind) and model.kind.insert_overwrite:
             self.adapter.insert_overwrite_by_partition(
                 table_name,
@@ -1446,7 +1658,7 @@ class FullRefreshStrategy(MaterializableStrategy):
         is_first_insert: bool,
         **kwargs: t.Any,
     ) -> None:
-        self._replace_query_for_model(model, table_name, query_or_df)
+        self._replace_query_for_model(model, table_name, query_or_df, **kwargs)
 
 
 class SeedStrategy(MaterializableStrategy):
@@ -1475,7 +1687,7 @@ class SeedStrategy(MaterializableStrategy):
             try:
                 for index, df in enumerate(model.render_seed()):
                     if index == 0:
-                        self._replace_query_for_model(model, table_name, df)
+                        self._replace_query_for_model(model, table_name, df, **kwargs)
                     else:
                         self.adapter.insert_append(
                             table_name, df, columns_to_types=model.columns_to_types
@@ -1517,9 +1729,9 @@ class SCDType2Strategy(MaterializableStrategy):
                 table_format=model.table_format,
                 storage_format=model.storage_format,
                 partitioned_by=model.partitioned_by,
-                partition_interval_unit=model.interval_unit,
+                partition_interval_unit=model.partition_interval_unit,
                 clustered_by=model.clustered_by,
-                table_properties=model.physical_properties,
+                table_properties=kwargs.get("physical_properties", model.physical_properties),
                 table_description=model.description if is_table_deployable else None,
                 column_descriptions=model.column_descriptions if is_table_deployable else None,
             )
@@ -1557,6 +1769,7 @@ class SCDType2Strategy(MaterializableStrategy):
                 invalidate_hard_deletes=model.kind.invalidate_hard_deletes,
                 updated_at_as_valid_from=model.kind.updated_at_as_valid_from,
                 columns_to_types=columns_to_types,
+                table_format=model.table_format,
                 table_description=model.description,
                 column_descriptions=model.column_descriptions,
                 truncate=is_first_insert,
@@ -1568,11 +1781,12 @@ class SCDType2Strategy(MaterializableStrategy):
                 unique_key=model.unique_key,
                 valid_from_col=model.kind.valid_from_name,
                 valid_to_col=model.kind.valid_to_name,
-                execution_time=kwargs["execution_time"],
+                execution_time=model.kind.updated_at_name or kwargs["execution_time"],
                 check_columns=model.kind.columns,
                 invalidate_hard_deletes=model.kind.invalidate_hard_deletes,
                 execution_time_as_valid_from=model.kind.execution_time_as_valid_from,
                 columns_to_types=columns_to_types,
+                table_format=model.table_format,
                 table_description=model.description,
                 column_descriptions=model.column_descriptions,
                 truncate=is_first_insert,
@@ -1602,6 +1816,7 @@ class SCDType2Strategy(MaterializableStrategy):
                 invalidate_hard_deletes=model.kind.invalidate_hard_deletes,
                 updated_at_as_valid_from=model.kind.updated_at_as_valid_from,
                 columns_to_types=columns_to_types,
+                table_format=model.table_format,
                 table_description=model.description,
                 column_descriptions=model.column_descriptions,
                 **kwargs,
@@ -1615,6 +1830,7 @@ class SCDType2Strategy(MaterializableStrategy):
                 valid_to_col=model.kind.valid_to_name,
                 check_columns=model.kind.columns,
                 columns_to_types=columns_to_types,
+                table_format=model.table_format,
                 invalidate_hard_deletes=model.kind.invalidate_hard_deletes,
                 execution_time_as_valid_from=model.kind.execution_time_as_valid_from,
                 table_description=model.description,
@@ -1665,7 +1881,7 @@ class ViewStrategy(PromotableStrategy):
             model.columns_to_types,
             replace=not self.adapter.HAS_VIEW_BINDING,
             materialized=self._is_materialized_view(model),
-            view_properties=model.physical_properties,
+            view_properties=kwargs.get("physical_properties", model.physical_properties),
             table_description=model.description,
             column_descriptions=model.column_descriptions,
         )
@@ -1687,12 +1903,13 @@ class ViewStrategy(PromotableStrategy):
         render_kwargs: t.Dict[str, t.Any],
         **kwargs: t.Any,
     ) -> None:
-        is_snapshot_deployable: bool = kwargs["is_snapshot_deployable"]
-        if not is_snapshot_deployable and is_table_deployable:
-            # If the snapshot is not deployable, the query may contain references to non-deployable tables or views.
+        is_snapshot_representative: bool = kwargs["is_snapshot_representative"]
+        if not is_snapshot_representative and is_table_deployable:
+            # If the snapshot is not representative, the query may contain references to non-deployable tables or views.
+            # This may happen if there was a forward-only change upstream which now requires the view query to point at dev preview tables.
             # Therefore, we postpone the creation of the deployable view until the snapshot is deployed to production.
             logger.info(
-                "Skipping creation of the deployable view '%s' for the non-deployable snapshot",
+                "Skipping creation of the deployable view '%s' for the non-representative snapshot",
                 table_name,
             )
             return
@@ -1710,7 +1927,7 @@ class ViewStrategy(PromotableStrategy):
             materialized_properties = {
                 "partitioned_by": model.partitioned_by,
                 "clustered_by": model.clustered_by,
-                "partition_interval_unit": model.interval_unit,
+                "partition_interval_unit": model.partition_interval_unit,
             }
         self.adapter.create_view(
             table_name,
@@ -1719,7 +1936,7 @@ class ViewStrategy(PromotableStrategy):
             replace=False,
             materialized=self._is_materialized_view(model),
             materialized_properties=materialized_properties,
-            view_properties=model.physical_properties,
+            view_properties=kwargs.get("physical_properties", model.physical_properties),
             table_description=model.description if is_table_deployable else None,
             column_descriptions=model.column_descriptions if is_table_deployable else None,
         )
@@ -1733,16 +1950,16 @@ class ViewStrategy(PromotableStrategy):
     ) -> None:
         logger.info("Migrating view '%s'", target_table_name)
         model = snapshot.model
+        render_kwargs = dict(
+            execution_time=now(), snapshots=kwargs["snapshots"], engine_adapter=self.adapter
+        )
+
         self.adapter.create_view(
             target_table_name,
-            model.render_query_or_raise(
-                execution_time=now(),
-                snapshots=kwargs["snapshots"],
-                engine_adapter=self.adapter,
-            ),
+            model.render_query_or_raise(**render_kwargs),
             model.columns_to_types,
             materialized=self._is_materialized_view(model),
-            view_properties=model.physical_properties,
+            view_properties=model.render_physical_properties(**render_kwargs),
             table_description=model.description,
             column_descriptions=model.column_descriptions,
         )
@@ -1763,7 +1980,10 @@ class ViewStrategy(PromotableStrategy):
         return isinstance(model.kind, ViewKind) and model.kind.materialized
 
 
-class CustomMaterialization(MaterializableStrategy):
+C = t.TypeVar("C", bound=CustomKind)
+
+
+class CustomMaterialization(MaterializableStrategy, t.Generic[C]):
     """Base class for custom materializations."""
 
     def insert(
@@ -1790,40 +2010,89 @@ class CustomMaterialization(MaterializableStrategy):
         )
 
 
-_custom_materialization_type_cache: t.Optional[t.Dict[str, t.Type[CustomMaterialization]]] = None
+_custom_materialization_type_cache: t.Optional[
+    t.Dict[str, t.Tuple[t.Type[CustomKind], t.Type[CustomMaterialization]]]
+] = None
 
 
-def get_custom_materialization_type(name: str) -> t.Type[CustomMaterialization]:
+def get_custom_materialization_kind_type(st: t.Type[CustomMaterialization]) -> t.Type[CustomKind]:
+    # try to read if there is a custom 'kind' type in use by inspecting the type signature
+    # eg try to read 'MyCustomKind' from:
+    # >>>> class MyCustomMaterialization(CustomMaterialization[MyCustomKind])
+    # and fall back to base CustomKind if there is no generic type declared
+    if hasattr(st, "__orig_bases__"):
+        for base in st.__orig_bases__:
+            if hasattr(base, "__origin__") and base.__origin__ == CustomMaterialization:
+                for generic_arg in t.get_args(base):
+                    if not issubclass(generic_arg, CustomKind):
+                        raise SQLMeshError(
+                            f"Custom materialization kind '{generic_arg.__name__}' must be a subclass of CustomKind"
+                        )
+
+                    return generic_arg
+
+    return CustomKind
+
+
+def get_custom_materialization_type(
+    name: str, raise_errors: bool = True
+) -> t.Optional[t.Tuple[t.Type[CustomKind], t.Type[CustomMaterialization]]]:
     global _custom_materialization_type_cache
 
     strategy_key = name.lower()
 
-    if (
-        _custom_materialization_type_cache is None
-        or strategy_key not in _custom_materialization_type_cache
-    ):
-        strategy_types = list(CustomMaterialization.__subclasses__())
+    try:
+        if (
+            _custom_materialization_type_cache is None
+            or strategy_key not in _custom_materialization_type_cache
+        ):
+            strategy_types = list(CustomMaterialization.__subclasses__())
 
-        entry_points = metadata.entry_points(group="sqlmesh.materializations")
-        for entry_point in entry_points:
-            strategy_type = entry_point.load()
-            if not issubclass(strategy_type, CustomMaterialization):
-                raise SQLMeshError(
-                    f"Custom materialization entry point '{entry_point.name}' must be a subclass of CustomMaterialization."
+            entry_points = metadata.entry_points(group="sqlmesh.materializations")
+            for entry_point in entry_points:
+                strategy_type = entry_point.load()
+                if not issubclass(strategy_type, CustomMaterialization):
+                    raise SQLMeshError(
+                        f"Custom materialization entry point '{entry_point.name}' must be a subclass of CustomMaterialization."
+                    )
+                strategy_types.append(strategy_type)
+
+            _custom_materialization_type_cache = {
+                getattr(strategy_type, "NAME", strategy_type.__name__).lower(): (
+                    get_custom_materialization_kind_type(strategy_type),
+                    strategy_type,
                 )
-            strategy_types.append(strategy_type)
+                for strategy_type in strategy_types
+            }
 
-        _custom_materialization_type_cache = {
-            getattr(strategy_type, "NAME", strategy_type.__name__).lower(): strategy_type
-            for strategy_type in strategy_types
-        }
+        if strategy_key not in _custom_materialization_type_cache:
+            raise ConfigError(f"Materialization strategy with name '{name}' was not found.")
+    except (SQLMeshError, ConfigError) as e:
+        if raise_errors:
+            raise e
 
-    if strategy_key not in _custom_materialization_type_cache:
-        raise ConfigError(f"Materialization strategy with name '{name}' was not found.")
+        from sqlmesh.core.console import get_console
 
-    strategy_type = _custom_materialization_type_cache[strategy_key]
-    logger.debug("Resolved custom materialization '%s' to '%s'", name, strategy_type)
-    return strategy_type
+        get_console().log_warning(str(e))
+        return None
+
+    strategy_kind_type, strategy_type = _custom_materialization_type_cache[strategy_key]
+    logger.debug(
+        "Resolved custom materialization '%s' to '%s' (%s)", name, strategy_type, strategy_kind_type
+    )
+
+    return strategy_kind_type, strategy_type
+
+
+def get_custom_materialization_type_or_raise(
+    name: str,
+) -> t.Tuple[t.Type[CustomKind], t.Type[CustomMaterialization]]:
+    types = get_custom_materialization_type(name, raise_errors=True)
+    if types is not None:
+        return types[0], types[1]
+
+    # Shouldnt get here as get_custom_materialization_type() has raise_errors=True, but just in case...
+    raise SQLMeshError(f"Custom materialization '{name}' not present in the Python environment")
 
 
 class EngineManagedStrategy(MaterializableStrategy):
@@ -1846,9 +2115,10 @@ class EngineManagedStrategy(MaterializableStrategy):
                 columns_to_types=model.columns_to_types,
                 partitioned_by=model.partitioned_by,
                 clustered_by=model.clustered_by,
-                table_properties=model.physical_properties,
+                table_properties=kwargs.get("physical_properties", model.physical_properties),
                 table_description=model.description,
                 column_descriptions=model.column_descriptions,
+                table_format=model.table_format,
             )
         elif not is_table_deployable:
             # Only create the dev preview table as a normal table.
@@ -1882,9 +2152,10 @@ class EngineManagedStrategy(MaterializableStrategy):
                 columns_to_types=model.columns_to_types,
                 partitioned_by=model.partitioned_by,
                 clustered_by=model.clustered_by,
-                table_properties=model.physical_properties,
+                table_properties=kwargs.get("physical_properties", model.physical_properties),
                 table_description=model.description,
                 column_descriptions=model.column_descriptions,
+                table_format=model.table_format,
             )
         elif not is_snapshot_deployable:
             # Snapshot isnt deployable; update the preview table instead
@@ -1894,7 +2165,9 @@ class EngineManagedStrategy(MaterializableStrategy):
                 table_name,
                 model.name,
             )
-            self._replace_query_for_model(model=model, name=table_name, query_or_df=query_or_df)
+            self._replace_query_for_model(
+                model=model, name=table_name, query_or_df=query_or_df, **kwargs
+            )
 
     def append(
         self,
@@ -1948,19 +2221,25 @@ def _check_destructive_schema_change(
     if snapshot.needs_destructive_check(allow_destructive_snapshots) and has_drop_alteration(
         alter_expressions
     ):
+        snapshot_name = snapshot.name
         dropped_column_names = get_dropped_column_names(alter_expressions)
-        dropped_column_str = "', '".join(dropped_column_names) if dropped_column_names else None
-        dropped_column_msg = (
-            f" that drops column{'s' if dropped_column_names and len(dropped_column_names) > 1 else ''} '{dropped_column_str}'"
-            if dropped_column_str
-            else ""
-        )
-        warning_msg = f"Plan results in a destructive change to forward-only table '{snapshot.name}'s schema{dropped_column_msg}."
+        model_dialect = snapshot.model.dialect
+
         if snapshot.model.on_destructive_change.is_warn:
-            logger.warning(warning_msg)
+            logger.warning(
+                format_destructive_change_msg(
+                    snapshot_name,
+                    dropped_column_names,
+                    alter_expressions,
+                    model_dialect,
+                    error=False,
+                )
+            )
             return
-        raise SQLMeshError(
-            f"{warning_msg} To allow this, change the model's `on_destructive_change` setting to `warn` or `allow` or include it in the plan's `--allow-destructive-model` option."
+        raise DestructiveChangeError(
+            format_destructive_change_msg(
+                snapshot_name, dropped_column_names, alter_expressions, model_dialect
+            )
         )
 
 

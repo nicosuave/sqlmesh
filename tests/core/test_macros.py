@@ -1,4 +1,5 @@
 import typing as t
+from datetime import datetime, date
 
 import pytest
 from sqlglot import MappingSchema, ParseError, exp, parse_one
@@ -6,8 +7,10 @@ from sqlglot import MappingSchema, ParseError, exp, parse_one
 from sqlmesh.core import constants as c, dialect as d
 from sqlmesh.core.dialect import StagedFilePath
 from sqlmesh.core.macros import SQL, MacroEvalError, MacroEvaluator, macro
+from sqlmesh.utils.date import to_datetime, to_date
 from sqlmesh.utils.errors import SQLMeshError
 from sqlmesh.utils.metaprogramming import Executable
+from sqlmesh.core.macros import RuntimeStage
 
 
 @pytest.fixture
@@ -587,6 +590,8 @@ def test_macro_coercion(macro_evaluator: MacroEvaluator, assert_exp_eq):
     assert coerce(exp.Literal.number(1.1), float) == 1.1
     assert coerce(exp.Literal.string("Hi mom"), str) == "Hi mom"
     assert coerce(exp.true(), bool) is True
+    assert coerce(exp.Literal.string("2020-01-01"), datetime) == to_datetime("2020-01-01")
+    assert coerce(exp.Literal.string("2020-01-01"), date) == to_date("2020-01-01")
 
     # Coercing a string literal to a column should return a column with the same name
     assert_exp_eq(coerce(exp.Literal.string("order"), exp.Column), exp.column("order"))
@@ -667,35 +672,26 @@ def test_positional_follows_kwargs(macro_evaluator):
 
 
 def test_macro_parameter_resolution(macro_evaluator):
-    with pytest.raises(MacroEvalError) as e:
+    with pytest.raises(MacroEvalError, match=".*missing a required argument: 'pos_only'"):
         macro_evaluator.evaluate(parse_one("@test_arg_resolution()"))
-    assert str(e.value.__cause__) == "missing a required argument: 'pos_only'"
 
-    with pytest.raises(MacroEvalError) as e:
+    with pytest.raises(MacroEvalError, match=".*missing a required argument: 'pos_only'"):
         macro_evaluator.evaluate(parse_one("@test_arg_resolution(a1 := 1)"))
-    assert str(e.value.__cause__) == "missing a required argument: 'pos_only'"
 
-    with pytest.raises(MacroEvalError) as e:
+    with pytest.raises(MacroEvalError, match=".*missing a required argument: 'a1'"):
         macro_evaluator.evaluate(parse_one("@test_arg_resolution(1)"))
-    assert str(e.value.__cause__) == "missing a required argument: 'a1'"
 
-    with pytest.raises(MacroEvalError) as e:
+    with pytest.raises(MacroEvalError, match=".*missing a required argument: 'a1'"):
         macro_evaluator.evaluate(parse_one("@test_arg_resolution(1, a2 := 2)"))
-    assert str(e.value.__cause__) == "missing a required argument: 'a1'"
 
-    with pytest.raises(MacroEvalError) as e:
+    with pytest.raises(
+        MacroEvalError,
+        match=".*'pos_only' parameter is positional only, but was passed as a keyword|.*missing a required positional-only argument: 'pos_only'|.*missing a required argument: 'a1'",
+    ):
         macro_evaluator.evaluate(parse_one("@test_arg_resolution(pos_only := 1)"))
 
-    # The CI was failing for Python 3.12 with the latter message, but other versions fail
-    # with the former one. This ensures we capture both.
-    assert str(e.value.__cause__) in (
-        "'pos_only' parameter is positional only, but was passed as a keyword",
-        "missing a required argument: 'a1'",
-    )
-
-    with pytest.raises(MacroEvalError) as e:
+    with pytest.raises(MacroEvalError, match=".*too many positional arguments"):
         macro_evaluator.evaluate(parse_one("@test_arg_resolution(1, 2, 3)"))
-    assert str(e.value.__cause__) == "too many positional arguments"
 
 
 def test_macro_metadata_flag():
@@ -802,28 +798,25 @@ def test_deduplicate(assert_exp_eq, dialect, sql, expected_sql):
 
 def test_deduplicate_error_handling(macro_evaluator):
     # Test error handling: non-list partition_by
-    with pytest.raises(SQLMeshError) as e:
+    with pytest.raises(
+        SQLMeshError,
+        match="partition_by must be a list of columns: \\[<column>, cast\\(<column> as <type>\\)\\]",
+    ):
         macro_evaluator.evaluate(parse_one("@deduplicate(my_table, user_id, ['timestamp DESC'])"))
-    assert (
-        str(e.value.__cause__)
-        == "partition_by must be a list of columns: [<column>, cast(<column> as <type>)]"
-    )
 
     # Test error handling: non-list order_by
-    with pytest.raises(SQLMeshError) as e:
+    with pytest.raises(
+        SQLMeshError,
+        match="order_by must be a list of strings, optional - nulls ordering: \\['<column> <asc|desc> nulls <first|last>'\\]",
+    ):
         macro_evaluator.evaluate(parse_one("@deduplicate(my_table, [user_id], 'timestamp DESC')"))
-    assert (
-        str(e.value.__cause__)
-        == "order_by must be a list of strings, optional - nulls ordering: ['<column> <asc|desc> nulls <first|last>']"
-    )
 
     # Test error handling: empty order_by
-    with pytest.raises(SQLMeshError) as e:
+    with pytest.raises(
+        SQLMeshError,
+        match="order_by must be a list of strings, optional - nulls ordering: \\['<column> <asc|desc> nulls <first|last>'\\]",
+    ):
         macro_evaluator.evaluate(parse_one("@deduplicate(my_table, [user_id], [])"))
-    assert (
-        str(e.value.__cause__)
-        == "order_by must be a list of strings, optional - nulls ordering: ['<column> <asc|desc> nulls <first|last>']"
-    )
 
 
 @pytest.mark.parametrize(
@@ -916,7 +909,7 @@ def test_date_spine(assert_exp_eq, dialect, date_part):
                     CAST('2022-01-01' AS DATE),
                     CAST('2024-12-31' AS DATE),
                     INTERVAL '{interval}'
-                ) AS value
+                ) AS _t(value)
         ) AS _exploded(date_{date_part})
         """
     elif dialect == "spark":
@@ -985,34 +978,32 @@ def test_date_spine(assert_exp_eq, dialect, date_part):
 
 def test_date_spine_error_handling(macro_evaluator):
     # Test error handling: invalid datepart
-    with pytest.raises(SQLMeshError) as e:
+    with pytest.raises(
+        MacroEvalError,
+        match=".*Invalid datepart 'invalid'. Expected: 'day', 'week', 'month', 'quarter', or 'year'",
+    ):
         macro_evaluator.evaluate(parse_one("@date_spine('invalid', '2022-01-01', '2024-12-31')"))
-    assert (
-        str(e.value.__cause__)
-        == "Invalid datepart 'invalid'. Expected: 'day', 'week', 'month', 'quarter', or 'year'"
-    )
 
     # Test error handling: invalid start_date format
-    with pytest.raises(SQLMeshError) as e:
+    with pytest.raises(
+        MacroEvalError,
+        match=".*Invalid date format - start_date and end_date must be in format: YYYY-MM-DD",
+    ):
         macro_evaluator.evaluate(parse_one("@date_spine('day', '2022/01/01', '2024-12-31')"))
-    assert str(e.value.__cause__).startswith(
-        "Invalid date format - start_date and end_date must be in format: YYYY-MM-DD"
-    )
 
     # Test error handling: invalid end_date format
-    with pytest.raises(SQLMeshError) as e:
+    with pytest.raises(
+        MacroEvalError,
+        match=".*Invalid date format - start_date and end_date must be in format: YYYY-MM-DD",
+    ):
         macro_evaluator.evaluate(parse_one("@date_spine('day', '2022-01-01', '2024/12/31')"))
-    assert str(e.value.__cause__).startswith(
-        "Invalid date format - start_date and end_date must be in format: YYYY-MM-DD"
-    )
 
     # Test error handling: start_date after end_date
-    with pytest.raises(SQLMeshError) as e:
+    with pytest.raises(
+        MacroEvalError,
+        match=".*Invalid date range - start_date '2024-12-31' is after end_date '2022-01-01'.",
+    ):
         macro_evaluator.evaluate(parse_one("@date_spine('day', '2024-12-31', '2022-01-01')"))
-    assert (
-        str(e.value.__cause__)
-        == "Invalid date range - start_date '2024-12-31' is after end_date '2022-01-01'."
-    )
 
 
 def test_macro_union(assert_exp_eq, macro_evaluator: MacroEvaluator):
@@ -1020,3 +1011,79 @@ def test_macro_union(assert_exp_eq, macro_evaluator: MacroEvaluator):
     expected_sql = "SELECT 1 AS col UNION ALL SELECT 1 AS col"
 
     assert_exp_eq(macro_evaluator.transform(parse_one(sql)), expected_sql)
+
+
+def test_resolve_template_literal():
+    parsed_sql = parse_one(
+        "@resolve_template('s3://data-bucket/prod/@{catalog_name}/@{schema_name}/@{table_name}')"
+    )
+
+    # Loading
+    # During loading, this should passthrough / no-op
+    # This is because SQLMesh renders everything on load to figure out model dependencies and we dont want to throw an error
+    evaluator = MacroEvaluator(runtime_stage=RuntimeStage.LOADING)
+    assert evaluator.transform(parsed_sql) == exp.Literal.string(
+        "s3://data-bucket/prod/@{catalog_name}/@{schema_name}/@{table_name}"
+    )
+
+    # Creating
+    # This macro can work during creating / evaluating but only if @this_model is present in the context
+    evaluator = MacroEvaluator(runtime_stage=RuntimeStage.CREATING)
+    with pytest.raises(MacroEvalError, match=".*this_model must be present"):
+        evaluator.transform(parsed_sql)
+
+    evaluator.locals.update(
+        {"this_model": exp.to_table("test_catalog.sqlmesh__test.test__test_model__2517971505")}
+    )
+
+    assert (
+        evaluator.transform(parsed_sql).sql()
+        == "'s3://data-bucket/prod/test_catalog/sqlmesh__test/test__test_model__2517971505'"
+    )
+
+    # Evaluating
+    evaluator = MacroEvaluator(runtime_stage=RuntimeStage.EVALUATING)
+    evaluator.locals.update(
+        {"this_model": exp.to_table("test_catalog.sqlmesh__test.test__test_model__2517971505")}
+    )
+    assert (
+        evaluator.transform(parsed_sql).sql()
+        == "'s3://data-bucket/prod/test_catalog/sqlmesh__test/test__test_model__2517971505'"
+    )
+
+
+def test_resolve_template_table():
+    parsed_sql = parse_one(
+        "SELECT * FROM @resolve_template('@{catalog_name}.@{schema_name}.@{table_name}$partitions', mode := 'table')"
+    )
+
+    evaluator = MacroEvaluator(runtime_stage=RuntimeStage.CREATING)
+    evaluator.locals.update(
+        {"this_model": exp.to_table("test_catalog.sqlmesh__test.test__test_model__2517971505")}
+    )
+
+    assert (
+        evaluator.transform(parsed_sql).sql(identify=True)
+        == 'SELECT * FROM "test_catalog"."sqlmesh__test"."test__test_model__2517971505$partitions"'
+    )
+
+
+def test_macro_with_spaces():
+    evaluator = MacroEvaluator()
+    evaluator.evaluate(d.parse_one(""" @DEF(x, "a b") """))
+    evaluator.evaluate(d.parse_one(""" @DEF(y, 'a b') """))
+    evaluator.evaluate(d.parse_one(""" @DEF(z, a."b c") """))
+
+    for sql, expected in (
+        ("@x", '"a b"'),
+        ("@{x}", '"a b"'),
+        ("a_@x", '"a_a b"'),
+        ("a.@x", 'a."a b"'),
+        ("@y", "'a b'"),
+        ("@{y}", '"a b"'),  # a little tricky here as it's not a string
+        ("a_@y", '"a_a b"'),
+        ("a.@{y}", 'a."a b"'),
+        ("@z", 'a."b c"'),
+        ("d.@z", 'd.a."b c"'),
+    ):
+        assert evaluator.transform(parse_one(sql)).sql() == expected

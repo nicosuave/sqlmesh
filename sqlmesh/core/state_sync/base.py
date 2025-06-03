@@ -9,7 +9,12 @@ import typing as t
 from sqlglot import __version__ as SQLGLOT_VERSION
 
 from sqlmesh import migrations
-from sqlmesh.core.environment import Environment, EnvironmentNamingInfo
+from sqlmesh.core.environment import (
+    Environment,
+    EnvironmentNamingInfo,
+    EnvironmentStatements,
+    EnvironmentSummary,
+)
 from sqlmesh.core.snapshot import (
     Snapshot,
     SnapshotId,
@@ -17,16 +22,14 @@ from sqlmesh.core.snapshot import (
     SnapshotInfoLike,
     SnapshotTableCleanupTask,
     SnapshotTableInfo,
+    SnapshotNameVersion,
 )
 from sqlmesh.core.snapshot.definition import Interval, SnapshotIntervals
 from sqlmesh.utils import major_minor
 from sqlmesh.utils.date import TimeLike
 from sqlmesh.utils.errors import SQLMeshError
-from sqlmesh.utils.pydantic import (
-    PydanticModel,
-    field_validator,
-    field_validator_v1_args,
-)
+from sqlmesh.utils.pydantic import PydanticModel, ValidationInfo, field_validator
+from sqlmesh.core.state_sync.common import StateStream
 
 logger = logging.getLogger(__name__)
 
@@ -70,11 +73,10 @@ class PromotionResult(PydanticModel):
     removed_environment_naming_info: t.Optional[EnvironmentNamingInfo]
 
     @field_validator("removed_environment_naming_info")
-    @field_validator_v1_args
     def _validate_removed_environment_naming_info(
-        cls, v: t.Optional[EnvironmentNamingInfo], values: t.Any
+        cls, v: t.Optional[EnvironmentNamingInfo], info: ValidationInfo
     ) -> t.Optional[EnvironmentNamingInfo]:
-        if v and not values["removed"]:
+        if v and not info.data.get("removed"):
             raise ValueError("removed_environment_naming_info must be None if removed is empty")
         return v
 
@@ -84,14 +86,12 @@ class StateReader(abc.ABC):
 
     @abc.abstractmethod
     def get_snapshots(
-        self,
-        snapshot_ids: t.Optional[t.Iterable[SnapshotIdLike]],
+        self, snapshot_ids: t.Iterable[SnapshotIdLike]
     ) -> t.Dict[SnapshotId, Snapshot]:
         """Bulk fetch snapshots given the corresponding snapshot ids.
 
         Args:
-            snapshot_ids: Iterable of snapshot ids to get. If not provided all
-                available snapshots will be returned.
+            snapshot_ids: Iterable of snapshot ids to get.
 
         Returns:
             A dictionary of snapshot ids to snapshots for ones that could be found.
@@ -140,6 +140,14 @@ class StateReader(abc.ABC):
         """
 
     @abc.abstractmethod
+    def get_environments_summary(self) -> t.List[EnvironmentSummary]:
+        """Fetches all environment names along with expiry datetime.
+
+        Returns:
+            A list of all environment summaries.
+        """
+
+    @abc.abstractmethod
     def max_interval_end_per_model(
         self,
         environment: str,
@@ -170,6 +178,24 @@ class StateReader(abc.ABC):
     @abc.abstractmethod
     def state_type(self) -> str:
         """Returns the type of state sync."""
+
+    @abc.abstractmethod
+    def update_auto_restatements(
+        self, next_auto_restatement_ts: t.Dict[SnapshotNameVersion, t.Optional[int]]
+    ) -> None:
+        """Updates the next auto restatement timestamp for the snapshots.
+
+        Args:
+            next_auto_restatement_ts: A dictionary of snapshot name / version pairs to the next auto restatement timestamp.
+        """
+
+    @abc.abstractmethod
+    def get_environment_statements(self, environment: str) -> t.List[EnvironmentStatements]:
+        """Fetches environment statements from the environment_statements table.
+
+        Returns:
+            A list of the Environment Statements.
+        """
 
     def get_versions(self, validate: bool = True) -> Versions:
         """Get the current versions of the SQLMesh schema and libraries.
@@ -238,14 +264,41 @@ class StateReader(abc.ABC):
         return versions
 
     @abc.abstractmethod
-    def _get_versions(self, lock_for_update: bool = False) -> Versions:
+    def _get_versions(self) -> Versions:
         """Queries the store to get the current versions of SQLMesh and deps.
-
-        Args:
-            lock_for_update: Whether or not the usage of this method plans to update the row.
 
         Returns:
             The versions object.
+        """
+
+    @abc.abstractmethod
+    def export(self, environment_names: t.Optional[t.List[str]] = None) -> StateStream:
+        """Export the contents of this StateSync as a StateStream
+
+        Args:
+            environment_names: An optional list of environment names to export. If not specified, all environments will be exported.
+        """
+
+    @abc.abstractmethod
+    def get_expired_snapshots(
+        self, current_ts: int, ignore_ttl: bool = False
+    ) -> t.List[SnapshotTableCleanupTask]:
+        """Aggregates the id's of the expired snapshots and creates a list of table cleanup tasks.
+
+        Expired snapshots are snapshots that have exceeded their time-to-live
+        and are no longer in use within an environment.
+
+        Returns:
+           The list of table cleanup tasks.
+        """
+
+    @abc.abstractmethod
+    def get_expired_environments(self, current_ts: int) -> t.List[Environment]:
+        """Returns the expired environments.
+
+        Expired environments are environments that have exceeded their time-to-live value.
+        Returns:
+            The list of environments to remove, the filter to remove environments.
         """
 
 
@@ -276,7 +329,7 @@ class StateSync(StateReader, abc.ABC):
 
     @abc.abstractmethod
     def delete_expired_snapshots(
-        self, ignore_ttl: bool = False
+        self, ignore_ttl: bool = False, current_ts: t.Optional[int] = None
     ) -> t.List[SnapshotTableCleanupTask]:
         """Removes expired snapshots.
 
@@ -288,16 +341,21 @@ class StateSync(StateReader, abc.ABC):
                 all snapshots that are not referenced in any environment
 
         Returns:
-            The list of table cleanup tasks.
+            The list of snapshot table cleanup tasks.
         """
 
     @abc.abstractmethod
-    def invalidate_environment(self, name: str) -> None:
+    def invalidate_environment(self, name: str, protect_prod: bool = True) -> None:
         """Invalidates the target environment by setting its expiration timestamp to now.
 
         Args:
             name: The name of the environment to invalidate.
+            protect_prod: If True, prevents invalidation of the production environment.
         """
+
+    @abc.abstractmethod
+    def remove_state(self, including_backup: bool = False) -> None:
+        """Removes the state store objects."""
 
     @abc.abstractmethod
     def remove_intervals(
@@ -331,6 +389,7 @@ class StateSync(StateReader, abc.ABC):
         self,
         environment: Environment,
         no_gaps_snapshot_names: t.Optional[t.Set[str]] = None,
+        environment_statements: t.Optional[t.List[EnvironmentStatements]] = None,
     ) -> PromotionResult:
         """Update the environment to reflect the current state.
 
@@ -357,7 +416,9 @@ class StateSync(StateReader, abc.ABC):
         """
 
     @abc.abstractmethod
-    def delete_expired_environments(self) -> t.List[Environment]:
+    def delete_expired_environments(
+        self, current_ts: t.Optional[int] = None
+    ) -> t.List[Environment]:
         """Removes expired environments.
 
         Expired environments are environments that have exceeded their time-to-live value.
@@ -425,7 +486,7 @@ class StateSync(StateReader, abc.ABC):
             end: The end of the interval to add.
             is_dev: Indicates whether the given interval is being added while in development mode
         """
-        start_ts, end_ts = snapshot.inclusive_exclusive(start, end, strict=False)
+        start_ts, end_ts = snapshot.inclusive_exclusive(start, end, strict=False, expand=False)
         if not snapshot.version:
             raise SQLMeshError("Snapshot version must be set to add an interval.")
         intervals = [(start_ts, end_ts)]
@@ -433,10 +494,21 @@ class StateSync(StateReader, abc.ABC):
             name=snapshot.name,
             identifier=snapshot.identifier,
             version=snapshot.version,
+            dev_version=snapshot.dev_version,
             intervals=intervals if not is_dev else [],
             dev_intervals=intervals if is_dev else [],
         )
         self.add_snapshots_intervals([snapshot_intervals])
+
+    @abc.abstractmethod
+    def import_(self, stream: StateStream, clear: bool = True) -> None:
+        """
+        Replace the existing state with the state contained in the StateStream
+
+        Args:
+            stream: The stream of new state
+            clear: Whether or not to clear existing state before inserting state from the stream
+        """
 
 
 class DelegatingStateSync(StateSync):

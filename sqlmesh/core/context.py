@@ -41,15 +41,15 @@ import time
 import traceback
 import typing as t
 import unittest.result
-from datetime import date, timedelta
 from functools import cached_property
 from io import StringIO
+from itertools import chain
 from pathlib import Path
 from shutil import rmtree
-from types import MappingProxyType, SimpleNamespace
+from types import MappingProxyType
 
-import pandas as pd
 from sqlglot import Dialect, exp
+from sqlglot.helper import first
 from sqlglot.lineage import GraphHTML
 
 from sqlmesh.core import analytics
@@ -61,8 +61,10 @@ from sqlmesh.core.config import (
     Config,
     load_configs,
 )
+from sqlmesh.core.config.connection import ConnectionConfig
 from sqlmesh.core.config.loader import C
-from sqlmesh.core.console import Console, get_console
+from sqlmesh.core.config.root import RegexKeyDict
+from sqlmesh.core.console import get_console
 from sqlmesh.core.context_diff import ContextDiff
 from sqlmesh.core.dialect import (
     format_model_expressions,
@@ -73,19 +75,23 @@ from sqlmesh.core.dialect import (
     parse_one,
 )
 from sqlmesh.core.engine_adapter import EngineAdapter
-from sqlmesh.core.environment import Environment, EnvironmentNamingInfo
-from sqlmesh.core.loader import Loader, update_model_schemas
+from sqlmesh.core.environment import Environment, EnvironmentNamingInfo, EnvironmentStatements
+from sqlmesh.core.loader import Loader
+from sqlmesh.core.linter.definition import AnnotatedRuleViolation, Linter
+from sqlmesh.core.linter.rules import BUILTIN_RULES
 from sqlmesh.core.macros import ExecutableOrMacro, macro
 from sqlmesh.core.metric import Metric, rewrite
-from sqlmesh.core.model import Model
+from sqlmesh.core.model import Model, update_model_schemas
+from sqlmesh.core.config.model import ModelDefaultsConfig
 from sqlmesh.core.notification_target import (
     NotificationEvent,
     NotificationTarget,
     NotificationTargetManager,
 )
-from sqlmesh.core.plan import Plan, PlanBuilder
+from sqlmesh.core.plan import Plan, PlanBuilder, SnapshotIntervals
+from sqlmesh.core.plan.definition import UserProvidedFlags
 from sqlmesh.core.reference import ReferenceGraph
-from sqlmesh.core.scheduler import Scheduler
+from sqlmesh.core.scheduler import Scheduler, CompletionStatus
 from sqlmesh.core.schema_loader import create_external_models_file
 from sqlmesh.core.selector import Selector
 from sqlmesh.core.snapshot import (
@@ -93,8 +99,10 @@ from sqlmesh.core.snapshot import (
     Snapshot,
     SnapshotEvaluator,
     SnapshotFingerprint,
+    missing_intervals,
     to_table_mapping,
 )
+from sqlmesh.core.snapshot.definition import get_next_model_interval_start
 from sqlmesh.core.state_sync import (
     CachingStateSync,
     StateReader,
@@ -104,29 +112,32 @@ from sqlmesh.core.state_sync import (
 from sqlmesh.core.table_diff import TableDiff
 from sqlmesh.core.test import (
     ModelTextTestResult,
+    ModelTestMetadata,
     generate_test,
-    get_all_model_tests,
-    run_model_tests,
     run_tests,
 )
 from sqlmesh.core.user import User
-from sqlmesh.utils import UniqueKeyDict, sys_path
+from sqlmesh.utils import UniqueKeyDict, Verbosity
+from sqlmesh.utils.concurrency import concurrent_apply_to_values
 from sqlmesh.utils.dag import DAG
-from sqlmesh.utils.date import TimeLike, now_ds, to_date
+from sqlmesh.utils.date import TimeLike, now_ds, to_timestamp, format_tz_datetime, now_timestamp
 from sqlmesh.utils.errors import (
     CircuitBreakerError,
     ConfigError,
     PlanError,
     SQLMeshError,
     UncategorizedPlanError,
+    LinterError,
 )
 from sqlmesh.utils.config import print_config
 from sqlmesh.utils.jinja import JinjaMacroRegistry
 
 if t.TYPE_CHECKING:
+    import pandas as pd
     from typing_extensions import Literal
 
     from sqlmesh.core.engine_adapter._typing import (
+        BigframeSession,
         DF,
         PySparkDataFrame,
         PySparkSession,
@@ -169,11 +180,16 @@ class BaseContext(abc.ABC):
         return self.engine_adapter.snowpark
 
     @property
+    def bigframe(self) -> t.Optional[BigframeSession]:
+        """Returns the bigframe session if it exists."""
+        return self.engine_adapter.bigframe
+
+    @property
     def default_catalog(self) -> t.Optional[str]:
         raise NotImplementedError
 
     def table(self, model_name: str) -> str:
-        logger.warning(
+        get_console().log_warning(
             "The SQLMesh context's `table` method is deprecated and will be removed "
             "in a future release. Please use the `resolve_table` method instead."
         )
@@ -242,6 +258,7 @@ class ExecutionContext(BaseContext):
         default_dialect: t.Optional[str] = None,
         default_catalog: t.Optional[str] = None,
         variables: t.Optional[t.Dict[str, t.Any]] = None,
+        blueprint_variables: t.Optional[t.Dict[str, t.Any]] = None,
     ):
         self.snapshots = snapshots
         self.deployability_index = deployability_index
@@ -249,6 +266,7 @@ class ExecutionContext(BaseContext):
         self._default_catalog = default_catalog
         self._default_dialect = default_dialect
         self._variables = variables or {}
+        self._blueprint_variables = blueprint_variables or {}
 
     @property
     def default_dialect(self) -> t.Optional[str]:
@@ -277,7 +295,15 @@ class ExecutionContext(BaseContext):
         """Returns a variable value."""
         return self._variables.get(var_name.lower(), default)
 
-    def with_variables(self, variables: t.Dict[str, t.Any]) -> ExecutionContext:
+    def blueprint_var(self, var_name: str, default: t.Optional[t.Any] = None) -> t.Optional[t.Any]:
+        """Returns a blueprint variable value."""
+        return self._blueprint_variables.get(var_name.lower(), default)
+
+    def with_variables(
+        self,
+        variables: t.Dict[str, t.Any],
+        blueprint_variables: t.Optional[t.Dict[str, t.Any]] = None,
+    ) -> ExecutionContext:
         """Returns a new ExecutionContext with additional variables."""
         return ExecutionContext(
             self._engine_adapter,
@@ -286,6 +312,7 @@ class ExecutionContext(BaseContext):
             self._default_dialect,
             self._default_catalog,
             variables=variables,
+            blueprint_variables=blueprint_variables,
         )
 
 
@@ -322,13 +349,12 @@ class GenericContext(BaseContext, t.Generic[C]):
         concurrent_tasks: t.Optional[int] = None,
         loader: t.Optional[t.Type[Loader]] = None,
         load: bool = True,
-        console: t.Optional[Console] = None,
         users: t.Optional[t.List[User]] = None,
     ):
         self.configs = (
             config if isinstance(config, dict) else load_configs(config, self.CONFIG_TYPE, paths)
         )
-        self._loaders: UniqueKeyDict[str, SimpleNamespace] = UniqueKeyDict("loaders")
+        self._projects = {config.project for config in self.configs.values()}
         self.dag: DAG[str] = DAG()
         self._models: UniqueKeyDict[str, Model] = UniqueKeyDict("models")
         self._audits: UniqueKeyDict[str, ModelAudit] = UniqueKeyDict("audits")
@@ -339,27 +365,15 @@ class GenericContext(BaseContext, t.Generic[C]):
         self._metrics: UniqueKeyDict[str, Metric] = UniqueKeyDict("metrics")
         self._jinja_macros = JinjaMacroRegistry()
         self._requirements: t.Dict[str, str] = {}
-        self._default_catalog: t.Optional[str] = None
+        self._environment_statements: t.List[EnvironmentStatements] = []
+        self._excluded_requirements: t.Set[str] = set()
+        self._engine_adapter: t.Optional[EngineAdapter] = None
+        self._linters: t.Dict[str, Linter] = {}
         self._loaded: bool = False
 
         self.path, self.config = t.cast(t.Tuple[Path, C], next(iter(self.configs.items())))
-        for path, config in self.configs.items():
-            project_type = c.DBT if config.loader.__name__.lower().startswith(c.DBT) else c.NATIVE
-            if project_type not in self._loaders:
-                self._loaders[project_type] = SimpleNamespace(
-                    loader=(loader or config.loader)(**config.loader_kwargs), configs={}
-                )
-            self._loaders[project_type].configs[path] = config
 
-        self.project_type = c.HYBRID if len(self._loaders) > 1 else project_type
         self._all_dialects: t.Set[str] = {self.config.dialect or ""}
-
-        # This allows overriding the default dialect's normalization strategy, so for example
-        # one can do `dialect="duckdb,normalization_strategy=lowercase"` and this will be
-        # applied to the DuckDB dialect globally
-        if "normalization_strategy" in str(self.config.dialect):
-            dialect = Dialect.get_or_raise(self.config.dialect)
-            type(dialect).NORMALIZATION_STRATEGY = dialect.normalization_strategy
 
         if self.config.disable_anonymized_analytics:
             analytics.disable_analytics()
@@ -371,19 +385,37 @@ class GenericContext(BaseContext, t.Generic[C]):
         self.auto_categorize_changes = self.config.plan.auto_categorize_changes
         self.selected_gateway = gateway or self.config.default_gateway_name
 
-        self._connection_config = self.config.get_connection(self.gateway)
-        self.concurrent_tasks = concurrent_tasks or self._connection_config.concurrent_tasks
+        gw_model_defaults = self.config.gateways[self.selected_gateway].model_defaults
+        if gw_model_defaults:
+            # Merge global model defaults with the selected gateway's, if it's overriden
+            global_defaults = self.config.model_defaults.model_dump(exclude_unset=True)
+            gateway_defaults = gw_model_defaults.model_dump(exclude_unset=True)
 
-        self._engine_adapters: t.Dict[str, EngineAdapter] = {
-            self.selected_gateway: self._connection_config.create_engine_adapter()
-        }
+            self.config.model_defaults = ModelDefaultsConfig(
+                **{**global_defaults, **gateway_defaults}
+            )
+
+        # This allows overriding the default dialect's normalization strategy, so for example
+        # one can do `dialect="duckdb,normalization_strategy=lowercase"` and this will be
+        # applied to the DuckDB dialect globally
+        if "normalization_strategy" in str(self.config.dialect):
+            dialect = Dialect.get_or_raise(self.config.dialect)
+            type(dialect).NORMALIZATION_STRATEGY = dialect.normalization_strategy
+
+        self._loaders = [
+            (loader or config.loader)(self, path, **config.loader_kwargs)
+            for path, config in self.configs.items()
+        ]
+
+        self._concurrent_tasks = concurrent_tasks
+        self._state_connection_config = (
+            self.config.get_state_connection(self.gateway) or self.connection_config
+        )
 
         self._snapshot_evaluator: t.Optional[SnapshotEvaluator] = None
 
-        self.console = console or get_console(dialect=self.engine_adapter.dialect)
-        self._test_connection_config = self.config.get_test_connection(
-            self.gateway, self.default_catalog, default_catalog_dialect=self.engine_adapter.DIALECT
-        )
+        self.console = get_console()
+        setattr(self.console, "dialect", self.config.dialect)
 
         self._provided_state_sync: t.Optional[StateSync] = state_sync
         self._state_sync: t.Optional[StateSync] = None
@@ -393,14 +425,6 @@ class GenericContext(BaseContext, t.Generic[C]):
         self.users = (users or []) + self.config.users
         self.users = list({user.username: user for user in self.users}.values())
         self._register_notification_targets()
-
-        if (
-            self.config.environment_catalog_mapping
-            and not self.engine_adapter.CATALOG_SUPPORT.is_multi_catalog_supported
-        ):
-            raise SQLMeshError(
-                "Environment catalog mapping is only supported for engine adapters that support multiple catalogs"
-            )
 
         if load:
             self.load()
@@ -412,17 +436,17 @@ class GenericContext(BaseContext, t.Generic[C]):
     @property
     def engine_adapter(self) -> EngineAdapter:
         """Returns the default engine adapter."""
-        return self._engine_adapters[self.selected_gateway]
+        if self._engine_adapter is None:
+            self._engine_adapter = self.connection_config.create_engine_adapter()
+        return self._engine_adapter
 
     @property
     def snapshot_evaluator(self) -> SnapshotEvaluator:
         if not self._snapshot_evaluator:
-            if self._snapshot_gateways:
-                self._create_engine_adapters(set(self._snapshot_gateways.values()))
             self._snapshot_evaluator = SnapshotEvaluator(
                 {
                     gateway: adapter.with_log_level(logging.INFO)
-                    for gateway, adapter in self._engine_adapters.items()
+                    for gateway, adapter in self.engine_adapters.items()
                 },
                 ddl_concurrent_tasks=self.concurrent_tasks,
                 selected_gateway=self.selected_gateway,
@@ -433,11 +457,12 @@ class GenericContext(BaseContext, t.Generic[C]):
         self,
         deployability_index: t.Optional[DeployabilityIndex] = None,
         engine_adapter: t.Optional[EngineAdapter] = None,
+        snapshots: t.Optional[t.Dict[str, Snapshot]] = None,
     ) -> ExecutionContext:
         """Returns an execution context."""
         return ExecutionContext(
             engine_adapter=engine_adapter or self.engine_adapter,
-            snapshots=self.snapshots,
+            snapshots=snapshots or self.snapshots,
             deployability_index=deployability_index,
             default_dialect=self.default_dialect,
             default_catalog=self.default_catalog,
@@ -543,35 +568,79 @@ class GenericContext(BaseContext, t.Generic[C]):
 
     def refresh(self) -> None:
         """Refresh all models that have been updated."""
-        if any(context_loader.loader.reload_needed() for context_loader in self._loaders.values()):
+        if any(loader.reload_needed() for loader in self._loaders):
             self.load()
 
     def load(self, update_schemas: bool = True) -> GenericContext[C]:
         """Load all files in the context's path."""
         load_start_ts = time.perf_counter()
 
-        projects = []
-        self._requirements.clear()
-        for context_loader in self._loaders.values():
-            for path in context_loader.configs:
-                self._load_requirements(path)
-            with sys_path(*context_loader.configs):
-                projects.append(context_loader.loader.load(self, update_schemas))
+        loaded_projects = [loader.load() for loader in self._loaders]
 
+        self.dag = DAG()
         self._standalone_audits.clear()
         self._audits.clear()
         self._macros.clear()
         self._models.clear()
         self._metrics.clear()
-        for project in projects:
+        self._requirements.clear()
+        self._excluded_requirements.clear()
+        self._linters.clear()
+        self._environment_statements = []
+
+        for loader, project in zip(self._loaders, loaded_projects):
             self._jinja_macros = self._jinja_macros.merge(project.jinja_macros)
             self._macros.update(project.macros)
             self._models.update(project.models)
             self._metrics.update(project.metrics)
             self._audits.update(project.audits)
             self._standalone_audits.update(project.standalone_audits)
+            self._requirements.update(project.requirements)
+            self._excluded_requirements.update(project.excluded_requirements)
+            self._environment_statements.extend(project.environment_statements)
 
-        self.dag = DAG({k: v for project in projects for k, v in project.dag.graph.items()})
+            config = loader.config
+            self._linters[config.project] = Linter.from_rules(
+                BUILTIN_RULES.union(project.user_rules), config.linter
+            )
+
+        uncached = set()
+
+        if any(self._projects):
+            prod = self.state_reader.get_environment(c.PROD)
+
+            if prod:
+                for snapshot in self.state_reader.get_snapshots(prod.snapshots).values():
+                    if snapshot.node.project in self._projects:
+                        uncached.add(snapshot.name)
+                    else:
+                        store = self._standalone_audits if snapshot.is_audit else self._models
+                        store[snapshot.name] = snapshot.node  # type: ignore
+
+        for model in self._models.values():
+            self.dag.add(model.fqn, model.depends_on)
+
+        if update_schemas:
+            for fqn in self.dag:
+                model = self._models.get(fqn)  # type: ignore
+
+                if not model or fqn in uncached:
+                    continue
+
+                # make a copy of remote models that depend on local models or in the downstream chain
+                # without this, a SELECT * FROM local will not propogate properly because the downstream
+                # model will get mutated (schema changes) but the object is the same as the remote cache
+                if any(dep in uncached for dep in model.depends_on):
+                    uncached.add(fqn)
+                    self._models.update({fqn: model.copy(update={"mapping_schema": {}})})
+                    continue
+
+            update_model_schemas(self.dag, models=self._models, context_path=self.path)
+
+            models = self.models.values()
+            for model in models:
+                # The model definition can be validated correctly only after the schema is set.
+                model.validate_definition()
 
         duplicates = set(self._models) & set(self._standalone_audits)
         if duplicates:
@@ -584,7 +653,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         }
 
         analytics.collector.on_project_loaded(
-            project_type=self.project_type,
+            project_type=self._project_type,
             models_count=len(self._models),
             audits_count=len(self._audits),
             standalone_audits_count=len(self._standalone_audits),
@@ -611,7 +680,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         select_models: t.Optional[t.Collection[str]] = None,
         exit_on_env_update: t.Optional[int] = None,
         no_auto_upstream: bool = False,
-    ) -> bool:
+    ) -> CompletionStatus:
         """Run the entire dag through the scheduler.
 
         Args:
@@ -631,6 +700,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             True if the run was successful, False otherwise.
         """
         environment = environment or self.config.default_target_environment
+        environment = Environment.sanitize_name(environment)
         if not skip_janitor and environment.lower() == c.PROD:
             self._run_janitor()
 
@@ -641,7 +711,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             engine_type=self.snapshot_evaluator.adapter.dialect,
             state_sync_type=self.state_sync.state_type(),
         )
-        self._load_materializations_and_signals()
+        self._load_materializations()
 
         env_check_attempts_num = max(
             1,
@@ -686,7 +756,7 @@ class GenericContext(BaseContext, t.Generic[C]):
                 )
 
             try:
-                success = self._run(
+                completion_status = self._run(
                     environment,
                     start=start,
                     end=end,
@@ -699,7 +769,7 @@ class GenericContext(BaseContext, t.Generic[C]):
                 done = True
             except CircuitBreakerError:
                 logger.warning(
-                    "Environment '%s' has been modified while running. Restarting the run...",
+                    "Environment '%s' modified while running. Restarting the run...",
                     environment,
                 )
                 if exit_on_env_update:
@@ -709,18 +779,18 @@ class GenericContext(BaseContext, t.Generic[C]):
                 self.notification_target_manager.notify(
                     NotificationEvent.RUN_FAILURE, traceback.format_exc()
                 )
-                logger.error(f"Run Failure: {traceback.format_exc()}")
+                logger.info("Run failed.", exc_info=e)
                 analytics.collector.on_run_end(
                     run_id=analytics_run_id, succeeded=False, interrupted=False, error=e
                 )
                 raise e
 
-        if success or interrupted:
+        if completion_status.is_success or interrupted:
             self.notification_target_manager.notify(
                 NotificationEvent.RUN_END, environment=environment
             )
             self.console.log_success(f"Run finished for environment '{environment}'")
-        else:
+        elif completion_status.is_failure:
             self.notification_target_manager.notify(
                 NotificationEvent.RUN_FAILURE, "See console logs for details."
             )
@@ -732,7 +802,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         if interrupted and exit_on_env_update is not None:
             sys.exit(exit_on_env_update)
 
-        return success
+        return completion_status
 
     @python_api_analytics
     def run_janitor(self, ignore_ttl: bool) -> bool:
@@ -744,6 +814,19 @@ class GenericContext(BaseContext, t.Generic[C]):
                 success = True
             finally:
                 self.console.stop_cleanup(success=success)
+
+        return success
+
+    @python_api_analytics
+    def destroy(self) -> bool:
+        success = False
+
+        if self.console.start_destroy():
+            try:
+                self._destroy()
+                success = True
+            finally:
+                self.console.stop_destroy(success=success)
 
         return success
 
@@ -771,7 +854,12 @@ class GenericContext(BaseContext, t.Generic[C]):
         Returns:
             The expected model.
         """
-        if isinstance(model_or_snapshot, str):
+        if isinstance(model_or_snapshot, Snapshot):
+            return model_or_snapshot.model
+        if not isinstance(model_or_snapshot, str):
+            return model_or_snapshot
+
+        try:
             # We should try all dialects referenced in the project for cases when models use mixed dialects.
             for dialect in self._all_dialects:
                 normalized_name = normalize_model_name(
@@ -781,13 +869,16 @@ class GenericContext(BaseContext, t.Generic[C]):
                 )
                 if normalized_name in self._models:
                     return self._models[normalized_name]
-        elif isinstance(model_or_snapshot, Snapshot):
-            return model_or_snapshot.model
-        else:
-            return model_or_snapshot
+        except:
+            pass
 
         if raise_if_missing:
-            raise SQLMeshError(f"Cannot find model for '{model_or_snapshot}'")
+            if model_or_snapshot.endswith((".sql", ".py")):
+                msg = "Resolving models by path is not supported, please pass in the model name instead."
+            else:
+                msg = f"Cannot find model with name '{model_or_snapshot}'"
+
+            raise SQLMeshError(msg)
 
         return None
 
@@ -818,13 +909,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         """
         if isinstance(node_or_snapshot, Snapshot):
             return node_or_snapshot
-        if isinstance(node_or_snapshot, str) and not self.standalone_audits.get(node_or_snapshot):
-            node_or_snapshot = normalize_model_name(
-                node_or_snapshot,
-                dialect=self.default_dialect,
-                default_catalog=self.default_catalog,
-            )
-        fqn = node_or_snapshot if isinstance(node_or_snapshot, str) else node_or_snapshot.fqn
+        fqn = self._node_or_snapshot_to_fqn(node_or_snapshot)
         snapshot = self.snapshots.get(fqn)
 
         if raise_if_missing and not snapshot:
@@ -832,19 +917,22 @@ class GenericContext(BaseContext, t.Generic[C]):
 
         return snapshot
 
-    def config_for_path(self, path: Path) -> Config:
+    def config_for_path(self, path: Path) -> t.Tuple[Config, Path]:
+        """Returns the config and path of the said project for a given file path."""
         for config_path, config in self.configs.items():
             try:
                 path.relative_to(config_path)
-                return config
+                return config, config_path
             except ValueError:
                 pass
-        return self.config
+        return self.config, self.path
 
     def config_for_node(self, node: str | Model | Audit) -> Config:
         if isinstance(node, str):
-            return self.config_for_path(self.get_snapshot(node, raise_if_missing=True).node._path)  # type: ignore
-        return self.config_for_path(node._path)  # type: ignore
+            return self.config_for_path(self.get_snapshot(node, raise_if_missing=True).node._path)[
+                0
+            ]  # type: ignore
+        return self.config_for_path(node._path)[0]  # type: ignore
 
     @property
     def models(self) -> MappingProxyType[str, Model]:
@@ -871,10 +959,13 @@ class GenericContext(BaseContext, t.Generic[C]):
         return self._snapshots()
 
     @property
+    def requirements(self) -> t.Dict[str, str]:
+        """Returns the Python dependencies of the project loaded in this context."""
+        return self._requirements.copy()
+
+    @cached_property
     def default_catalog(self) -> t.Optional[str]:
-        if self._default_catalog is None:
-            self._default_catalog = self._scheduler.get_default_catalog(self)
-        return self._default_catalog
+        return self.default_catalog_per_gateway.get(self.selected_gateway)
 
     @python_api_analytics
     def render(
@@ -916,6 +1007,8 @@ class GenericContext(BaseContext, t.Generic[C]):
         expand = self.dag.upstream(model.fqn) if expand is True else expand or []
 
         if model.is_seed:
+            import pandas as pd
+
             df = next(
                 model.render(
                     context=self.execution_context(
@@ -964,7 +1057,22 @@ class GenericContext(BaseContext, t.Generic[C]):
             execution_time: The date/time time reference to use for execution time.
             limit: A limit applied to the model.
         """
-        snapshot = self.get_snapshot(model_or_snapshot, raise_if_missing=True)
+        snapshots = self.snapshots
+        fqn = self._node_or_snapshot_to_fqn(model_or_snapshot)
+        if fqn not in snapshots:
+            raise SQLMeshError(f"Cannot find snapshot for '{fqn}'")
+        snapshot = snapshots[fqn]
+
+        # Expand all uncategorized parents since physical tables don't exist for them yet
+        expand = [
+            parent
+            for parent in self.dag.upstream(snapshot.model.fqn)
+            if (parent_snapshot := snapshots.get(parent))
+            and parent_snapshot.is_model
+            and parent_snapshot.model.is_sql
+            and not parent_snapshot.categorized
+        ]
+
         df = self.snapshot_evaluator.evaluate_and_fetch(
             snapshot,
             start=start,
@@ -972,6 +1080,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             execution_time=execution_time,
             snapshots=self.snapshots,
             limit=limit or c.DEFAULT_MAX_LIMIT,
+            expand=expand,
         )
 
         if df is None:
@@ -991,50 +1100,87 @@ class GenericContext(BaseContext, t.Generic[C]):
         **kwargs: t.Any,
     ) -> bool:
         """Format all SQL models and audits."""
-        format_targets = {**self._models, **self._audits}
-        for target in format_targets.values():
-            if target._path is None or target._path.suffix != ".sql":
-                continue
-            if paths and not any(target._path.samefile(p) for p in paths):
+        filtered_targets = [
+            target
+            for target in chain(self._models.values(), self._audits.values())
+            if target._path is not None
+            and target._path.suffix == ".sql"
+            and (not paths or any(target._path.samefile(p) for p in paths))
+        ]
+        unformatted_file_paths = []
+
+        for target in filtered_targets:
+            if (
+                target._path is None or target.formatting is False
+            ):  # introduced to satisfy type checker as still want to pull filter out as many targets as possible before loop
                 continue
 
             with open(target._path, "r+", encoding="utf-8") as file:
                 before = file.read()
-                expressions = parse(before, default_dialect=self.config_for_node(target).dialect)
-                if transpile and is_meta_expression(expressions[0]):
-                    for prop in expressions[0].expressions:
-                        if prop.name.lower() == "dialect":
-                            prop.replace(
-                                exp.Property(
-                                    this="dialect",
-                                    value=exp.Literal.string(transpile or target.dialect),
-                                )
-                            )
 
-                format_config = self.config_for_node(target).format
-                after = format_model_expressions(
-                    expressions,
-                    transpile or target.dialect,
-                    rewrite_casts=(
-                        rewrite_casts
-                        if rewrite_casts is not None
-                        else not format_config.no_rewrite_casts
-                    ),
-                    **{**format_config.generator_options, **kwargs},
+                after = self._format(
+                    target,
+                    before,
+                    transpile=transpile,
+                    rewrite_casts=rewrite_casts,
+                    append_newline=append_newline,
+                    **kwargs,
                 )
-
-                if append_newline is None:
-                    append_newline = format_config.append_newline
-                if append_newline:
-                    after += "\n"
 
                 if not check:
                     file.seek(0)
                     file.write(after)
                     file.truncate()
                 elif before != after:
-                    return False
+                    unformatted_file_paths.append(target._path)
+
+        if unformatted_file_paths:
+            for path in unformatted_file_paths:
+                self.console.log_status_update(f"{path} needs reformatting.")
+            self.console.log_status_update(
+                f"\n{len(unformatted_file_paths)} file(s) need reformatting."
+            )
+            return False
+
         return True
+
+    def _format(
+        self,
+        target: Model | Audit,
+        before: str,
+        *,
+        transpile: t.Optional[str] = None,
+        rewrite_casts: t.Optional[bool] = None,
+        append_newline: t.Optional[bool] = None,
+        **kwargs: t.Any,
+    ) -> str:
+        expressions = parse(before, default_dialect=self.config_for_node(target).dialect)
+        if transpile and is_meta_expression(expressions[0]):
+            for prop in expressions[0].expressions:
+                if prop.name.lower() == "dialect":
+                    prop.replace(
+                        exp.Property(
+                            this="dialect",
+                            value=exp.Literal.string(transpile or target.dialect),
+                        )
+                    )
+
+        format_config = self.config_for_node(target).format
+        after = format_model_expressions(
+            expressions,
+            transpile or target.dialect,
+            rewrite_casts=(
+                rewrite_casts if rewrite_casts is not None else not format_config.no_rewrite_casts
+            ),
+            **{**format_config.generator_options, **kwargs},
+        )
+
+        if append_newline is None:
+            append_newline = format_config.append_newline
+        if append_newline:
+            after += "\n"
+
+        return after
 
     @python_api_analytics
     def plan(
@@ -1045,11 +1191,11 @@ class GenericContext(BaseContext, t.Generic[C]):
         end: t.Optional[TimeLike] = None,
         execution_time: t.Optional[TimeLike] = None,
         create_from: t.Optional[str] = None,
-        skip_tests: bool = False,
+        skip_tests: t.Optional[bool] = None,
         restate_models: t.Optional[t.Iterable[str]] = None,
-        no_gaps: bool = False,
-        skip_backfill: bool = False,
-        empty_backfill: bool = False,
+        no_gaps: t.Optional[bool] = None,
+        skip_backfill: t.Optional[bool] = None,
+        empty_backfill: t.Optional[bool] = None,
         forward_only: t.Optional[bool] = None,
         allow_destructive_models: t.Optional[t.Collection[str]] = None,
         no_prompts: t.Optional[bool] = None,
@@ -1062,7 +1208,9 @@ class GenericContext(BaseContext, t.Generic[C]):
         categorizer_config: t.Optional[CategorizerConfig] = None,
         enable_preview: t.Optional[bool] = None,
         no_diff: t.Optional[bool] = None,
-        run: bool = False,
+        run: t.Optional[bool] = None,
+        diff_rendered: t.Optional[bool] = None,
+        skip_linter: t.Optional[bool] = None,
     ) -> Plan:
         """Interactively creates a plan.
 
@@ -1106,6 +1254,8 @@ class GenericContext(BaseContext, t.Generic[C]):
             enable_preview: Indicates whether to enable preview for forward-only models in development environments.
             no_diff: Hide text differences for changed models.
             run: Whether to run latest intervals as part of the plan application.
+            diff_rendered: Whether the diff should compare raw vs rendered models
+            skip_linter: Linter runs by default so this will skip it if enabled
 
         Returns:
             The populated Plan object.
@@ -1131,7 +1281,16 @@ class GenericContext(BaseContext, t.Generic[C]):
             categorizer_config=categorizer_config,
             enable_preview=enable_preview,
             run=run,
+            diff_rendered=diff_rendered,
+            skip_linter=skip_linter,
         )
+
+        plan = plan_builder.build()
+
+        if no_auto_categorization or plan.uncategorized:
+            # Prompts are required if the auto categorization is disabled
+            # or if there are any uncategorized snapshots in the plan
+            no_prompts = False
 
         self.console.plan(
             plan_builder,
@@ -1141,7 +1300,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             no_prompts=no_prompts if no_prompts is not None else self.config.plan.no_prompts,
         )
 
-        return plan_builder.build()
+        return plan
 
     @python_api_analytics
     def plan_builder(
@@ -1152,11 +1311,11 @@ class GenericContext(BaseContext, t.Generic[C]):
         end: t.Optional[TimeLike] = None,
         execution_time: t.Optional[TimeLike] = None,
         create_from: t.Optional[str] = None,
-        skip_tests: bool = False,
+        skip_tests: t.Optional[bool] = None,
         restate_models: t.Optional[t.Iterable[str]] = None,
-        no_gaps: bool = False,
-        skip_backfill: bool = False,
-        empty_backfill: bool = False,
+        no_gaps: t.Optional[bool] = None,
+        skip_backfill: t.Optional[bool] = None,
+        empty_backfill: t.Optional[bool] = None,
         forward_only: t.Optional[bool] = None,
         allow_destructive_models: t.Optional[t.Collection[str]] = None,
         no_auto_categorization: t.Optional[bool] = None,
@@ -1166,7 +1325,9 @@ class GenericContext(BaseContext, t.Generic[C]):
         backfill_models: t.Optional[t.Collection[str]] = None,
         categorizer_config: t.Optional[CategorizerConfig] = None,
         enable_preview: t.Optional[bool] = None,
-        run: bool = False,
+        run: t.Optional[bool] = None,
+        diff_rendered: t.Optional[bool] = None,
+        skip_linter: t.Optional[bool] = None,
     ) -> PlanBuilder:
         """Creates a plan builder.
 
@@ -1202,10 +1363,47 @@ class GenericContext(BaseContext, t.Generic[C]):
             backfill_models: A list of model selection strings to filter the models for which the data should be backfilled.
             enable_preview: Indicates whether to enable preview for forward-only models in development environments.
             run: Whether to run latest intervals as part of the plan application.
+            diff_rendered: Whether the diff should compare raw vs rendered models
 
         Returns:
             The plan builder.
         """
+        kwargs: t.Dict[str, t.Optional[UserProvidedFlags]] = {
+            "start": start,
+            "end": end,
+            "execution_time": execution_time,
+            "create_from": create_from,
+            "skip_tests": skip_tests,
+            "restate_models": list(restate_models) if restate_models is not None else None,
+            "no_gaps": no_gaps,
+            "skip_backfill": skip_backfill,
+            "empty_backfill": empty_backfill,
+            "forward_only": forward_only,
+            "allow_destructive_models": list(allow_destructive_models)
+            if allow_destructive_models is not None
+            else None,
+            "no_auto_categorization": no_auto_categorization,
+            "effective_from": effective_from,
+            "include_unmodified": include_unmodified,
+            "select_models": list(select_models) if select_models is not None else None,
+            "backfill_models": list(backfill_models) if backfill_models is not None else None,
+            "enable_preview": enable_preview,
+            "run": run,
+            "diff_rendered": diff_rendered,
+            "skip_linter": skip_linter,
+        }
+        user_provided_flags: t.Dict[str, UserProvidedFlags] = {
+            k: v for k, v in kwargs.items() if v is not None
+        }
+
+        skip_tests = skip_tests or False
+        no_gaps = no_gaps or False
+        skip_backfill = skip_backfill or False
+        empty_backfill = empty_backfill or False
+        run = run or False
+        diff_rendered = diff_rendered or False
+        skip_linter = skip_linter or False
+
         environment = environment or self.config.default_target_environment
         environment = Environment.sanitize_name(environment)
         is_dev = environment != c.PROD
@@ -1220,6 +1418,9 @@ class GenericContext(BaseContext, t.Generic[C]):
 
         if run and is_dev:
             raise ConfigError("The '--run' flag is only supported for the production environment.")
+
+        if not skip_linter:
+            self.lint_models()
 
         self._run_plan_tests(skip_tests=skip_tests)
 
@@ -1243,12 +1444,18 @@ class GenericContext(BaseContext, t.Generic[C]):
 
         models_override: t.Optional[UniqueKeyDict[str, Model]] = None
         if select_models:
-            models_override = model_selector.select_models(
-                select_models,
-                environment,
-                fallback_env_name=create_from or c.PROD,
-                ensure_finalized_snapshots=self.config.plan.use_finalized_state,
-            )
+            try:
+                models_override = model_selector.select_models(
+                    select_models,
+                    environment,
+                    fallback_env_name=create_from or c.PROD,
+                    ensure_finalized_snapshots=self.config.plan.use_finalized_state,
+                )
+            except SQLMeshError as e:
+                logger.exception(e)  # ensure the full stack trace is logged
+                raise PlanError(
+                    f"{e}\nCheck the SQLMesh log file for the full stack trace.\nIf the model has been fixed locally, please ensure that the --select-model expression includes it."
+                )
             if not backfill_models:
                 # Only backfill selected models unless explicitly specified.
                 backfill_models = model_selector.expand_model_selections(select_models)
@@ -1256,6 +1463,13 @@ class GenericContext(BaseContext, t.Generic[C]):
         expanded_restate_models = None
         if restate_models is not None:
             expanded_restate_models = model_selector.expand_model_selections(restate_models)
+
+        if (restate_models is not None and not expanded_restate_models) or (
+            backfill_models is not None and not backfill_models
+        ):
+            raise PlanError(
+                "Selector did not return any models. Please check your model selection and try again."
+            )
 
         snapshots = self._snapshots(models_override)
         context_diff = self._context_diff(
@@ -1265,7 +1479,12 @@ class GenericContext(BaseContext, t.Generic[C]):
             force_no_diff=restate_models is not None
             or (backfill_models is not None and not backfill_models),
             ensure_finalized_snapshots=self.config.plan.use_finalized_state,
+            diff_rendered=diff_rendered,
         )
+        modified_model_names = {
+            *context_diff.modified_snapshots,
+            *[s.name for s in context_diff.added],
+        }
 
         if (
             is_dev
@@ -1275,42 +1494,22 @@ class GenericContext(BaseContext, t.Generic[C]):
         ):
             # Only backfill modified and added models.
             # This ensures that no models outside the impacted sub-DAG(s) will be backfilled unexpectedly.
-            backfill_models = {
-                *context_diff.modified_snapshots,
-                *[s.name for s in context_diff.added],
-            }
+            backfill_models = modified_model_names or None
 
-        # If no end date is specified, use the max interval end from prod
-        # to prevent unintended evaluation of the entire DAG.
-        default_end: t.Optional[int] = None
-        default_start: t.Optional[date] = None
-        max_interval_end_per_model: t.Optional[t.Dict[str, int]] = None
-        if not run and not end:
-            models_for_interval_end: t.Optional[t.Set[str]] = None
-            if backfill_models is not None:
-                models_for_interval_end = set()
-                models_stack = list(backfill_models)
-                while models_stack:
-                    next_model = models_stack.pop()
-                    if next_model not in snapshots:
-                        continue
-                    models_for_interval_end.add(next_model)
-                    models_stack.extend(
-                        s.name
-                        for s in snapshots[next_model].parents
-                        if s.name not in models_for_interval_end
-                    )
-
-            max_interval_end_per_model = self.state_sync.max_interval_end_per_model(
-                c.PROD,
-                models=models_for_interval_end,
-                ensure_finalized_snapshots=self.config.plan.use_finalized_state,
+        max_interval_end_per_model = None
+        default_start, default_end = None, None
+        if not run:
+            max_interval_end_per_model = self._get_max_interval_end_per_model(
+                snapshots, backfill_models
             )
-            if max_interval_end_per_model:
-                default_end = max(max_interval_end_per_model.values())
-                default_start = to_date(min(max_interval_end_per_model.values())) - timedelta(
-                    days=1
-                )
+            # If no end date is specified, use the max interval end from prod
+            # to prevent unintended evaluation of the entire DAG.
+            default_start, default_end = self._get_plan_default_start_end(
+                snapshots, max_interval_end_per_model, backfill_models, modified_model_names
+            )
+
+            # Refresh snapshot intervals to ensure that they are up to date with values reflected in the max_interval_end_per_model.
+            self.state_sync.refresh_snapshot_intervals(context_diff.snapshots.values())
 
         return self.PLAN_BUILDER_TYPE(
             context_diff=context_diff,
@@ -1330,7 +1529,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             allow_destructive_models=expanded_destructive_models,
             environment_ttl=environment_ttl,
             environment_suffix_target=self.config.environment_suffix_target,
-            environment_catalog_mapping=self.config.environment_catalog_mapping,
+            environment_catalog_mapping=self.environment_catalog_mapping,
             categorizer_config=categorizer_config or self.auto_categorize_changes,
             auto_categorization_enabled=not no_auto_categorization,
             effective_from=effective_from,
@@ -1338,13 +1537,13 @@ class GenericContext(BaseContext, t.Generic[C]):
             default_start=default_start,
             default_end=default_end,
             enable_preview=(
-                enable_preview if enable_preview is not None else self.config.plan.enable_preview
+                enable_preview if enable_preview is not None else self._plan_preview_enabled
             ),
             end_bounded=not run,
             ensure_finalized_snapshots=self.config.plan.use_finalized_state,
-            engine_schema_differ=self.engine_adapter.SCHEMA_DIFFER,
             interval_end_per_model=max_interval_end_per_model,
             console=self.console,
+            user_provided_flags=user_provided_flags,
         )
 
     def apply(
@@ -1383,7 +1582,7 @@ class GenericContext(BaseContext, t.Generic[C]):
                 plan_id=plan.plan_id,
                 exc=traceback.format_exc(),
             )
-            logger.error(f"Apply Failure: {traceback.format_exc()}")
+            logger.info("Plan application failed.", exc_info=e)
             raise e
         self.notification_target_manager.notify(
             NotificationEvent.APPLY_END,
@@ -1404,9 +1603,9 @@ class GenericContext(BaseContext, t.Generic[C]):
         self.state_sync.invalidate_environment(name)
         if sync:
             self._cleanup_environments()
-            self.console.log_success(f"Environment '{name}' has been deleted.")
+            self.console.log_success(f"Environment '{name}' deleted.")
         else:
-            self.console.log_success(f"Environment '{name}' has been invalidated.")
+            self.console.log_success(f"Environment '{name}' invalidated.")
 
     @python_api_analytics
     def diff(self, environment: t.Optional[str] = None, detailed: bool = False) -> bool:
@@ -1422,17 +1621,22 @@ class GenericContext(BaseContext, t.Generic[C]):
         environment = environment or self.config.default_target_environment
         environment = Environment.sanitize_name(environment)
         context_diff = self._context_diff(environment)
-        self.console.show_model_difference_summary(
+        self.console.show_environment_difference_summary(
             context_diff,
-            EnvironmentNamingInfo.from_environment_catalog_mapping(
-                self.config.environment_catalog_mapping,
-                name=environment,
-                suffix_target=self.config.environment_suffix_target,
-                normalize_name=context_diff.normalize_environment_name,
-            ),
-            self.default_catalog,
             no_diff=not detailed,
         )
+        if context_diff.has_changes:
+            self.console.show_model_difference_summary(
+                context_diff,
+                EnvironmentNamingInfo.from_environment_catalog_mapping(
+                    self.environment_catalog_mapping,
+                    name=environment,
+                    suffix_target=self.config.environment_suffix_target,
+                    normalize_name=context_diff.normalize_environment_name,
+                ),
+                self.default_catalog,
+                no_diff=not detailed,
+            )
         return context_diff.has_changes
 
     @python_api_analytics
@@ -1440,17 +1644,18 @@ class GenericContext(BaseContext, t.Generic[C]):
         self,
         source: str,
         target: str,
-        on: t.List[str] | exp.Condition | None = None,
-        skip_columns: t.List[str] | None = None,
-        model_or_snapshot: t.Optional[ModelOrSnapshot] = None,
+        on: t.Optional[t.List[str] | exp.Condition] = None,
+        skip_columns: t.Optional[t.List[str]] = None,
+        select_models: t.Optional[t.Collection[str]] = None,
         where: t.Optional[str | exp.Condition] = None,
         limit: int = 20,
         show: bool = True,
         show_sample: bool = True,
         decimals: int = 3,
         skip_grain_check: bool = False,
+        warn_grain_check: bool = False,
         temp_schema: t.Optional[str] = None,
-    ) -> TableDiff:
+    ) -> t.List[TableDiff]:
         """Show a diff between two tables.
 
         Args:
@@ -1459,7 +1664,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             on: The join condition, table aliases must be "s" and "t" for source and target.
                 If omitted, the table's grain will be used.
             skip_columns: The columns to skip when computing the table diff.
-            model_or_snapshot: The model or snapshot to use when environments are passed in.
+            select_models: The models or snapshots to use when environments are passed in.
             where: An optional where statement to filter results.
             limit: The limit of the sample dataframe.
             show: Show the table diff output in the console.
@@ -1469,49 +1674,199 @@ class GenericContext(BaseContext, t.Generic[C]):
             temp_schema: The schema to use for temporary tables.
 
         Returns:
-            The TableDiff object containing schema and summary differences.
+            The list of TableDiff objects containing schema and summary differences.
         """
-        source_alias, target_alias = source, target
 
-        adapter = self.engine_adapter
-        if model_or_snapshot:
-            model = self.get_model(model_or_snapshot, raise_if_missing=True)
-            adapter = self._get_engine_adapter(model.gateway)
+        table_diffs: t.List[TableDiff] = []
+
+        # Diffs multiple or a single model across two environments
+        if select_models:
             source_env = self.state_reader.get_environment(source)
             target_env = self.state_reader.get_environment(target)
-
             if not source_env:
                 raise SQLMeshError(f"Could not find environment '{source}'")
             if not target_env:
-                raise SQLMeshError(f"Could not find environment '{target}')")
+                raise SQLMeshError(f"Could not find environment '{target}'")
+            criteria = ", ".join(f"'{c}'" for c in select_models)
+            try:
+                selected_models = self._new_selector().expand_model_selections(select_models)
+                if not selected_models:
+                    self.console.log_status_update(
+                        f"No models matched the selection criteria: {criteria}"
+                    )
+            except Exception as e:
+                raise SQLMeshError(e)
 
-            source = next(
-                snapshot for snapshot in source_env.snapshots if snapshot.name == model.fqn
-            ).table_name()
-            target = next(
-                snapshot for snapshot in target_env.snapshots if snapshot.name == model.fqn
-            ).table_name()
-            source_alias = source_env.name
-            target_alias = target_env.name
+            models_to_diff: t.List[
+                t.Tuple[Model, EngineAdapter, str, str, t.Optional[t.List[str] | exp.Condition]]
+            ] = []
+            models_without_grain: t.List[Model] = []
+            source_snapshots_to_name = {
+                snapshot.name: snapshot for snapshot in source_env.snapshots
+            }
+            target_snapshots_to_name = {
+                snapshot.name: snapshot for snapshot in target_env.snapshots
+            }
 
-            if not on:
-                for ref in model.all_references:
-                    if ref.unique:
-                        expr = ref.expression
+            for model_fqn in selected_models:
+                model = self._models[model_fqn]
+                adapter = self._get_engine_adapter(model.gateway)
+                source_snapshot = source_snapshots_to_name.get(model.fqn)
+                target_snapshot = target_snapshots_to_name.get(model.fqn)
 
-                        if isinstance(expr, exp.Tuple):
-                            on = [key.this.sql() for key in expr.expressions]
+                if target_snapshot and source_snapshot:
+                    if (source_snapshot.fingerprint != target_snapshot.fingerprint) and (
+                        (source_snapshot.version != target_snapshot.version)
+                        or source_snapshot.is_forward_only
+                    ):
+                        # Compare the virtual layer instead of the physical layer because the virtual layer is guaranteed to point
+                        # to the correct/active snapshot for the model in the specified environment, taking into account things like dev previews
+                        source = source_snapshot.qualified_view_name.for_environment(
+                            source_env.naming_info, adapter.dialect
+                        )
+                        target = target_snapshot.qualified_view_name.for_environment(
+                            target_env.naming_info, adapter.dialect
+                        )
+                        model_on = on or model.on
+                        if not model_on:
+                            models_without_grain.append(model)
                         else:
-                            # Handle a single Column or Paren expression
-                            on = [expr.this.sql()]
+                            models_to_diff.append((model, adapter, source, target, model_on))
 
+            if models_without_grain:
+                model_names = "\n".join(
+                    f"─ {model.name} \n  at '{model._path}'" for model in models_without_grain
+                )
+                message = (
+                    "SQLMesh doesn't know how to join the tables for the following models:\n"
+                    f"{model_names}\n\n"
+                    "Please specify a `grain` in each model definition. It must be unique and not null."
+                )
+                if warn_grain_check:
+                    self.console.log_warning(message)
+                else:
+                    raise SQLMeshError(message)
+
+            if models_to_diff:
+                self.console.show_table_diff_details(
+                    [model[0].name for model in models_to_diff],
+                )
+
+                self.console.start_table_diff_progress(len(models_to_diff))
+                try:
+                    tasks_num = min(len(models_to_diff), self.concurrent_tasks)
+                    table_diffs = concurrent_apply_to_values(
+                        list(models_to_diff),
+                        lambda model_info: self._model_diff(
+                            model=model_info[0],
+                            adapter=model_info[1],
+                            source=model_info[2],
+                            target=model_info[3],
+                            on=model_info[4],
+                            source_alias=source_env.name,
+                            target_alias=target_env.name,
+                            limit=limit,
+                            decimals=decimals,
+                            skip_columns=skip_columns,
+                            where=where,
+                            show=show,
+                            temp_schema=temp_schema,
+                            skip_grain_check=skip_grain_check,
+                        ),
+                        tasks_num=tasks_num,
+                    )
+                    self.console.stop_table_diff_progress(success=True)
+                except:
+                    self.console.stop_table_diff_progress(success=False)
+                    raise
+            elif selected_models:
+                self.console.log_status_update(
+                    f"No models contain differences with the selection criteria: {criteria}"
+                )
+
+        else:
+            table_diffs = [
+                self._table_diff(
+                    source=source,
+                    target=target,
+                    source_alias=source,
+                    target_alias=target,
+                    limit=limit,
+                    decimals=decimals,
+                    adapter=self.engine_adapter,
+                    on=on,
+                    skip_columns=skip_columns,
+                    where=where,
+                )
+            ]
+
+        if show:
+            self.console.show_table_diff(table_diffs, show_sample, skip_grain_check, temp_schema)
+
+        return table_diffs
+
+    def _model_diff(
+        self,
+        model: Model,
+        adapter: EngineAdapter,
+        source: str,
+        target: str,
+        source_alias: str,
+        target_alias: str,
+        limit: int,
+        decimals: int,
+        on: t.Optional[t.List[str] | exp.Condition] = None,
+        skip_columns: t.Optional[t.List[str]] = None,
+        where: t.Optional[str | exp.Condition] = None,
+        show: bool = True,
+        temp_schema: t.Optional[str] = None,
+        skip_grain_check: bool = False,
+    ) -> TableDiff:
+        self.console.start_table_diff_model_progress(model.name)
+
+        table_diff = self._table_diff(
+            on=on,
+            skip_columns=skip_columns,
+            where=where,
+            limit=limit,
+            decimals=decimals,
+            model=model,
+            adapter=adapter,
+            source=source,
+            target=target,
+            source_alias=source_alias,
+            target_alias=target_alias,
+        )
+
+        if show:
+            # Trigger row_diff in parallel execution so it's available for ordered display later
+            table_diff.row_diff(temp_schema=temp_schema, skip_grain_check=skip_grain_check)
+
+        self.console.update_table_diff_progress(model.name)
+
+        return table_diff
+
+    def _table_diff(
+        self,
+        source: str,
+        target: str,
+        source_alias: str,
+        target_alias: str,
+        limit: int,
+        decimals: int,
+        adapter: EngineAdapter,
+        on: t.Optional[t.List[str] | exp.Condition] = None,
+        model: t.Optional[Model] = None,
+        skip_columns: t.Optional[t.List[str]] = None,
+        where: t.Optional[str | exp.Condition] = None,
+    ) -> TableDiff:
         if not on:
             raise SQLMeshError(
                 "SQLMesh doesn't know how to join the two tables. Specify the `grains` in each model definition or pass join column names in separate `-o` flags."
             )
 
-        table_diff = TableDiff(
-            adapter=adapter,
+        return TableDiff(
+            adapter=adapter.with_log_level(logger.getEffectiveLevel()),
             source=source,
             target=target,
             on=on,
@@ -1519,19 +1874,11 @@ class GenericContext(BaseContext, t.Generic[C]):
             where=where,
             source_alias=source_alias,
             target_alias=target_alias,
-            model_name=model.name if model_or_snapshot else None,
-            model_dialect=model.dialect if model_or_snapshot else None,
             limit=limit,
             decimals=decimals,
+            model_name=model.name if model else None,
+            model_dialect=model.dialect if model else None,
         )
-        if show:
-            self.console.show_schema_diff(table_diff.schema_diff())
-            self.console.show_row_diff(
-                table_diff.row_diff(temp_schema=temp_schema, skip_grain_check=skip_grain_check),
-                show_sample=show_sample,
-                skip_grain_check=skip_grain_check,
-            )
-        return table_diff
 
     @python_api_analytics
     def get_dag(
@@ -1594,7 +1941,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         suffix = file_path.suffix
         if suffix != ".html":
             if suffix:
-                logger.warning(
+                get_console().log_warning(
                     f"The extension {suffix} does not designate an html file. A file with a `.html` extension will be created instead."
                 )
             path = str(file_path.with_suffix(".html"))
@@ -1636,9 +1983,10 @@ class GenericContext(BaseContext, t.Generic[C]):
 
         try:
             model_to_test = self.get_model(model, raise_if_missing=True)
-            test_adapter = self._test_connection_config.create_engine_adapter(
+            test_adapter = self.test_connection_config.create_engine_adapter(
                 register_comments_override=False
             )
+
             generate_test(
                 model=model_to_test,
                 input_queries=input_queries,
@@ -1653,65 +2001,38 @@ class GenericContext(BaseContext, t.Generic[C]):
                 include_ctes=include_ctes,
             )
         finally:
-            test_adapter.close()
+            if test_adapter:
+                test_adapter.close()
 
     @python_api_analytics
     def test(
         self,
         match_patterns: t.Optional[t.List[str]] = None,
         tests: t.Optional[t.List[str]] = None,
-        verbose: bool = False,
+        verbosity: Verbosity = Verbosity.DEFAULT,
         preserve_fixtures: bool = False,
         stream: t.Optional[t.TextIO] = None,
     ) -> ModelTextTestResult:
         """Discover and run model tests"""
-        if verbose:
+        if verbosity >= Verbosity.VERBOSE:
+            import pandas as pd
+
             pd.set_option("display.max_columns", None)
-            verbosity = 2
-        else:
-            verbosity = 1
 
-        if tests:
-            result = run_model_tests(
-                tests=tests,
-                models=self._models,
-                config=self.config,
-                gateway=self.gateway,
-                dialect=self.default_dialect,
-                verbosity=verbosity,
-                patterns=match_patterns,
-                preserve_fixtures=preserve_fixtures,
-                stream=stream,
-                default_catalog=self.default_catalog,
-                default_catalog_dialect=self.engine_adapter.DIALECT,
-            )
-        else:
-            test_meta = []
+        test_meta = self.load_model_tests(tests=tests, patterns=match_patterns)
 
-            for path, config in self.configs.items():
-                test_meta.extend(
-                    get_all_model_tests(
-                        path / c.TESTS,
-                        patterns=match_patterns,
-                        ignore_patterns=config.ignore_patterns,
-                        variables=config.variables,
-                    )
-                )
-
-            result = run_tests(
-                model_test_metadata=test_meta,
-                models=self._models,
-                config=self.config,
-                gateway=self.gateway,
-                dialect=self.default_dialect,
-                verbosity=verbosity,
-                preserve_fixtures=preserve_fixtures,
-                stream=stream,
-                default_catalog=self.default_catalog,
-                default_catalog_dialect=self.engine_adapter.DIALECT,
-            )
-
-        return result
+        return run_tests(
+            model_test_metadata=test_meta,
+            models=self._models,
+            config=self.config,
+            selected_gateway=self.selected_gateway,
+            dialect=self.default_dialect,
+            verbosity=verbosity,
+            preserve_fixtures=preserve_fixtures,
+            stream=stream,
+            default_catalog=self.default_catalog,
+            default_catalog_dialect=self.config.dialect or "",
+        )
 
     @python_api_analytics
     def audit(
@@ -1721,7 +2042,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         *,
         models: t.Optional[t.Iterator[str]] = None,
         execution_time: t.Optional[TimeLike] = None,
-    ) -> None:
+    ) -> bool:
         """Audit models.
 
         Args:
@@ -1729,6 +2050,9 @@ class GenericContext(BaseContext, t.Generic[C]):
             end: The end of the interval to audit.
             models: The models to audit. All models will be audited if not specified.
             execution_time: The date/time time reference to use for execution time. Defaults to now.
+
+        Returns:
+            False if any of the audits failed, True otherwise.
         """
 
         snapshots = (
@@ -1739,6 +2063,7 @@ class GenericContext(BaseContext, t.Generic[C]):
 
         num_audits = sum(len(snapshot.node.audits_with_args) for snapshot in snapshots)
         self.console.log_status_update(f"Found {num_audits} audit(s).")
+
         errors = []
         skipped_count = 0
         for snapshot in snapshots:
@@ -1778,6 +2103,7 @@ class GenericContext(BaseContext, t.Generic[C]):
                 )
 
         self.console.log_status_update("Done.")
+        return not errors
 
     @python_api_analytics
     def rewrite(self, sql: str, dialect: str = "") -> exp.Expression:
@@ -1800,13 +2126,68 @@ class GenericContext(BaseContext, t.Generic[C]):
         )
 
     @python_api_analytics
+    def check_intervals(
+        self,
+        environment: t.Optional[str],
+        no_signals: bool,
+        select_models: t.Collection[str],
+        start: t.Optional[TimeLike] = None,
+        end: t.Optional[TimeLike] = None,
+    ) -> t.Dict[Snapshot, SnapshotIntervals]:
+        """Check intervals for a given environment.
+
+        Args:
+            environment: The environment or prod if None.
+            select_models: A list of model selection strings to show intervals for.
+            start: The start of the intervals to check.
+            end: The end of the intervals to check.
+        """
+
+        environment = environment or c.PROD
+        env = self.state_reader.get_environment(environment)
+        if not env:
+            raise SQLMeshError(f"Environment '{environment}' was not found.")
+
+        snapshots = {k.name: v for k, v in self.state_sync.get_snapshots(env.snapshots).items()}
+
+        missing = {
+            k.name: v
+            for k, v in missing_intervals(
+                snapshots.values(), start=start, end=end, execution_time=end
+            ).items()
+        }
+
+        if select_models:
+            selected: t.Collection[str] = self._select_models_for_run(
+                select_models, True, snapshots.values()
+            )
+        else:
+            selected = snapshots.keys()
+
+        results = {}
+        execution_context = self.execution_context(snapshots=snapshots)
+
+        for fqn in selected:
+            snapshot = snapshots[fqn]
+            intervals = missing.get(fqn) or []
+
+            results[snapshot] = SnapshotIntervals(
+                snapshot.snapshot_id,
+                intervals
+                if no_signals
+                else snapshot.check_ready_intervals(intervals, execution_context),
+            )
+
+        return results
+
+    @python_api_analytics
     def migrate(self) -> None:
         """Migrates SQLMesh to the current running version.
 
         Please contact your SQLMesh administrator before doing this.
         """
         self.notification_target_manager.notify(NotificationEvent.MIGRATION_START)
-        self._load_materializations_and_signals()
+        self._load_materializations()
         try:
             self._new_state_sync().migrate(
                 default_catalog=self.default_catalog,
@@ -1873,7 +2254,9 @@ class GenericContext(BaseContext, t.Generic[C]):
             )
 
     @python_api_analytics
-    def print_info(self, skip_connection: bool = False, verbose: bool = False) -> None:
+    def print_info(
+        self, skip_connection: bool = False, verbosity: Verbosity = Verbosity.DEFAULT
+    ) -> None:
         """Prints information about connections, models, macros, etc. to the console."""
         self.console.log_status_update(f"Models: {len(self.models)}")
         self.console.log_status_update(f"Macros: {len(self._macros) - len(macro.get_registry())}")
@@ -1881,7 +2264,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         if skip_connection:
             return
 
-        if verbose:
+        if verbosity >= Verbosity.VERBOSE:
             self.console.log_status_update("")
             print_config(self.config.get_connection(self.gateway), self.console, "Connection")
             print_config(
@@ -1895,6 +2278,16 @@ class GenericContext(BaseContext, t.Generic[C]):
         state_connection = self.config.get_state_connection(self.gateway)
         if state_connection:
             self._try_connection("state backend", state_connection.connection_validator())
+
+    @python_api_analytics
+    def print_environment_names(self) -> None:
+        """Prints all environment names along with expiry datetime."""
+        result = self._new_state_sync().get_environments_summary()
+        if not result:
+            raise SQLMeshError(
+                "This project has no environments. Create an environment using the `sqlmesh plan` command."
+            )
+        self.console.print_environments(result)
 
     def close(self) -> None:
         """Releases all resources allocated by this context."""
@@ -1914,7 +2307,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         select_models: t.Optional[t.Collection[str]],
         circuit_breaker: t.Optional[t.Callable[[], bool]],
         no_auto_upstream: bool,
-    ) -> bool:
+    ) -> CompletionStatus:
         scheduler = self.scheduler(environment=environment)
         snapshots = scheduler.snapshots
 
@@ -1923,7 +2316,7 @@ class GenericContext(BaseContext, t.Generic[C]):
                 select_models, no_auto_upstream, snapshots.values()
             )
 
-        return scheduler.run(
+        completion_status = scheduler.run(
             environment,
             start=start,
             end=end,
@@ -1931,7 +2324,25 @@ class GenericContext(BaseContext, t.Generic[C]):
             ignore_cron=ignore_cron,
             circuit_breaker=circuit_breaker,
             selected_snapshots=select_models,
+            auto_restatement_enabled=environment.lower() == c.PROD,
+            run_environment_statements=True,
         )
+
+        if completion_status.is_nothing_to_do:
+            next_run_ready_msg = ""
+
+            next_ready_interval_start = get_next_model_interval_start(snapshots.values())
+            if next_ready_interval_start:
+                utc_time = format_tz_datetime(next_ready_interval_start)
+                local_time = format_tz_datetime(next_ready_interval_start, use_local_timezone=True)
+                time_msg = local_time if local_time == utc_time else f"{local_time} ({utc_time})"
+                next_run_ready_msg = f"\n\nNext run will be ready at {time_msg}."
+
+            self.console.log_status_update(
+                f"No models are ready to run. Please wait until a model `cron` interval has elapsed.{next_run_ready_msg}"
+            )
+
+        return completion_status
 
     def _apply(self, plan: Plan, circuit_breaker: t.Optional[t.Callable[[], bool]]) -> None:
         self._scheduler.create_plan_evaluator(self).evaluate(
@@ -1939,33 +2350,115 @@ class GenericContext(BaseContext, t.Generic[C]):
         )
 
     @python_api_analytics
-    def table_name(self, model_name: str, dev: bool) -> str:
-        """Returns the name of the pysical table for the given model name.
+    def table_name(
+        self, model_name: str, environment: t.Optional[str] = None, prod: bool = False
+    ) -> str:
+        """Returns the name of the pysical table for the given model name in the target environment.
 
         Args:
             model_name: The name of the model.
-            dev: Whether to use the deployability index for the table name.
+            environment: The environment to source the model version from.
+            prod: If True, return the name of the physical table that will be used in production for the model version
+                promoted in the target environment.
 
         Returns:
             The name of the physical table.
         """
-        deployability_index = (
-            DeployabilityIndex.create(self.snapshots.values())
-            if dev
-            else DeployabilityIndex.all_deployable()
+        environment = environment or self.config.default_target_environment
+        fqn = self._node_or_snapshot_to_fqn(model_name)
+        target_env = self.state_reader.get_environment(environment)
+        if not target_env:
+            raise SQLMeshError(f"Environment '{environment}' was not found.")
+
+        snapshot_info = None
+        for s in target_env.snapshots:
+            if s.name == fqn:
+                snapshot_info = s
+                break
+        if not snapshot_info:
+            raise SQLMeshError(
+                f"Model '{model_name}' was not found in environment '{environment}'."
+            )
+
+        if target_env.name == c.PROD or prod:
+            return snapshot_info.table_name()
+
+        snapshots = self.state_reader.get_snapshots(target_env.snapshots)
+        deployability_index = DeployabilityIndex.create(snapshots)
+
+        return snapshot_info.table_name(
+            is_deployable=deployability_index.is_deployable(snapshot_info.snapshot_id)
         )
-        snapshot = self.get_snapshot(model_name)
-        if not snapshot:
-            raise SQLMeshError(f"Model '{model_name}' was not found.")
-        return snapshot.table_name(is_deployable=deployability_index.is_deployable(snapshot))
 
     def clear_caches(self) -> None:
         for path in self.configs:
             rmtree(path / c.CACHE)
+        if isinstance(self.state_sync, CachingStateSync):
+            self.state_sync.clear_cache()
 
-    def _run_tests(self, verbose: bool = False) -> t.Tuple[unittest.result.TestResult, str]:
+    def export_state(
+        self,
+        output_file: Path,
+        environment_names: t.Optional[t.List[str]] = None,
+        local_only: bool = False,
+        confirm: bool = True,
+    ) -> None:
+        from sqlmesh.core.state_sync.export_import import export_state
+
+        # trigger a connection to the StateSync so we can fail early if there is a problem
+        # note we still need to do this even if we are doing a local export so we know what 'versions' to write
+        self.state_sync.get_versions(validate=True)
+
+        local_snapshots = self.snapshots if local_only else None
+
+        if self.console.start_state_export(
+            output_file=output_file,
+            gateway=self.selected_gateway,
+            state_connection_config=self._state_connection_config,
+            environment_names=environment_names,
+            local_only=local_only,
+            confirm=confirm,
+        ):
+            try:
+                export_state(
+                    state_sync=self.state_sync,
+                    output_file=output_file,
+                    local_snapshots=local_snapshots,
+                    environment_names=environment_names,
+                    console=self.console,
+                )
+                self.console.stop_state_export(success=True, output_file=output_file)
+            except:
+                self.console.stop_state_export(success=False, output_file=output_file)
+                raise
+
+    def import_state(self, input_file: Path, clear: bool = False, confirm: bool = True) -> None:
+        from sqlmesh.core.state_sync.export_import import import_state
+
+        if self.console.start_state_import(
+            input_file=input_file,
+            gateway=self.selected_gateway,
+            state_connection_config=self._state_connection_config,
+            clear=clear,
+            confirm=confirm,
+        ):
+            try:
+                import_state(
+                    state_sync=self.state_sync,
+                    input_file=input_file,
+                    clear=clear,
+                    console=self.console,
+                )
+                self.console.stop_state_import(success=True, input_file=input_file)
+            except:
+                self.console.stop_state_import(success=False, input_file=input_file)
+                raise
+
+    def _run_tests(
+        self, verbosity: Verbosity = Verbosity.DEFAULT
+    ) -> t.Tuple[unittest.result.TestResult, str]:
         test_output_io = StringIO()
-        result = self.test(stream=test_output_io, verbose=verbose)
+        result = self.test(stream=test_output_io, verbosity=verbosity)
         return result, test_output_io.getvalue()
 
     def _run_plan_tests(
@@ -1977,11 +2470,11 @@ class GenericContext(BaseContext, t.Generic[C]):
                 self.console.log_test_results(
                     result,
                     test_output,
-                    self._test_connection_config._engine_adapter.DIALECT,
+                    self.test_connection_config._engine_adapter.DIALECT,
                 )
             if not result.wasSuccessful():
                 raise PlanError(
-                    "Cannot generate plan due to failing test(s). Fix test(s) and run again"
+                    "Cannot generate plan due to failing test(s). Fix test(s) and run again."
                 )
             return result, test_output
         return None, None
@@ -1998,7 +2491,7 @@ class GenericContext(BaseContext, t.Generic[C]):
                 if snapshot.version
                 else snapshot.qualified_view_name.for_environment(
                     EnvironmentNamingInfo.from_environment_catalog_mapping(
-                        self.config.environment_catalog_mapping,
+                        self.environment_catalog_mapping,
                         name=c.PROD,
                         suffix_target=self.config.environment_suffix_target,
                     )
@@ -2007,31 +2500,61 @@ class GenericContext(BaseContext, t.Generic[C]):
             for fqn, snapshot in self.snapshots.items()
         }
 
-    @property
-    def _snapshot_gateways(self) -> t.Dict[str, str]:
-        """Mapping of snapshot name to the gateway if specified in the model."""
-
-        return {
-            fqn: snapshot.model.gateway
-            for fqn, snapshot in self.snapshots.items()
-            if snapshot.is_model and snapshot.model.gateway
-        }
-
-    def _create_engine_adapters(self, gateways: t.Optional[t.Set] = None) -> None:
-        """Create engine adapters for the gateways, when none provided include all defined in the configs."""
-
+    @cached_property
+    def engine_adapters(self) -> t.Dict[str, EngineAdapter]:
+        """Returns all the engine adapters for the gateways defined in the configuration."""
+        adapters: t.Dict[str, EngineAdapter] = {self.selected_gateway: self.engine_adapter}
         for gateway_name in self.config.gateways:
-            if gateway_name != self.selected_gateway and (
-                gateways is None or gateway_name in gateways
-            ):
+            if gateway_name != self.selected_gateway:
                 connection = self.config.get_connection(gateway_name)
-                adapter = connection.create_engine_adapter()
-                self.concurrent_tasks = min(self.concurrent_tasks, connection.concurrent_tasks)
-                self._engine_adapters[gateway_name] = adapter
+                adapter = connection.create_engine_adapter(concurrent_tasks=self.concurrent_tasks)
+                adapters[gateway_name] = adapter
+        return adapters
+
+    @cached_property
+    def default_catalog_per_gateway(self) -> t.Dict[str, str]:
+        """Returns the default catalogs for each engine adapter."""
+        return self._scheduler.get_default_catalog_per_gateway(self)
+
+    @property
+    def concurrent_tasks(self) -> int:
+        if self._concurrent_tasks is None:
+            self._concurrent_tasks = self.connection_config.concurrent_tasks
+        return self._concurrent_tasks
+
+    @cached_property
+    def connection_config(self) -> ConnectionConfig:
+        return self.config.get_connection(self.selected_gateway)
+
+    @cached_property
+    def test_connection_config(self) -> ConnectionConfig:
+        return self.config.get_test_connection(
+            self.gateway,
+            self.default_catalog,
+            default_catalog_dialect=self.config.dialect,
+        )
+
+    @cached_property
+    def environment_catalog_mapping(self) -> RegexKeyDict:
+        engine_adapter = None
+        try:
+            engine_adapter = self.engine_adapter
+        except Exception:
+            pass
+
+        if (
+            self.config.environment_catalog_mapping
+            and engine_adapter
+            and not self.engine_adapter.catalog_support.is_multi_catalog_supported
+        ):
+            raise SQLMeshError(
+                "Environment catalog mapping is only supported for engine adapters that support multiple catalogs"
+            )
+        return self.config.environment_catalog_mapping
 
     def _get_engine_adapter(self, gateway: t.Optional[str] = None) -> EngineAdapter:
         if gateway:
-            if adapter := self._engine_adapters.get(gateway):
+            if adapter := self.engine_adapters.get(gateway):
                 return adapter
             raise SQLMeshError(f"Gateway '{gateway}' not found in the available engine adapters.")
         return self.engine_adapter
@@ -2039,67 +2562,25 @@ class GenericContext(BaseContext, t.Generic[C]):
     def _snapshots(
         self, models_override: t.Optional[UniqueKeyDict[str, Model]] = None
     ) -> t.Dict[str, Snapshot]:
-        projects = {config.project for config in self.configs.values()}
-
-        if any(projects):
-            prod = self.state_reader.get_environment(c.PROD)
-            remote_snapshots = (
-                {
-                    snapshot.name: snapshot
-                    for snapshot in self.state_reader.get_snapshots(prod.snapshots).values()
-                }
-                if prod
-                else {}
-            )
-        else:
-            remote_snapshots = {}
-
-        local_nodes = {**(models_override or self._models), **self._standalone_audits}
-        nodes = local_nodes.copy()
-
-        for name, snapshot in remote_snapshots.items():
-            if name not in nodes and snapshot.node.project not in projects:
-                nodes[name] = snapshot.node
-
-        def _nodes_to_snapshots(nodes: t.Dict[str, Node]) -> t.Dict[str, Snapshot]:
-            snapshots: t.Dict[str, Snapshot] = {}
-            fingerprint_cache: t.Dict[str, SnapshotFingerprint] = {}
-
-            for node in nodes.values():
-                if node.fqn not in local_nodes and node.fqn in remote_snapshots:
-                    ttl = remote_snapshots[node.fqn].ttl
-                else:
-                    config = self.config_for_node(node)
-                    ttl = config.snapshot_ttl
-
-                snapshot = Snapshot.from_node(
-                    node,
-                    nodes=nodes,
-                    cache=fingerprint_cache,
-                    ttl=ttl,
-                    config=self.config_for_node(node),
-                )
-                snapshots[snapshot.name] = snapshot
-            return snapshots
-
-        snapshots = _nodes_to_snapshots(nodes)
+        nodes = {**(models_override or self._models), **self._standalone_audits}
+        snapshots = self._nodes_to_snapshots(nodes)
         stored_snapshots = self.state_reader.get_snapshots(snapshots.values())
 
         unrestorable_snapshots = {
             snapshot
             for snapshot in stored_snapshots.values()
-            if snapshot.name in local_nodes and snapshot.unrestorable
+            if snapshot.name in nodes and snapshot.unrestorable
         }
         if unrestorable_snapshots:
             for snapshot in unrestorable_snapshots:
                 logger.info(
                     "Found a unrestorable snapshot %s. Restamping the model...", snapshot.name
                 )
-                node = local_nodes[snapshot.name]
+                node = nodes[snapshot.name]
                 nodes[snapshot.name] = node.copy(
                     update={"stamp": f"revert to {snapshot.identifier}"}
                 )
-            snapshots = _nodes_to_snapshots(nodes)
+            snapshots = self._nodes_to_snapshots(nodes)
             stored_snapshots = self.state_reader.get_snapshots(snapshots.values())
 
         for snapshot in stored_snapshots.values():
@@ -2115,6 +2596,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         create_from: t.Optional[str] = None,
         force_no_diff: bool = False,
         ensure_finalized_snapshots: bool = False,
+        diff_rendered: bool = False,
     ) -> ContextDiff:
         environment = Environment.sanitize_name(environment)
         if force_no_diff:
@@ -2125,24 +2607,66 @@ class GenericContext(BaseContext, t.Generic[C]):
             snapshots=snapshots or self.snapshots,
             create_from=create_from or c.PROD,
             state_reader=self.state_reader,
-            requirements=self._requirements,
+            provided_requirements=self._requirements,
+            excluded_requirements=self._excluded_requirements,
             ensure_finalized_snapshots=ensure_finalized_snapshots,
+            diff_rendered=diff_rendered,
+            environment_statements=self._environment_statements,
+            gateway_managed_virtual_layer=self.config.gateway_managed_virtual_layer,
+            infer_python_dependencies=self.config.infer_python_dependencies,
         )
 
+    def _destroy(self) -> None:
+        # Invalidate all environments, including prod
+        for environment in self.state_reader.get_environments():
+            self.state_sync.invalidate_environment(name=environment.name, protect_prod=False)
+            self.console.log_success(f"Environment '{environment.name}' invalidated.")
+
+        # Run janitor to clean up all objects
+        self._run_janitor(ignore_ttl=True)
+
+        # Remove state tables, including backup tables
+        self.state_sync.remove_state(including_backup=True)
+        self.console.log_status_update("State tables removed.")
+
+        # Finally clear caches
+        self.clear_caches()
+
     def _run_janitor(self, ignore_ttl: bool = False) -> None:
-        self._cleanup_environments()
-        expired_snapshots = self.state_sync.delete_expired_snapshots(ignore_ttl=ignore_ttl)
+        current_ts = now_timestamp()
+
+        # Clean up expired environments by removing their views and schemas
+        self._cleanup_environments(current_ts=current_ts)
+
+        cleanup_targets = self.state_sync.get_expired_snapshots(
+            ignore_ttl=ignore_ttl, current_ts=current_ts
+        )
+
+        # Remove the expired snapshots tables
         self.snapshot_evaluator.cleanup(
-            expired_snapshots,
-            self._snapshot_gateways,
+            target_snapshots=cleanup_targets,
             on_complete=self.console.update_cleanup_progress,
         )
 
+        # Delete the expired snapshot records from the state sync
+        self.state_sync.delete_expired_snapshots(ignore_ttl=ignore_ttl, current_ts=current_ts)
+
         self.state_sync.compact_intervals()
 
-    def _cleanup_environments(self) -> None:
-        expired_environments = self.state_sync.delete_expired_environments()
-        cleanup_expired_views(self.engine_adapter, expired_environments, console=self.console)
+    def _cleanup_environments(self, current_ts: t.Optional[int] = None) -> None:
+        current_ts = current_ts or now_timestamp()
+
+        expired_environments = self.state_sync.get_expired_environments(current_ts=current_ts)
+
+        cleanup_expired_views(
+            default_adapter=self.engine_adapter,
+            engine_adapters=self.engine_adapters,
+            environments=expired_environments,
+            warn_on_delete_failure=self.config.janitor.warn_on_delete_failure,
+            console=self.console,
+        )
+
+        self.state_sync.delete_expired_environments(current_ts=current_ts)
 
     def _try_connection(self, connection_name: str, validator: t.Callable[[], None]) -> None:
         connection_name = connection_name.capitalize()
@@ -2183,11 +2707,10 @@ class GenericContext(BaseContext, t.Generic[C]):
             event_notifications, user_notification_targets, username=self.config.username
         )
 
-    def _load_materializations_and_signals(self) -> None:
+    def _load_materializations(self) -> None:
         if not self._loaded:
-            for context_loader in self._loaders.values():
-                with sys_path(*context_loader.configs):
-                    context_loader.loader.load_materializations(self)
+            for loader in self._loaders:
+                loader.load_materializations()
 
     def _select_models_for_run(
         self,
@@ -2207,23 +2730,159 @@ class GenericContext(BaseContext, t.Generic[C]):
             result = set(dag.subdag(*result))
         return result
 
-    def _load_requirements(self, path: Path) -> None:
-        path = path / c.REQUIREMENTS
-        if path.is_file():
-            with open(path, "r", encoding="utf-8") as file:
-                for line in file:
-                    args = [k.strip() for k in line.split("==")]
-                    if len(args) != 2:
-                        raise SQLMeshError(
-                            f"Invalid lock file entry '{line.strip()}'. Only 'dep==ver' is supported"
-                        )
-                    dep, ver = args
-                    other_ver = self._requirements.get(dep, ver)
-                    if ver != other_ver:
-                        raise SQLMeshError(
-                            f"Conflicting requirement {dep}: {ver} != {other_ver}. Fix your {c.REQUIREMENTS} file."
-                        )
-                    self._requirements[dep] = ver
+    @cached_property
+    def _project_type(self) -> str:
+        project_types = {
+            c.DBT if loader.__class__.__name__.lower().startswith(c.DBT) else c.NATIVE
+            for loader in self._loaders
+        }
+        return c.HYBRID if len(project_types) > 1 else first(project_types)
+
+    def _nodes_to_snapshots(self, nodes: t.Dict[str, Node]) -> t.Dict[str, Snapshot]:
+        snapshots: t.Dict[str, Snapshot] = {}
+        fingerprint_cache: t.Dict[str, SnapshotFingerprint] = {}
+
+        for node in nodes.values():
+            kwargs = {}
+            if node.project in self._projects:
+                kwargs["ttl"] = self.config_for_node(node).snapshot_ttl
+
+            snapshot = Snapshot.from_node(
+                node,
+                nodes=nodes,
+                cache=fingerprint_cache,
+                **kwargs,
+            )
+            snapshots[snapshot.name] = snapshot
+        return snapshots
+
+    def _node_or_snapshot_to_fqn(self, node_or_snapshot: NodeOrSnapshot) -> str:
+        if isinstance(node_or_snapshot, Snapshot):
+            return node_or_snapshot.name
+        if isinstance(node_or_snapshot, str) and not self.standalone_audits.get(node_or_snapshot):
+            return normalize_model_name(
+                node_or_snapshot,
+                dialect=self.default_dialect,
+                default_catalog=self.default_catalog,
+            )
+        if not isinstance(node_or_snapshot, str):
+            return node_or_snapshot.fqn
+        return node_or_snapshot
+
+    @property
+    def _plan_preview_enabled(self) -> bool:
+        if self.config.plan.enable_preview is not None:
+            return self.config.plan.enable_preview
+        # It is dangerous to enable preview by default for dbt projects that rely on engines that don’t support cloning.
+        # Enabling previews in such cases can result in unintended full refreshes because dbt incremental models rely on
+        # the maximum timestamp value in the target table.
+        return self._project_type == c.NATIVE or self.engine_adapter.SUPPORTS_CLONING
+
+    def _get_plan_default_start_end(
+        self,
+        snapshots: t.Dict[str, Snapshot],
+        max_interval_end_per_model: t.Dict[str, int],
+        backfill_models: t.Optional[t.Set[str]],
+        modified_model_names: t.Set[str],
+    ) -> t.Tuple[t.Optional[int], t.Optional[int]]:
+        if not max_interval_end_per_model:
+            return None, None
+
+        default_end = max(max_interval_end_per_model.values())
+        default_start: t.Optional[int] = None
+        # Infer the default start by finding the smallest interval start that corresponds to the default end.
+        for model_name in backfill_models or modified_model_names or max_interval_end_per_model:
+            if model_name not in snapshots:
+                continue
+            node = snapshots[model_name].node
+            interval_unit = node.interval_unit
+            default_start = min(
+                default_start or sys.maxsize,
+                to_timestamp(
+                    interval_unit.cron_prev(
+                        interval_unit.cron_floor(
+                            max_interval_end_per_model.get(
+                                model_name, node.cron_floor(default_end)
+                            ),
+                        ),
+                        estimate=True,
+                    )
+                ),
+            )
+        return default_start, default_end
+
+    def _get_max_interval_end_per_model(
+        self, snapshots: t.Dict[str, Snapshot], backfill_models: t.Optional[t.Set[str]]
+    ) -> t.Dict[str, int]:
+        models_for_interval_end = (
+            self._get_models_for_interval_end(snapshots, backfill_models)
+            if backfill_models is not None
+            else None
+        )
+        return self.state_sync.max_interval_end_per_model(
+            c.PROD,
+            models=models_for_interval_end,
+            ensure_finalized_snapshots=self.config.plan.use_finalized_state,
+        )
+
+    @staticmethod
+    def _get_models_for_interval_end(
+        snapshots: t.Dict[str, Snapshot], backfill_models: t.Set[str]
+    ) -> t.Set[str]:
+        models_for_interval_end = set()
+        models_stack = list(backfill_models)
+        while models_stack:
+            next_model = models_stack.pop()
+            if next_model not in snapshots:
+                continue
+            models_for_interval_end.add(next_model)
+            models_stack.extend(
+                s.name
+                for s in snapshots[next_model].parents
+                if s.name not in models_for_interval_end
+            )
+        return models_for_interval_end
+
+    def lint_models(
+        self,
+        models: t.Optional[t.Iterable[t.Union[str, Model]]] = None,
+        raise_on_error: bool = True,
+    ) -> t.List[AnnotatedRuleViolation]:
+        found_error = False
+
+        model_list = (
+            list(self.get_model(model) for model in models) if models else self.models.values()
+        )
+        all_violations = []
+        for model in model_list:
+            # Linter may be `None` if the context is not loaded yet
+            if linter := self._linters.get(model.project):
+                lint_violation, violations = (
+                    linter.lint_model(model, self, console=self.console) or found_error
+                )
+                if lint_violation:
+                    found_error = True
+                all_violations.extend(violations)
+
+        if raise_on_error and found_error:
+            raise LinterError(
+                "Linter detected errors in the code. Please fix them before proceeding."
+            )
+
+        return all_violations
+
+    def load_model_tests(
+        self, tests: t.Optional[t.List[str]] = None, patterns: list[str] | None = None
+    ) -> t.List[ModelTestMetadata]:
+        # If a set of specific test path(s) are provided, we can use a single loader
+        # since it's not required to walk every tests/ folder in each repo
+        loaders = [self._loaders[0]] if tests else self._loaders
+
+        model_tests = []
+        for loader in loaders:
+            model_tests.extend(loader.load_model_tests(tests=tests, patterns=patterns))
+
+        return model_tests
 
 
 class Context(GenericContext[Config]):

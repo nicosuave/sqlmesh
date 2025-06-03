@@ -16,7 +16,6 @@ import sys
 import typing as t
 from functools import partial
 
-import pandas as pd
 from sqlglot import Dialect, exp
 from sqlglot.errors import ErrorLevel
 from sqlglot.helper import ensure_list
@@ -41,14 +40,21 @@ from sqlmesh.core.engine_adapter.shared import (
 from sqlmesh.core.model.kind import TimeColumn
 from sqlmesh.core.schema_diff import SchemaDiffer
 from sqlmesh.utils import columns_to_types_all_known, random_id
-from sqlmesh.utils.connection_pool import create_connection_pool
+from sqlmesh.utils.connection_pool import create_connection_pool, ConnectionPool
 from sqlmesh.utils.date import TimeLike, make_inclusive, to_time_column
-from sqlmesh.utils.errors import SQLMeshError, UnsupportedCatalogOperationError
+from sqlmesh.utils.errors import (
+    SQLMeshError,
+    UnsupportedCatalogOperationError,
+    MissingDefaultCatalogError,
+)
 from sqlmesh.utils.pandas import columns_to_types_from_df
 
 if t.TYPE_CHECKING:
+    import pandas as pd
+
     from sqlmesh.core._typing import SchemaName, SessionProperties, TableName
     from sqlmesh.core.engine_adapter._typing import (
+        BigframeSession,
         DF,
         PySparkDataFrame,
         PySparkSession,
@@ -74,7 +80,7 @@ class EngineAdapter:
     with the underlying engine and data store.
 
     Args:
-        connection_factory: a callable which produces a new Database API-compliant
+        connection_factory_or_pool: a callable which produces a new Database API-compliant
             connection on every call.
         dialect: The dialect with which this adapter is associated.
         multithreaded: Indicates whether this adapter will be used by more than one thread.
@@ -97,30 +103,37 @@ class EngineAdapter:
     SUPPORTS_MANAGED_MODELS = False
     SCHEMA_DIFFER = SchemaDiffer()
     SUPPORTS_TUPLE_IN = True
-    CATALOG_SUPPORT = CatalogSupport.UNSUPPORTED
     HAS_VIEW_BINDING = False
     SUPPORTS_REPLACE_TABLE = True
     DEFAULT_CATALOG_TYPE = DIALECT
     QUOTE_IDENTIFIERS_IN_VIEWS = True
+    MAX_IDENTIFIER_LENGTH: t.Optional[int] = None
 
     def __init__(
         self,
-        connection_factory: t.Callable[[], t.Any],
+        connection_factory_or_pool: t.Union[t.Callable[[], t.Any], ConnectionPool],
         dialect: str = "",
         sql_gen_kwargs: t.Optional[t.Dict[str, Dialect | bool | str]] = None,
         multithreaded: bool = False,
-        cursor_kwargs: t.Optional[t.Dict[str, t.Any]] = None,
         cursor_init: t.Optional[t.Callable[[t.Any], None]] = None,
         default_catalog: t.Optional[str] = None,
         execute_log_level: int = logging.DEBUG,
         register_comments: bool = True,
         pre_ping: bool = False,
         pretty_sql: bool = False,
+        shared_connection: bool = False,
         **kwargs: t.Any,
     ):
         self.dialect = dialect.lower() or self.DIALECT
-        self._connection_pool = create_connection_pool(
-            connection_factory, multithreaded, cursor_kwargs=cursor_kwargs, cursor_init=cursor_init
+        self._connection_pool = (
+            connection_factory_or_pool
+            if isinstance(connection_factory_or_pool, ConnectionPool)
+            else create_connection_pool(
+                connection_factory_or_pool,
+                multithreaded,
+                shared_connection=shared_connection,
+                cursor_init=cursor_init,
+            )
         )
         self._sql_gen_kwargs = sql_gen_kwargs or {}
         self._default_catalog = default_catalog
@@ -129,19 +142,21 @@ class EngineAdapter:
         self._register_comments = register_comments
         self._pre_ping = pre_ping
         self._pretty_sql = pretty_sql
+        self._multithreaded = multithreaded
 
     def with_log_level(self, level: int) -> EngineAdapter:
         adapter = self.__class__(
-            lambda: None,
+            self._connection_pool,
             dialect=self.dialect,
             sql_gen_kwargs=self._sql_gen_kwargs,
             default_catalog=self._default_catalog,
             execute_log_level=level,
             register_comments=self._register_comments,
+            null_connection=True,
+            multithreaded=self._multithreaded,
+            pretty_sql=self._pretty_sql,
             **self._extra_config,
         )
-
-        adapter._connection_pool = self._connection_pool
 
         return adapter
 
@@ -162,8 +177,16 @@ class EngineAdapter:
         return None
 
     @property
+    def bigframe(self) -> t.Optional[BigframeSession]:
+        return None
+
+    @property
     def comments_enabled(self) -> bool:
         return self._register_comments and self.COMMENT_CREATION_TABLE.is_supported
+
+    @property
+    def catalog_support(self) -> CatalogSupport:
+        return CatalogSupport.UNSUPPORTED
 
     @classmethod
     def _casted_columns(cls, columns_to_types: t.Dict[str, exp.DataType]) -> t.List[exp.Alias]:
@@ -174,11 +197,13 @@ class EngineAdapter:
 
     @property
     def default_catalog(self) -> t.Optional[str]:
-        if self.CATALOG_SUPPORT.is_unsupported:
+        if self.catalog_support.is_unsupported:
             return None
         default_catalog = self._default_catalog or self.get_current_catalog()
         if not default_catalog:
-            raise SQLMeshError("Could not determine a default catalog despite it being supported.")
+            raise MissingDefaultCatalogError(
+                "Could not determine a default catalog despite it being supported."
+            )
         return default_catalog
 
     @property
@@ -193,6 +218,8 @@ class EngineAdapter:
         *,
         batch_size: t.Optional[int] = None,
     ) -> t.List[SourceQuery]:
+        import pandas as pd
+
         batch_size = self.DEFAULT_BATCH_SIZE if batch_size is None else batch_size
         if isinstance(query_or_df, (exp.Query, exp.DerivedTable)):
             return [SourceQuery(query_factory=lambda: query_or_df)]  # type: ignore
@@ -220,15 +247,22 @@ class EngineAdapter:
         batch_size: int,
         target_table: TableName,
     ) -> t.List[SourceQuery]:
+        import pandas as pd
+
         assert isinstance(df, pd.DataFrame)
         num_rows = len(df.index)
         batch_size = sys.maxsize if batch_size == 0 else batch_size
+
+        # we need to ensure that the order of the columns in columns_to_types columns matches the order of the values
+        # they can differ if a user specifies columns() on a python model in a different order than what's in the DataFrame's emitted by that model
+        df = df[list(columns_to_types)]
         values = list(df.itertuples(index=False, name=None))
+
         return [
             SourceQuery(
                 query_factory=partial(
                     self._values_to_sql,
-                    values=values,
+                    values=values,  # type: ignore
                     columns_to_types=columns_to_types,
                     batch_start=i,
                     batch_end=min(i + batch_size, num_rows),
@@ -266,6 +300,8 @@ class EngineAdapter:
     def _columns_to_types(
         self, query_or_df: QueryOrDF, columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None
     ) -> t.Optional[t.Dict[str, exp.DataType]]:
+        import pandas as pd
+
         if columns_to_types:
             return columns_to_types
         if isinstance(query_or_df, pd.DataFrame):
@@ -293,7 +329,7 @@ class EngineAdapter:
         """Intended to be overridden for data virtualization systems like Trino that,
         depending on the target catalog, require slightly different properties to be set when creating / updating tables
         """
-        if self.CATALOG_SUPPORT.is_unsupported:
+        if self.catalog_support.is_unsupported:
             raise UnsupportedCatalogOperationError(
                 f"{self.dialect} does not support catalogs and a catalog was provided: {catalog}"
             )
@@ -355,33 +391,32 @@ class EngineAdapter:
                 column_descriptions=column_descriptions,
                 **kwargs,
             )
-        else:
-            if self_referencing:
-                with self.temp_table(
-                    self._select_columns(columns_to_types).from_(target_table),
-                    name=target_table,
-                    columns_to_types=columns_to_types,
-                    **kwargs,
-                ) as temp_table:
-                    for source_query in source_queries:
-                        source_query.add_transform(
-                            lambda node: (  # type: ignore
-                                temp_table  # type: ignore
-                                if isinstance(node, exp.Table)
-                                and quote_identifiers(node) == quote_identifiers(target_table)
-                                else node
-                            )
+        if self_referencing:
+            with self.temp_table(
+                self._select_columns(columns_to_types).from_(target_table),
+                name=target_table,
+                columns_to_types=columns_to_types,
+                **kwargs,
+            ) as temp_table:
+                for source_query in source_queries:
+                    source_query.add_transform(
+                        lambda node: (  # type: ignore
+                            temp_table  # type: ignore
+                            if isinstance(node, exp.Table)
+                            and quote_identifiers(node) == quote_identifiers(target_table)
+                            else node
                         )
-                    return self._insert_overwrite_by_condition(
-                        target_table,
-                        source_queries,
-                        columns_to_types,
                     )
-            return self._insert_overwrite_by_condition(
-                target_table,
-                source_queries,
-                columns_to_types,
-            )
+                return self._insert_overwrite_by_condition(
+                    target_table,
+                    source_queries,
+                    columns_to_types,
+                )
+        return self._insert_overwrite_by_condition(
+            target_table,
+            source_queries,
+            columns_to_types,
+        )
 
     def create_index(
         self,
@@ -634,28 +669,54 @@ class EngineAdapter:
         Build a schema expression for a table, columns, column comments, and additional schema properties.
         """
         expressions = expressions or []
+
+        return exp.Schema(
+            this=table,
+            expressions=self._build_column_defs(
+                columns_to_types=columns_to_types,
+                column_descriptions=column_descriptions,
+                is_view=is_view,
+            )
+            + expressions,
+        )
+
+    def _build_column_defs(
+        self,
+        columns_to_types: t.Dict[str, exp.DataType],
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+        is_view: bool = False,
+    ) -> t.List[exp.ColumnDef]:
         engine_supports_schema_comments = (
             self.COMMENT_CREATION_VIEW.supports_schema_def
             if is_view
             else self.COMMENT_CREATION_TABLE.supports_schema_def
         )
-        return exp.Schema(
-            this=table,
-            expressions=[
-                exp.ColumnDef(
-                    this=exp.to_identifier(column),
-                    kind=None if is_view else kind,  # don't include column data type for views
-                    constraints=(
-                        self._build_col_comment_exp(column, column_descriptions)
-                        if column_descriptions
-                        and engine_supports_schema_comments
-                        and self.comments_enabled
-                        else None
-                    ),
-                )
-                for column, kind in columns_to_types.items()
-            ]
-            + expressions,
+        return [
+            self._build_column_def(
+                column,
+                column_descriptions=column_descriptions,
+                engine_supports_schema_comments=engine_supports_schema_comments,
+                col_type=None if is_view else kind,  # don't include column data type for views
+            )
+            for column, kind in columns_to_types.items()
+        ]
+
+    def _build_column_def(
+        self,
+        col_name: str,
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+        engine_supports_schema_comments: bool = False,
+        col_type: t.Optional[exp.DATA_TYPE] = None,
+        nested_names: t.List[str] = [],
+    ) -> exp.ColumnDef:
+        return exp.ColumnDef(
+            this=exp.to_identifier(col_name),
+            kind=col_type,
+            constraints=(
+                self._build_col_comment_exp(col_name, column_descriptions)
+                if engine_supports_schema_comments and self.comments_enabled and column_descriptions
+                else None
+            ),
         )
 
     def _build_col_comment_exp(
@@ -845,6 +906,8 @@ class EngineAdapter:
         """
         if not self.SUPPORTS_CLONING:
             raise NotImplementedError(f"Engine does not support cloning: {type(self)}")
+
+        kwargs.pop("rendered_physical_properties", None)
         self.execute(
             exp.Create(
                 this=exp.to_table(target_table_name),
@@ -950,8 +1013,12 @@ class EngineAdapter:
             view_properties: Optional view properties to add to the view.
             create_kwargs: Additional kwargs to pass into the Create expression
         """
+        import pandas as pd
+
         if materialized_properties and not materialized:
             raise SQLMeshError("Materialized properties are only supported for materialized views")
+
+        query_or_df = self._native_df_to_pandas_df(query_or_df)
 
         if isinstance(query_or_df, pd.DataFrame):
             values: t.List[t.Tuple[t.Any, ...]] = list(
@@ -1000,17 +1067,25 @@ class EngineAdapter:
         if materialized_properties:
             partitioned_by = materialized_properties.pop("partitioned_by", None)
             clustered_by = materialized_properties.pop("clustered_by", None)
-            if partitioned_by and (
-                partitioned_by_prop := self._build_partitioned_by_exp(
-                    partitioned_by, **materialized_properties
+            if (
+                partitioned_by
+                and (
+                    partitioned_by_prop := self._build_partitioned_by_exp(
+                        partitioned_by, **materialized_properties
+                    )
                 )
+                is not None
             ):
                 materialized_properties["catalog_name"] = exp.to_table(view_name).catalog
                 properties.append("expressions", partitioned_by_prop)
-            if clustered_by and (
-                clustered_by_prop := self._build_clustered_by_exp(
-                    clustered_by, **materialized_properties
+            if (
+                clustered_by
+                and (
+                    clustered_by_prop := self._build_clustered_by_exp(
+                        clustered_by, **materialized_properties
+                    )
                 )
+                is not None
             ):
                 properties.append("expressions", clustered_by_prop)
 
@@ -1243,7 +1318,9 @@ class EngineAdapter:
         )
         if not columns_to_types or not columns_to_types_all_known(columns_to_types):
             columns_to_types = self.columns(table_name)
-        low, high = [time_formatter(dt, columns_to_types) for dt in make_inclusive(start, end)]
+        low, high = [
+            time_formatter(dt, columns_to_types) for dt in make_inclusive(start, end, self.dialect)
+        ]
         if isinstance(time_column, TimeColumn):
             time_column = time_column.column
         where = exp.Between(
@@ -1340,20 +1417,13 @@ class EngineAdapter:
         target_table: TableName,
         query: Query,
         on: exp.Expression,
-        match_expressions: t.List[exp.When],
+        whens: exp.Whens,
     ) -> None:
         this = exp.alias_(exp.to_table(target_table), alias=MERGE_TARGET_ALIAS, table=True)
         using = exp.alias_(
             exp.Subquery(this=query), alias=MERGE_SOURCE_ALIAS, copy=False, table=True
         )
-        self.execute(
-            exp.Merge(
-                this=this,
-                using=using,
-                on=on,
-                expressions=match_expressions,
-            )
-        )
+        self.execute(exp.Merge(this=this, using=using, on=on, whens=whens))
 
     def scd_type_2_by_time(
         self,
@@ -1362,7 +1432,7 @@ class EngineAdapter:
         unique_key: t.Sequence[exp.Expression],
         valid_from_col: exp.Column,
         valid_to_col: exp.Column,
-        execution_time: TimeLike,
+        execution_time: t.Union[TimeLike, exp.Column],
         updated_at_col: exp.Column,
         invalidate_hard_deletes: bool = True,
         updated_at_as_valid_from: bool = False,
@@ -1396,7 +1466,7 @@ class EngineAdapter:
         unique_key: t.Sequence[exp.Expression],
         valid_from_col: exp.Column,
         valid_to_col: exp.Column,
-        execution_time: TimeLike,
+        execution_time: t.Union[TimeLike, exp.Column],
         check_columns: t.Union[exp.Star, t.Sequence[exp.Column]],
         invalidate_hard_deletes: bool = True,
         execution_time_as_valid_from: bool = False,
@@ -1430,7 +1500,7 @@ class EngineAdapter:
         unique_key: t.Sequence[exp.Expression],
         valid_from_col: exp.Column,
         valid_to_col: exp.Column,
-        execution_time: TimeLike,
+        execution_time: t.Union[TimeLike, exp.Column],
         invalidate_hard_deletes: bool = True,
         updated_at_col: t.Optional[exp.Column] = None,
         check_columns: t.Optional[t.Union[exp.Star, t.Sequence[exp.Column]]] = None,
@@ -1505,7 +1575,11 @@ class EngineAdapter:
         # column names and then remove them from the unmanaged_columns
         if check_columns and check_columns == exp.Star():
             check_columns = [exp.column(col) for col in unmanaged_columns_to_types]
-        execution_ts = to_time_column(execution_time, time_data_type, self.dialect, nullable=True)
+        execution_ts = (
+            exp.cast(execution_time, time_data_type, dialect=self.dialect)
+            if isinstance(execution_time, exp.Column)
+            else to_time_column(execution_time, time_data_type, self.dialect, nullable=True)
+        )
         if updated_at_as_valid_from:
             if not updated_at_col:
                 raise SQLMeshError(
@@ -1810,7 +1884,8 @@ class EngineAdapter:
         source_table: QueryOrDF,
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
         unique_key: t.Sequence[exp.Expression],
-        when_matched: t.Optional[t.Union[exp.When, t.List[exp.When]]] = None,
+        when_matched: t.Optional[exp.Whens] = None,
+        merge_filter: t.Optional[exp.Expression] = None,
     ) -> None:
         source_queries, columns_to_types = self._get_source_queries_and_columns_to_types(
             source_table, columns_to_types, target_table=target_table
@@ -1822,36 +1897,48 @@ class EngineAdapter:
                 for part in unique_key
             )
         )
+        if merge_filter:
+            on = exp.and_(merge_filter, on)
+
         if not when_matched:
-            when_matched = exp.When(
-                matched=True,
+            match_expressions = [
+                exp.When(
+                    matched=True,
+                    source=False,
+                    then=exp.Update(
+                        expressions=[
+                            exp.column(col, MERGE_TARGET_ALIAS).eq(
+                                exp.column(col, MERGE_SOURCE_ALIAS)
+                            )
+                            for col in columns_to_types
+                        ],
+                    ),
+                )
+            ]
+        else:
+            match_expressions = when_matched.copy().expressions
+
+        match_expressions.append(
+            exp.When(
+                matched=False,
                 source=False,
-                then=exp.Update(
-                    expressions=[
-                        exp.column(col, MERGE_TARGET_ALIAS).eq(exp.column(col, MERGE_SOURCE_ALIAS))
-                        for col in columns_to_types
-                    ],
+                then=exp.Insert(
+                    this=exp.Tuple(expressions=[exp.column(col) for col in columns_to_types]),
+                    expression=exp.Tuple(
+                        expressions=[
+                            exp.column(col, MERGE_SOURCE_ALIAS) for col in columns_to_types
+                        ]
+                    ),
                 ),
             )
-        when_matched = ensure_list(when_matched)
-        when_not_matched = exp.When(
-            matched=False,
-            source=False,
-            then=exp.Insert(
-                this=exp.Tuple(expressions=[exp.column(col) for col in columns_to_types]),
-                expression=exp.Tuple(
-                    expressions=[exp.column(col, MERGE_SOURCE_ALIAS) for col in columns_to_types]
-                ),
-            ),
         )
-        match_expressions = when_matched + [when_not_matched]
         for source_query in source_queries:
             with source_query as query:
                 self._merge(
                     target_table=target_table,
                     query=query,
                     on=on,
-                    match_expressions=match_expressions,
+                    whens=exp.Whens(expressions=match_expressions),
                 )
 
     def rename_table(
@@ -1930,10 +2017,27 @@ class EngineAdapter:
             self.execute(query, quote_identifiers=quote_identifiers)
             return self.cursor.fetchdf()
 
+    def _native_df_to_pandas_df(
+        self,
+        query_or_df: QueryOrDF,
+    ) -> t.Union[Query, pd.DataFrame]:
+        """
+        Take a "native" DataFrame (eg Pyspark, Bigframe, Snowpark etc) and convert it to Pandas
+        """
+        import pandas as pd
+
+        if isinstance(query_or_df, (exp.Query, exp.DerivedTable, pd.DataFrame)):
+            return query_or_df
+
+        # EngineAdapter subclasses that have native DataFrame types should override this
+        raise NotImplementedError(f"Unable to convert {type(query_or_df)} to Pandas")
+
     def fetchdf(
         self, query: t.Union[exp.Expression, str], quote_identifiers: bool = False
     ) -> pd.DataFrame:
         """Fetches a Pandas DataFrame from the cursor"""
+        import pandas as pd
+
         df = self._fetch_native_df(query, quote_identifiers=quote_identifiers)
         if not isinstance(df, pd.DataFrame):
             raise NotImplementedError(
@@ -2051,19 +2155,36 @@ class EngineAdapter:
         )
         with self.transaction():
             for e in ensure_list(expressions):
-                sql = t.cast(
-                    str,
-                    (
-                        self._to_sql(e, quote=quote_identifiers, **to_sql_kwargs)
-                        if isinstance(e, exp.Expression)
-                        else e
-                    ),
+                if isinstance(e, exp.Expression):
+                    self._check_identifier_length(e)
+                    sql = self._to_sql(e, quote=quote_identifiers, **to_sql_kwargs)
+                else:
+                    sql = t.cast(str, e)
+
+                self._log_sql(
+                    sql,
+                    expression=e if isinstance(e, exp.Expression) else None,
+                    quote_identifiers=quote_identifiers,
                 )
-                self._log_sql(sql)
                 self._execute(sql, **kwargs)
 
-    def _log_sql(self, sql: str) -> None:
-        logger.log(self._execute_log_level, "Executing SQL: %s", sql)
+    def _log_sql(
+        self,
+        sql: str,
+        expression: t.Optional[exp.Expression] = None,
+        quote_identifiers: bool = True,
+    ) -> None:
+        if not logger.isEnabledFor(self._execute_log_level):
+            return
+
+        sql_to_log = sql
+        if expression is not None and not isinstance(expression, exp.Query):
+            values = expression.find(exp.Values)
+            if values:
+                values.set("expressions", [exp.to_identifier("<REDACTED VALUES>")])
+                sql_to_log = self._to_sql(expression, quote=quote_identifiers)
+
+        logger.log(self._execute_log_level, "Executing SQL: %s", sql_to_log)
 
     def _execute(self, sql: str, **kwargs: t.Any) -> None:
         self.cursor.execute(sql, **kwargs)
@@ -2157,6 +2278,7 @@ class EngineAdapter:
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         table_description: t.Optional[str] = None,
         table_kind: t.Optional[str] = None,
+        **kwargs: t.Any,
     ) -> t.Optional[exp.Properties]:
         """Creates a SQLGlot table properties expression for ddl."""
         properties: t.List[exp.Expression] = []
@@ -2349,7 +2471,7 @@ class EngineAdapter:
             self.execute(self._build_create_comment_table_exp(table, table_comment, table_kind))
         except Exception:
             logger.warning(
-                f"Table comment for '{table.alias_or_name}' not registered - this may be due to limited permissions.",
+                f"Table comment for '{table.alias_or_name}' not registered - this may be due to limited permissions",
                 exc_info=True,
             )
 
@@ -2376,7 +2498,7 @@ class EngineAdapter:
                 self.execute(self._build_create_comment_column_exp(table, col, comment, table_kind))
             except Exception:
                 logger.warning(
-                    f"Column comments for column '{col}' in table '{table.alias_or_name}' not registered - this may be due to limited permissions.",
+                    f"Column comments for column '{col}' in table '{table.alias_or_name}' not registered - this may be due to limited permissions",
                     exc_info=True,
                 )
 
@@ -2408,6 +2530,18 @@ class EngineAdapter:
     @classmethod
     def _select_columns(cls, columns: t.Iterable[str]) -> exp.Select:
         return exp.select(*(exp.column(c, quoted=True) for c in columns))
+
+    def _check_identifier_length(self, expression: exp.Expression) -> None:
+        if self.MAX_IDENTIFIER_LENGTH is None or not isinstance(expression, exp.DDL):
+            return
+
+        for identifier in expression.find_all(exp.Identifier):
+            name = identifier.name
+            name_length = len(name)
+            if name_length > self.MAX_IDENTIFIER_LENGTH:
+                raise SQLMeshError(
+                    f"Identifier name '{name}' (length {name_length}) exceeds {self.dialect.capitalize()}'s max identifier limit of {self.MAX_IDENTIFIER_LENGTH} characters"
+                )
 
 
 class EngineAdapterWithIndexSupport(EngineAdapter):

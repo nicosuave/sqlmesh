@@ -71,15 +71,15 @@ This creates a gateway named `bigquery` and makes it your project's default gate
 
 It uses the [`oauth` authentication method](#authentication-methods), which does not specify a username or other information directly in the connection configuration. Other authentication methods are [described below](#authentication-methods).
 
-In BigQuery, navigate to the dashboard and select the BigQuery project your SQLMesh project will use. From the Google Cloud dashboard, use the arrow to open the pop-up menu:  
+In BigQuery, navigate to the dashboard and select the BigQuery project your SQLMesh project will use. From the Google Cloud dashboard, use the arrow to open the pop-up menu:
 
 ![BigQuery Dashboard](./bigquery/bigquery-1.png)
 
-Now we can identify the project ID needed in the `config.yaml` gateway specification above. Select the project that you want to work with, the project ID that you need to add to your yaml file is the ID label from the pop-up menu. 
+Now we can identify the project ID needed in the `config.yaml` gateway specification above. Select the project that you want to work with, the project ID that you need to add to your yaml file is the ID label from the pop-up menu.
 
 ![BigQuery Dashboard: selecting your project](./bigquery/bigquery-2.png)
 
-For this guide, the Docs-Demo is the one we will use, thus the project ID for this example is `healthy-life-440919-s0`. 
+For this guide, the Docs-Demo is the one we will use, thus the project ID for this example is `healthy-life-440919-s0`.
 
 ## Usage
 
@@ -156,56 +156,14 @@ pip install "sqlmesh[bigquery]"
 | `refresh_token`                 | OAuth 2.0 refresh token                                                                                                                                           | string |    N     |
 | `client_id`                     | OAuth 2.0 client ID                                                                                                                                               | string |    N     |
 | `client_secret`                 | OAuth 2.0 client secret                                                                                                                                           | string |    N     |
-| `token_uri`                     | OAuth 2.0 authorization server's toke endpoint URI                                                                                                                | string |    N     |
+| `token_uri`                     | OAuth 2.0 authorization server's token endpoint URI                                                                                                                | string |    N     |
 | `scopes`                        | The scopes used to obtain authorization                                                                                                                           |  list  |    N     |
+| `impersonated_service_account`  | If set, SQLMesh will attempt to impersonate this service account                                                                                                                                | string |    N     |
 | `job_creation_timeout_seconds`  | The maximum amount of time, in seconds, to wait for the underlying job to be created.                                                                             |  int   |    N     |
 | `job_execution_timeout_seconds` | The maximum amount of time, in seconds, to wait for the underlying job to complete.                                                                               |  int   |    N     |
 | `job_retries`                   | The number of times to retry the underlying job if it fails. (Default: `1`)                                                                                       |  int   |    N     |
 | `priority`                      | The priority of the underlying job. (Default: `INTERACTIVE`)                                                                                                      | string |    N     |
 | `maximum_bytes_billed`          | The maximum number of bytes to be billed for the underlying job.                                                                                                  |  int   |    N     |
-
-## Airflow Scheduler
-**Engine Name:** `bigquery`
-
-In order to share a common implementation across local and Airflow, SQLMesh BigQuery implements its own hook and operator.
-
-### Installation
-
-To enable support for this operator, the Airflow BigQuery provider package should be installed on the target Airflow cluster along with SQLMesh with the BigQuery extra:
-```
-pip install "apache-airflow-providers-google"
-pip install "sqlmesh[bigquery]"
-```
-
-### Connection info
-
-The operator requires an [Airflow connection](https://airflow.apache.org/docs/apache-airflow/stable/howto/connection.html) to determine the target BigQuery account. Please see [GoogleBaseHook](https://airflow.apache.org/docs/apache-airflow-providers-google/stable/_api/airflow/providers/google/common/hooks/base_google/index.html#airflow.providers.google.common.hooks.base_google.GoogleBaseHook) and [GCP connection](https://airflow.apache.org/docs/apache-airflow-providers-google/stable/connections/gcp.html)for more details. Use the `sqlmesh_google_cloud_bigquery_default` (by default) connection ID instead of the `google_cloud_default` one in the Airflow guide.
-
-By default, the connection ID is set to `sqlmesh_google_cloud_bigquery_default`, but it can be overridden using the `engine_operator_args` parameter to the `SQLMeshAirflow` instance as in the example below:
-```python linenums="1"
-sqlmesh_airflow = SQLMeshAirflow(
-    "bigquery",
-    default_catalog="<project id>",
-    engine_operator_args={
-        "bigquery_conn_id": "<Connection ID>"
-    },
-)
-```
-
-#### Optional Arguments
-
-* `location`: Sets the default location for datasets and tables. If not set, BigQuery defaults to US for new datasets. See `location` in [Connection options](#connection-options) for more details.
-
-```python linenums="1"
-sqlmesh_airflow = SQLMeshAirflow(
-    "bigquery",
-    default_catalog="<project id>",
-    engine_operator_args={
-        "bigquery_conn_id": "<Connection ID>",
-        "location": "<location>"
-    },
-)
-```
 
 ## Authentication Methods
 - [oauth](https://google-auth.readthedocs.io/en/master/reference/google.auth.html#google.auth.default) (default)
@@ -228,8 +186,15 @@ sqlmesh_airflow = SQLMeshAirflow(
         - `keyfile_json` (Required)
         - `scopes` (Optional)
 
+If the `impersonated_service_account` argument is set, SQLMesh will:
+
+1. Authenticate user account credentials with one of the methods above
+2. Attempt to impersonate the service account with those credentials
+
+The user account must have [sufficient permissions to impersonate the service account](https://cloud.google.com/docs/authentication/use-service-account-impersonation).
+
 ## Permissions Required
 With any of the above connection methods, ensure these BigQuery permissions are enabled to allow SQLMesh to work correctly.
 
-- [`BigQuery Data Editor`](https://cloud.google.com/bigquery/docs/access-control#bigquery.dataEditor)
+- [`BigQuery Data Owner`](https://cloud.google.com/bigquery/docs/access-control#bigquery.dataOwner)
 - [`BigQuery User`](https://cloud.google.com/bigquery/docs/access-control#bigquery.user)

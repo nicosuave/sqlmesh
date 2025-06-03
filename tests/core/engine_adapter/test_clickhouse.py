@@ -167,10 +167,7 @@ def test_alter_table(
             return {
                 k: exp.DataType.build(v, dialect=adapter.dialect) for k, v in current_table.items()
             }
-        else:
-            return {
-                k: exp.DataType.build(v, dialect=adapter.dialect) for k, v in target_table.items()
-            }
+        return {k: exp.DataType.build(v, dialect=adapter.dialect) for k, v in target_table.items()}
 
     adapter.columns = table_columns  # type: ignore
 
@@ -371,7 +368,8 @@ def test_partitioned_by_expr(make_mocked_engine_adapter: t.Callable):
     )
 
     assert (
-        model.partitioned_by[0].sql("clickhouse") == """toMonday(CAST("ds" AS DateTime64('UTC')))"""
+        model.partitioned_by[0].sql("clickhouse")
+        == """toMonday(CAST("ds" AS DateTime64(9, 'UTC')))"""
     )
 
     # user specifies without time column, unknown time column type
@@ -396,7 +394,7 @@ def test_partitioned_by_expr(make_mocked_engine_adapter: t.Callable):
     )
 
     assert [p.sql("clickhouse") for p in model.partitioned_by] == [
-        """toMonday(CAST("ds" AS DateTime64('UTC')))""",
+        """toMonday(CAST("ds" AS DateTime64(9, 'UTC')))""",
         '"x"',
     ]
 
@@ -444,7 +442,7 @@ def test_partitioned_by_expr(make_mocked_engine_adapter: t.Callable):
 
     assert (
         model.partitioned_by[0].sql("clickhouse")
-        == """CAST(toMonday(CAST("ds" AS DateTime64('UTC'))) AS String)"""
+        == """CAST(toMonday(CAST("ds" AS DateTime64(9, 'UTC'))) AS String)"""
     )
 
     # user specifies partitioned_by with time column
